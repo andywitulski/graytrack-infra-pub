@@ -1,0 +1,4 @@
+---
+lab_data_identity_name: labdata
+lab_data_identity_id: 2000
+lab_data_identity_home: /var/lib/labdata

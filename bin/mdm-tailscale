@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# bin/mdm-tailscale <host> <device-name> [--dry-run]
+# Takes the Tailscale app on an enrolled iPhone or iPad under management and gives it its settings (Apple
+# managed app configuration, Tailscale's MDM keys): the Headscale server, always on, the lab routes and DNS
+# always used, and a fixed device name (the name in headscale_trusted_devices). The phone asks once whether
+# to let the organization manage the app (and installs it from the App Store first if it is missing).
+#
+#   <host>         the device in Fleet: serial number, hostname or UUID (Fleet console, Hosts)
+#   <device-name>  lowercase letters, digits, hyphens, e.g. alice-phone
+#
+# Runs as you, with your own fleetctl context (fleetctl config set --address https://mdm.example.com, then
+# fleetctl login, or an API token from the console: My account). docs/howto/mdm.md, "Tailscale app".
+set -euo pipefail
+
+host=${1:?usage: bin/mdm-tailscale <host> <device-name> [--dry-run]}
+name=${2:?usage: bin/mdm-tailscale <host> <device-name> [--dry-run]}
+dry=${3:-}
+[[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "device name: lowercase letters, digits, hyphens" >&2; exit 2; }
+[[ $host =~ ^[A-Za-z0-9._-]+$ ]] || { echo "host: a serial number, hostname or UUID" >&2; exit 2; }
+
+login_url=https://hs.example.com
+app_store_id=1470499037 # Tailscale (App Store)
+
+payload=$(mktemp "${TMPDIR:-/tmp}/mdm-tailscale.XXXXXX")
+trap 'rm -f "$payload"' EXIT
+cat > "$payload" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Command</key>
+	<dict>
+		<key>RequestType</key>
+		<string>InstallApplication</string>
+		<key>iTunesStoreID</key>
+		<integer>$app_store_id</integer>
+		<!-- Already installed: take it under management (the user is asked once) instead of reinstalling -->
+		<key>ChangeManagementState</key>
+		<string>Managed</string>
+		<!-- 0: the app stays when the phone leaves MDM -->
+		<key>ManagementFlags</key>
+		<integer>0</integer>
+		<key>Configuration</key>
+		<dict>
+			<key>LoginURL</key>
+			<string>$login_url</string>
+			<key>AlwaysOn.Enabled</key>
+			<true/>
+			<key>UseTailscaleSubnets</key>
+			<string>always</string>
+			<key>UseTailscaleDNSSettings</key>
+			<string>always</string>
+			<key>ManagedByOrganizationName</key>
+			<string>labstack</string>
+			<key>Hostname</key>
+			<string>$name</string>
+		</dict>
+	</dict>
+</dict>
+</plist>
+EOF
+
+if [[ $dry == --dry-run ]]; then
+  cat "$payload"
+  exit 0
+fi
+command -v fleetctl > /dev/null || { echo "fleetctl not found (docs/howto/mdm.md, Tools)" >&2; exit 1; }
+fleetctl mdm run-command --payload "$payload" --hosts "$host"
+echo "Check the result: fleetctl get mdm-command-results --id <the command UUID above>"

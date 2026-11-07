@@ -1,0 +1,14 @@
+---
+# NIC names pinned to the VM MACs (inventories/labnode/group_vars/all/pvedev.yml, read by tofu/envs/labnode)
+pve_nic_pins:
+  - { name: nic0, mac: "00:00:5e:00:53:03" }
+  - { name: nic1, mac: "00:00:5e:00:53:04" }
+pve_net_bridge_port: nic0
+pve_net_address: __DEV_NET__.12/24
+pve_net_gateway: __DEV_NET__.1
+pve_net_storage:
+  iface: nic1
+  bridge: vmbr1
+  address: __DEV_STOR_NET__.12/24
+pve_net_eee_off: []
+pve_blacklist_modules: []

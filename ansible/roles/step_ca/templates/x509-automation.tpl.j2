@@ -1,0 +1,8 @@
+{#- X.509 template for {{ step_ca_template_name }}: client authentication only, the name fixed here
+    (OpenBao cert auth matches on it). No SANs, so it cannot pass as a server. -#}
+{
+  "subject": {"commonName": {{ step_ca_template_name | to_json }}},
+  "sans": [],
+  "keyUsage": ["digitalSignature"],
+  "extKeyUsage": ["clientAuth"]
+}

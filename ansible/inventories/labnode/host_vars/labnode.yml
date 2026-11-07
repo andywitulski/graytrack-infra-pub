@@ -1,0 +1,21 @@
+---
+# Node network, like pve01-03: the dock's Ethernet is the only uplink, on a "Node trunk" switch port
+# (native Management VLAN 100, tagged security, services, Edge; ansible/network/switching.yml).
+# vmbr0 is VLAN-aware: paw01 untagged (Management), gpu01 tagged 120 (Services).
+# Fill in the NIC address after the install: ip -br link (the dock NIC, not the Thunderbolt or Wi-Fi ones).
+pve_nic_pins:
+  - { name: nic0, mac: "00:00:5e:00:53:07" }
+pve_net_bridge_port: nic0
+pve_net_address: __MGMT_NET__.4/24
+pve_net_gateway: __MGMT_NET__.1
+pve_dns_servers: [__MGMT_NET__.1]   # "Mgmt DNS"; bootstrap.yml sets it (the installer had the node itself)
+pve_net_eee_off: []
+# Wi-Fi off on the hypervisor; the GPU drivers stay off the host (vfio owns the GPU)
+pve_blacklist_modules: [iwlmvm, iwlwifi, nouveau, nvidia, nvidia_drm, nvidia_modeset]
+
+# Second disk for VM storage (the 2TB NVMe that held /lab). LVM-thin pool "lab" is created on it.
+# Fill in after the install: ls -l /dev/disk/by-id/ | command grep nvme
+labnode_lab_disk: /dev/disk/by-id/__LAB_DISK_ID__
+
+# playbooks/patch.yml: rebooting this node reboots paw01, so a run from paw01 leaves it for the workstation
+patch_hosts_controllers: [paw01]

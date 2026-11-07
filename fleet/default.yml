@@ -1,0 +1,47 @@
+# Fleet configuration as code (docs/howto/mdm.md). Applied with bin/fleet-gitops <env>; never edit these
+# settings in the Fleet UI, the next run puts this file back. Fleet Free: one group of hosts, no fleets
+# (teams), so every control below applies to every enrolled device.
+#
+# Values starting with $ come from the environment bin/fleet-gitops builds (OpenBao, OpenTofu outputs).
+# $FLEET_SSO_METADATA and $FLEET_ENROLL_SECRET arrive already quoted: leave them unquoted here.
+
+org_settings:
+  org_info:
+    org_name: labstack
+  server_settings:
+    server_url: $FLEET_URL
+    enable_analytics: false
+    ai_features_disabled: true
+  # The console signs in through Authentik (SAML app "fleet", group fleet-admins). Free has no JIT
+  # provisioning: a Fleet user with the same email must exist first (the runbook's first-run step).
+  sso_settings:
+    enable_sso: true
+    idp_name: Authentik
+    entity_id: fleet
+    metadata: $FLEET_SSO_METADATA
+    enable_sso_idp_login: false
+  # Enrollment links (Add hosts, iOS & iPadOS, Personal) carry this secret; Fleet refuses enrollment without it
+  secrets:
+    - secret: $FLEET_ENROLL_SECRET
+  features:
+    enable_host_users: false
+    enable_software_inventory: true
+  host_expiry_settings:
+    host_expiry_enabled: false
+
+agent_options:
+  config:
+    options:
+      distributed_interval: 60
+      logger_tls_period: 60
+
+controls:
+  apple_settings:
+    configuration_profiles:
+      - path: profiles/apple/passcode.mobileconfig
+      - path: profiles/apple/tailscale-vpn.mobileconfig
+      - path: profiles/apple/lab-root-ca.mobileconfig
+
+policies: []
+reports: []
+labels: []

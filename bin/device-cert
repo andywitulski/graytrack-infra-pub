@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Device certificate for this machine (ADR-0006, docs/howto/device-trust.md).
+#
+#   bin/device-cert <env> enroll [<you@example.com>]  make the device key if there is none, then a 30-day
+#                                                     certificate for it from step-ca-login (fresh MFA in
+#                                                     Authentik); prints the line to register the device
+#   bin/device-cert <env> status                      key hash, certificate validity, the registration line
+#
+# The private key never exists outside the device:
+#   macOS  not yet. The Secure Enclave (mackms) only serves binaries signed with a Developer ID and a
+#          provisioning profile; step-kms-plugin's release build is ad-hoc signed and gets -34018
+#          (errSecMissingEntitlement). Planned: a YubiKey (yubikey:), which Safari and Chrome read natively.
+#   Linux  the TPM (paw01's vTPM), through tpmkms; the account needs /dev/tpmrm0 (group tss, roles/paw)
+# A device only counts when the browser that signs in runs on it (Caddy asks that browser for the
+# certificate). paw01 has none yet, so its certificate is enrolled but not usable for sign-in.
+# The CA signs a CSR made with that key. Authentik trusts the device by the SHA-256 of its public key once
+# that hash is in trusted_devices (tofu/authentik/<env>/main.tf). Re-enrolling keeps the key, so the
+# registration stays valid; a new key (new machine, wiped keychain) needs a new registration.
+set -euo pipefail
+
+env=${1:?usage: bin/device-cert <dev|prod> enroll|status [<you@example.com>]}
+cmd=${2:?usage: bin/device-cert <dev|prod> enroll|status [<you@example.com>]}
+shift 2
+case "$env" in dev | prod) ;; *) echo "unknown env: $env (labnode uses prod's CA)" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root"
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+platform_env "$env" "$root"
+
+export STEPPATH="$HOME/.local/share/labstack/step-$env" NO_COLOR=1
+dir="$HOME/.config/labstack/device"
+mkdir -p "$STEPPATH" "$dir"
+chmod 700 "$dir"
+crt="$dir/$env.crt"
+name="labstack-device-$env"
+device=$(hostname -s)
+
+case "$(uname -s)" in
+  Darwin)
+    echo "macOS: no device key store that works yet (Secure Enclave needs a Developer ID build; YubiKey planned)" >&2
+    exit 2 ;;
+  Linux) uri="tpmkms:name=$name" ;;
+  *) echo "unsupported OS: $(uname -s)" >&2; exit 2 ;;
+esac
+
+command -v step > /dev/null || { echo "step CLI missing" >&2; exit 1; }
+step kms version > /dev/null 2>&1 || {
+  echo "step-kms-plugin missing: Linux, roles/paw installs it; macOS, not supported yet" >&2
+  echo "from github.com/smallstep/step-kms-plugin/releases into a directory on PATH (not Homebrew)." >&2
+  exit 1
+}
+
+sha256_hex() { if command -v sha256sum > /dev/null; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
+
+# SHA-256 of the DER SubjectPublicKeyInfo: what Caddy puts in the header and Authentik compares
+key_hash() { step kms key "$uri" | openssl pkey -pubin -outform DER | sha256_hex; }
+
+# The Authentik username is the certificate's common name (step-ca template oidc-device)
+owner() {
+  [[ -f $crt ]] || { echo "<your authentik username>"; return; }
+  openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 | sed -n 's/.*CN=\([^,]*\).*/\1/p'
+}
+
+registration() {
+  echo "Register it in tofu/authentik/$env/main.tf, trusted_devices, then bin/tf-ak $env apply:"
+  echo "    $device = { owner = \"$(owner)\", key_sha256 = \"$(key_hash)\" }"
+}
+
+case "$cmd" in
+  enroll)
+    identity=${1:-}
+    [[ -n $identity ]] || { echo "usage: bin/device-cert $env enroll <you@example.com> (your Authentik e-mail)" >&2; exit 2; }
+
+    if step kms key "$uri" > /dev/null 2>&1; then
+      echo "Device key: $uri (existing, kept)"
+    else
+      echo "Creating the device key: $uri"
+      step kms create "$uri" > /dev/null || {
+        echo "Could not create it. Is this account in group tss (log in again after roles/paw adds it)?" >&2
+        exit 1
+      }
+    fi
+
+    tmp=$(gt_tmpdir)
+    trap 'gt_shred_dir "$tmp"' EXIT
+    # The OIDC provisioner accepts a CSR for your own e-mail only; the CA's template sets the final names
+    step certificate create --csr --key "$uri" "$identity" "$tmp/device.csr" > /dev/null
+
+    echo "Authentik opens in your browser: confirm with your second factor (not the device)."
+    step ca sign "$tmp/device.csr" "$tmp/device.crt" --provisioner authentik-device \
+      --ca-url "$PLATFORM_CA_LOGIN_URL" --root "$PLATFORM_CA_ROOT" --not-after 720h --force > /dev/null
+    mv -f "$tmp/device.crt" "$crt"
+    chmod 600 "$crt"
+
+    # Pair the certificate with the key where the browser and TLS stack look for identities
+    if step kms certificate --import "$crt" "$uri" > /dev/null 2>&1; then
+      echo "Certificate stored with the key ($uri)."
+    elif [[ $(uname -s) == Darwin ]]; then
+      security import "$crt" -k "$HOME/Library/Keychains/login.keychain-db" > /dev/null
+      echo "Certificate imported into the login keychain."
+    else
+      echo "Could not store the certificate with the key; it is in $crt." >&2
+    fi
+
+    step certificate inspect "$crt" --short
+    if [[ $(uname -s) == Darwin ]]; then
+      security find-identity -v -p ssl-client | grep -i "$identity" || \
+        echo "No keychain identity shows yet: docs/howto/device-trust.md, troubleshooting." >&2
+    fi
+    registration
+    echo "Valid until $(openssl x509 -in "$crt" -noout -enddate | cut -d= -f2). Renew by running enroll again (same key)."
+    ;;
+  status)
+    if step kms key "$uri" > /dev/null 2>&1; then
+      echo "Device key: $uri"
+      echo "Key SHA-256: $(key_hash)"
+    else
+      echo "No device key ($uri). bin/device-cert $env enroll <you@example.com>"
+      exit 1
+    fi
+    if [[ -f $crt ]]; then
+      step certificate inspect "$crt" --short
+    else
+      echo "No certificate yet ($crt)."
+    fi
+    registration
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    exit 2
+    ;;
+esac

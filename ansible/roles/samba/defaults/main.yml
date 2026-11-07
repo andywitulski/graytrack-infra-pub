@@ -1,0 +1,7 @@
+---
+# { name, path, valid_users (optional, defaults to samba_users), comment, library }
+# library: true: everything written as samba_library_owner, group-writable, junk files vetoed
+samba_shares: []
+samba_users: []
+samba_interface: eth0
+samba_library_owner: labdata

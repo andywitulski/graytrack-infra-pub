@@ -1,0 +1,12 @@
+---
+- name: Restart openbao
+  ansible.builtin.service:
+    name: openbao
+    state: restarted
+
+# SIGHUP: reopens the audit log and reloads the listener certificate
+- name: Reload openbao
+  ansible.builtin.service:
+    name: openbao
+    state: reloaded
+  listen: host_tls certificate changed

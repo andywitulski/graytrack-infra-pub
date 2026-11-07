@@ -1,0 +1,6 @@
+---
+# ts02: Tailscale exit node (docs/howto/vpn.md, Roaming device). Its own UDP port, forwarded from the WAN
+# (network/zone_policy.yml, unifi_port_forward_extra), so devices behind restrictive NAT connect directly.
+tailscale_router_role: exit
+tailscale_router_port: 41642
+tailscale_router_exit_tag: "tag:exit"

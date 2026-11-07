@@ -1,0 +1,21 @@
+---
+pbs_repo_key_url: ""
+pbs_datastore_name: tank
+pbs_datastore_path: /mnt/datastore/tank
+
+# Identity the cluster backs up as: a PBS user plus an API token, DatastoreBackup on the datastore only.
+pbs_cluster_user: pve@pbs
+pbs_cluster_token: cluster
+# More tokens on the same user, each with its own secret and its own backup ownership (a token cannot
+# read or prune backups another token made). prod: [labnode] for the standalone node (inventories/labnode).
+pbs_extra_tokens: []
+# Where a newly generated token secret is left (root only) for you to move into sops, then delete:
+# <dir>/pbs-<token>-token.json (the cluster's: /root/pbs-cluster-token.json)
+pbs_token_drop_dir: /root
+
+# Retention runs on PBS (prune job), not in the PVE backup job.
+pbs_prune_schedule: daily
+pbs_prune_keep: { keep-daily: 7, keep-weekly: 4, keep-monthly: 6 }
+pbs_gc_schedule: "sat 03:00"
+pbs_verify_schedule: "sun 04:00"
+pbs_verify_outdated_after_days: 30

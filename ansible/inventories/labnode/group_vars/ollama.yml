@@ -1,0 +1,8 @@
+---
+# gpu01 (roles/ollama). The version is shared: inventories/common/group_vars/ollama.yml.
+ollama_models_disk_serial: ollama-models   # tofu/envs/labnode/gpu.tf, scsi1 (backup = false)
+# One entry per line of the old ollama-models.txt, as `ollama pull` takes them (no tag: :latest).
+# Pulled when missing, never removed; a model taken off this list stays until `ollama rm`.
+ollama_models:
+  - llama3.1:8b
+  - nomic-embed-text

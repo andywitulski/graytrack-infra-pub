@@ -1,0 +1,16 @@
+---
+# PBS backups of labnode's guests to prod's pbs01 (playbooks/backups.yml, second play). labnode has no pbs
+# group: the server is described here. Its own token (pve@pbs!labnode, made by roles/pbs on pbs01), so
+# labnode can neither read nor prune the cluster's backups, and its own encryption key.
+#   pbs_cluster_token_secret, pbs_encryption_key: this inventory's sops (bin/gen-service-secrets labnode)
+# VM IDs 5xxx do not overlap the cluster's 1xxx-4xxx, so the groups stay apart in the one datastore.
+pbs_remote:
+  ssh_host: __MGMT_NET__.21          # pbs01; SSH only to read its certificate fingerprint
+  address: __MGMT_NET__.21
+  datastore: tank
+  auth_id: pve@pbs!labnode
+  storage_id: pbs01
+  schedule: "02:30"                 # after the cluster's 02:00 job, after gpu01's 01:30 database dumps
+  # paw01 (the age key and SSH keys are inside; PBS encrypts the backup) and gpu01 (the rag database;
+  # its models disk has backup = false). Not the dev cluster or kali01: rebuilt, never restored.
+  vmids: [5001, 5011]

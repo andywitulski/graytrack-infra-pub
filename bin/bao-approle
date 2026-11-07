@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Usage: bin/bao-approle <dev|prod> <ansible|tofu>
+# Issues a new AppRole secret ID for a machine identity (tofu/modules/openbao_config) and stores the pair
+# in secrets/openbao-<env>.enc.yaml as approle_<role>_role_id / approle_<role>_secret_id. bin/ap logs in
+# with the ansible pair. The secret ID works only from the controller (CIDR-bound) and expires (90 days by
+# default): run this again to rotate; the previous secret ID is destroyed afterwards.
+set -euo pipefail
+
+env=${1:?usage: bin/bao-approle <dev|prod> <role>}
+role=${2:?usage: bin/bao-approle <dev|prod> <role>}
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+[[ $role =~ ^[a-z0-9-]+$ ]] || { echo "bad role name: $role" >&2; exit 2; }
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root"
+out="secrets/openbao-$env.enc.yaml"
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+platform_env "$env" "$root"
+bao_root_token "$env" "$root"
+
+old_accessor=""
+if sops decrypt --extract "[\"approle_${role}_secret_id\"]" "$out" > /dev/null 2>&1; then
+  old=$(sops decrypt --extract "[\"approle_${role}_secret_id\"]" "$out")
+  old_accessor=$(bao_api POST "auth/approle/role/$role/secret-id/lookup" "$(jq -n --arg s "$old" '{secret_id: $s}')" 2> /dev/null |
+    jq -r '.data.secret_id_accessor // empty' || true)
+  unset old
+fi
+
+role_id=$(bao_api GET "auth/approle/role/$role/role-id" | jq -r .data.role_id)
+secret_id=$(bao_api POST "auth/approle/role/$role/secret-id" '{}' | jq -r .data.secret_id)
+[[ -n $role_id && $role_id != null && -n $secret_id && $secret_id != null ]] ||
+  { echo "OpenBao returned no role or secret ID for '$role' (bin/tf-bao $env apply first?)" >&2; exit 1; }
+
+sops set --idempotent "$out" "[\"approle_${role}_role_id\"]" "$(jq -n --arg v "$role_id" '$v')"
+printf '%s' "$(jq -n --arg v "$secret_id" '$v')" | sops set --value-stdin "$out" "[\"approle_${role}_secret_id\"]"
+unset secret_id
+
+if [[ -n $old_accessor ]]; then
+  bao_api POST "auth/approle/role/$role/secret-id-accessor/destroy" "$(jq -n --arg a "$old_accessor" '{secret_id_accessor: $a}')" > /dev/null
+  echo "previous secret ID destroyed"
+fi
+echo "approle_${role}_role_id / approle_${role}_secret_id stored in $out"

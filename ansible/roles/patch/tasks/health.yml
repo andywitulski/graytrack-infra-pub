@@ -1,0 +1,91 @@
+---
+# After the upgrade (and the reboot, if there was one): the host's main services answer, and no unit
+# failed that had not failed before.
+
+# ---------------------------------------------------------------- platform tier
+- name: PostgreSQL accepts connections
+  ansible.builtin.command: pg_isready -q -h {{ ansible_host }} # the network address: localhost passes even when clients cannot connect
+  register: patch_pg
+  until: patch_pg.rc == 0
+  retries: 20
+  delay: 6
+  changed_when: false
+  when: "'postgres' in group_names or 'rag_db' in group_names"
+
+- name: OpenBao unsealed and active (static seal unseals it on start)
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}:8200/v1/sys/health"
+    ca_path: /etc/openbao/tls/ca.crt
+    status_code: 200
+  register: patch_bao
+  until: patch_bao.status == 200
+  retries: 20
+  delay: 6
+  when: "'openbao' in group_names"
+
+- name: Step-ca answers (automation and people)
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}:{{ item }}/health"
+    ca_path: /etc/step-ca/certs/root_ca.crt
+  register: patch_ca
+  until: patch_ca.status == 200
+  retries: 20
+  delay: 6
+  loop: [443, 8443]
+  when: "'step_ca' in group_names"
+
+# ---------------------------------------------------------------- containers
+- name: Docker containers settled (none unhealthy, starting or restarting)
+  ansible.builtin.command:
+    argv: [docker, ps, -a, --format, "{% raw %}{{.Names}}: {{.Status}}{% endraw %}"]
+  register: patch_docker
+  until: >-
+    patch_docker.stdout_lines | select('search', 'unhealthy|health: starting|^[^:]+: Restarting') | list | length == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+  when: "'docker_hosts' in group_names"
+
+# ---------------------------------------------------------------- Proxmox nodes
+- name: Proxmox services running # noqa: command-instead-of-module (read-only query, no module reports it)
+  ansible.builtin.command: systemctl is-active pve-cluster pvedaemon pveproxy pvestatd
+  register: patch_pve_svc
+  until: patch_pve_svc.rc == 0
+  retries: 20
+  delay: 6
+  changed_when: false
+  when: "'pve_nodes' in group_names"
+
+- name: Cluster quorate with every node online (a standalone node has no cluster entry and passes)
+  ansible.builtin.command: pvesh get /cluster/status --output-format json
+  register: patch_pve_cluster
+  until: >-
+    patch_pve_cluster.rc == 0
+    and (patch_pve_cluster.stdout | from_json | selectattr('type', 'equalto', 'cluster')
+         | rejectattr('quorate', 'equalto', 1) | list | length == 0)
+    and (patch_pve_cluster.stdout | from_json | selectattr('type', 'equalto', 'node')
+         | rejectattr('online', 'equalto', 1) | list | length == 0)
+  retries: 40
+  delay: 15
+  changed_when: false
+  when: "'pve_nodes' in group_names"
+
+- name: Guests started (pve-guests has started the on-boot guests) # noqa: command-instead-of-module (read-only query, no module reports it)
+  ansible.builtin.command: systemctl is-active pve-guests
+  register: patch_pve_guests
+  until: patch_pve_guests.stdout == 'active'
+  retries: 40
+  delay: 15
+  changed_when: false
+  when: "'pve_nodes' in group_names"
+
+# ---------------------------------------------------------------- every host
+- name: No unit failed that had not failed before # noqa: command-instead-of-module (read-only query, no module reports it)
+  ansible.builtin.command: systemctl list-units --failed --plain --no-legend
+  register: patch_failed_after
+  until: >-
+    patch_failed_after.stdout_lines | map('split') | map('first')
+    | reject('in', patch_failed_before.stdout_lines | map('split') | map('first') | list) | list | length == 0
+  retries: 10
+  delay: 15
+  changed_when: false

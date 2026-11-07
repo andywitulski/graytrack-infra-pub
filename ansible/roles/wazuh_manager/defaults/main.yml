@@ -1,0 +1,233 @@
+---
+# Wazuh single-node server (indexer, manager, dashboard) from the official wazuh-docker release.
+# Upgrades are deliberate: bump wazuh_manager_version, then follow Wazuh's Docker upgrade guide (the role only
+# extracts a release into an empty directory and never overwrites an existing deployment).
+# renovate: datasource=github-releases depName=wazuh/wazuh-docker
+wazuh_manager_version: "4.14.8"
+wazuh_manager_docker_dir: /opt/wazuh-docker
+wazuh_manager_dir: "{{ wazuh_manager_docker_dir }}/single-node"
+wazuh_manager_release_url: "https://github.com/wazuh/wazuh-docker/archive/refs/tags/v{{ wazuh_manager_version }}.tar.gz"
+
+# Published defaults of the Docker deployment, used only to detect and replace them.
+wazuh_manager_default_admin_password: SecretPassword
+wazuh_manager_default_api_password: "MyS3cr37P450r.*-"
+
+# From sops (group_vars/all/secrets.sops.yml):
+#   wazuh_admin_password, wazuh_kibanaserver_password, wazuh_api_password, wazuh_enrollment_password
+# Characters are restricted (no $ ' " \ or whitespace): they are written into docker-compose.yml and YAML.
+
+# Paths inside the indexer container (wazuh-docker 4.14 layout)
+wazuh_manager_indexer_home: /usr/share/wazuh-indexer
+# How long to wait for the indexer after compose up, in 10 s steps (a first start on a small VM is slow)
+wazuh_manager_indexer_wait_retries: 30
+
+# ---------------------------------------------------------------- log sources (tasks/sources.yml)
+# Hosts allowed to send syslog to the manager (UDP, unauthenticated: keep this to exact addresses).
+# Empty = no syslog listener. Prod sets the UniFi gateway in group_vars/wazuh_manager.yml.
+wazuh_manager_syslog_allowed_ips: []
+wazuh_manager_syslog_port: 514
+
+# Custom ruleset files written into the manager: src ending in .j2 is a template, anything else a file
+wazuh_manager_ruleset_files:
+  - { src: labstack_decoders.xml.j2, dest: /var/ossec/etc/decoders/labstack_decoders.xml }
+  - { src: labstack_rules.xml, dest: /var/ossec/etc/rules/labstack_rules.xml }
+  # Loads after labstack_rules.xml (files load in name order): its rules extend 100306 from there
+  - { src: labstack_tuning.xml.j2, dest: /var/ossec/etc/rules/labstack_tuning.xml }
+# Earlier names of ruleset files, removed from the manager
+wazuh_manager_retired_ruleset_files:
+  - /var/ossec/etc/rules/labstack_host_rules.xml
+# The automation account and the addresses it may log in from: the controllers, lab_controllers in the
+# env inventory (admin workstation and paw01 in prod). labstack_tuning.xml: 100401 hides its sudo noise, 100402
+# alerts at level 10 when it logs in from anywhere else.
+wazuh_manager_automation_user: ansible
+wazuh_manager_automation_sources: "{{ lab_controllers }}"
+# Its numeric UID on the hosts (audit events carry auid, not names)
+wazuh_manager_automation_uid: 1000
+
+# Self-test after every deployment: each line goes through wazuh-logtest and must hit its rule.
+# Lines look the way the manager receives them (journald entries arrive in syslog format).
+wazuh_manager_logtest_samples:
+  # Tuning (labstack_tuning.xml): real lines from the hosts and the gateway
+  - rule: "100400"
+    line: "Oct 10 09:36:14 pve03 sudo[1383046]: pam_unix(sudo:session): session opened for user root(uid=0) by ansible(uid=1000)"
+  - rule: "100401"
+    line: >-
+      Oct 10 09:36:16 pve03 sudo[1383078]:  ansible : PWD=/home/ansible ; USER=root ;
+      COMMAND=/bin/sh -c 'echo BECOME-SUCCESS-hvehnahwyoswfalipfbmhkycdqmgvjgi ; /usr/bin/python3.13'
+  - rule: "100402"
+    line: >-
+      Oct 10 09:42:16 files01 sshd-session[19419]: Accepted publickey for ansible from __LAN_NET__.99 port 51204
+      ssh2: ED25519 SHA256:51YFKFVJseTjPACErzR/AoMb4u7TSEL/Vq4VmsR28nY
+  # A plain key from the controller: allowed until ssh_ca_enforce, a standing key after it
+  - rule: "{{ '100452' if ssh_ca_enforce | default(false) | bool else '5715' }}"
+    line: >-
+      Oct 10 09:42:16 files01 sshd-session[19419]: Accepted publickey for ansible from {{ wazuh_manager_automation_sources | first }} port 51204
+      ssh2: ED25519 SHA256:51YFKFVJseTjPACErzR/AoMb4u7TSEL/Vq4VmsR28nY
+  # SSH certificates from ca01 (lines as sshd writes them)
+  - rule: "100450"
+    line: >-
+      Oct 28 22:57:30 git01 sshd-session[20311]: Accepted publickey for ansible from {{ wazuh_manager_automation_sources | first }} port 52892
+      ssh2: ED25519-CERT SHA256:r5zFUmBc98FPPlq8lpm3986HhsZrTx7bpAbaOw5KlBw ID ansible@paw01
+      (serial 4885765211517163206) CA ECDSA SHA256:4dWaiAHXk4I4G98ZcTYXghp0BvInxMsbBQF+EzVtynI
+  - rule: "100451"
+    line: >-
+      Oct 28 23:02:31 git01 sshd-session[20377]: Accepted publickey for ansible from {{ wazuh_manager_automation_sources | first }} port 57320
+      ssh2: ED25519-CERT SHA256:UqDaeHDLajRTXAPQD9GveznKcFwCmzSV15YC+jQ71Jo ID breakglass:ansible@paw01:20261028T230220Z
+      (serial 1761692540) CA ECDSA SHA256:4dWaiAHXk4I4G98ZcTYXghp0BvInxMsbBQF+EzVtynI
+  - rule: "100421"
+    line: >-
+      4101 6 tap4101i0-IN 10/Oct/2026:09:15:01 -0400 ACCEPT: IN=fwbr4101i0 OUT=fwbr4101i0 PHYSIN=fwln4101i0
+      PHYSOUT=tap4101i0 MAC=00:00:5e:00:53:0f:00:00:5e:00:53:20:08:00 SRC=__LAN_NET__.6 DST=__DMZ_NET__.10 LEN=60 TOS=0x00
+      PREC=0x00 TTL=63 ID=0 DF PROTO=TCP SPT=51515 DPT=8080 SEQ=1 ACK=0 WINDOW=64240 SYN
+  - rule: "100422"
+    line: >-
+      4111 6 tap4111i0-IN 10/Oct/2026:09:15:01 -0400 policy DROP: IN=fwbr4111i0 OUT=fwbr4111i0 PHYSIN=fwln4111i0
+      PHYSOUT=tap4111i0 MAC=00:00:5e:00:53:0f:00:00:5e:00:53:20:08:00 SRC=__SVC_NET__.13 DST=__SVC_NET__.11 LEN=60 TOS=0x00
+      PREC=0x00 TTL=64 ID=0 DF PROTO=TCP SPT=40404 DPT=22 SEQ=1 ACK=0 WINDOW=64240 SYN
+  # Broadcast (a DHCP discover) and multicast (an MLD report): seen by every guest on the VLAN
+  - rule: "100444"
+    line: >-
+      4151 6 tap4151i0-IN 29/Oct/2026:19:48:46 -0400 ACCEPT: IN=fwbr4151i0 OUT=fwbr4151i0 PHYSIN=fwln4151i0
+      PHYSOUT=tap4151i0 MAC=ff:ff:ff:ff:ff:ff:00:00:5e:00:53:21:08:00 SRC=0.0.0.0 DST=255.255.255.255 LEN=328 TOS=0x00
+      PREC=0x00 TTL=64 ID=24081 PROTO=UDP SPT=68 DPT=67 LEN=308
+  - rule: "100444"
+    line: >-
+      4151 6 tap4151i0-IN 28/Oct/2026:21:00:11 -0400 ACCEPT: IN=fwbr4151i0 OUT=fwbr4151i0 PHYSIN=fwln4151i0
+      PHYSOUT=tap4151i0 MAC=33:33:00:00:00:16:00:00:5e:00:53:22:86:dd SRC=fe80::200:5eff:fe00:5301 DST=ff02::16 LEN=36
+      TC=0 FLOWLBL=0 HOPLIMIT=1 NEXTHDR=HOPOPTS PROTO=ICMPV6 TYPE=143 CODE=0
+  # The Wazuh agent's own CIS check ("auditctl -l" from /var/ossec, no login session), and the same
+  # command from a person's session, which stays at 100431
+  - rule: "100445"
+    line: >-
+      type=SYSCALL msg=audit(1793231079.493:18015): arch=c000003e syscall=59 success=yes exit=0 a0=7f11e8bf4960
+      a1=7f11d8089540 a2=7ffd7766c068 a3=8 items=3 ppid=18632 pid=133763 auid=4294967295 uid=0 gid=0 euid=0 suid=0
+      fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4294967295 comm="auditctl" exe="/usr/sbin/auditctl"
+      subj=unconfined key="audit_tools" type=EXECVE msg=audit(1793231079.493:18015): argc=2 a0="auditctl" a1="-l"
+      type=CWD msg=audit(1793231079.493:18015): cwd="/var/ossec" type=PROCTITLE msg=audit(1793231079.493:18015):
+      proctitle=617564697463746C002D6C
+  - rule: "100431"
+    line: >-
+      type=SYSCALL msg=audit(1793231079.493:18016): arch=c000003e syscall=59 success=yes exit=0 a0=7f11e8bf4960
+      a1=7f11d8089540 a2=7ffd7766c068 a3=8 items=3 ppid=1200 pid=133764 auid=1001 uid=0 gid=0 euid=0 suid=0 fsuid=0
+      egid=0 sgid=0 fsgid=0 tty=pts0 ses=9 comm="auditctl" exe="/usr/sbin/auditctl" subj=unconfined
+      key="audit_tools" type=EXECVE msg=audit(1793231079.493:18016): argc=2 a0="auditctl" a1="-D" type=CWD
+      msg=audit(1793231079.493:18016): cwd="/root" type=PROCTITLE msg=audit(1793231079.493:18016):
+      proctitle=617564697463746C002D44
+  - rule: "100447"
+    line: "2026-10-29 04:49:49 status half-configured step-ca:amd64 0.30.2-1"
+  - rule: "100430"
+    line: >-
+      type=SYSCALL msg=audit(1791629000.123:4567): arch=c000003e syscall=257 success=yes exit=3 a0=ffffff9c a1=55d2 a2=241
+      a3=1b6 items=2 ppid=1200 pid=1234 auid=1001 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=5
+      comm="vi" exe="/usr/bin/vim.basic" subj=unconfined key="identity"
+  - rule: "100435"
+    line: >-
+      type=SYSCALL msg=audit(1791629000.789:4569): arch=c000003e syscall=257 success=yes exit=3 a0=ffffff9c a1=55d2 a2=241
+      a3=1b6 items=2 ppid=1200 pid=1236 auid=1001 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=7
+      comm="python3" exe="/usr/bin/python3.13" subj=unconfined key="identity"
+  - rule: "100433"
+    line: >-
+      type=SYSCALL msg=audit(1791629000.456:4568): arch=c000003e syscall=257 success=yes exit=3 a0=ffffff9c a1=55d2 a2=241
+      a3=1b6 items=2 ppid=1200 pid=1235 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=6
+      comm="python3" exe="/usr/bin/python3.13" subj=unconfined key="identity"
+  - rule: "100434"
+    line: "Oct 10 09:20:00 git01 systemd[1]: Stopping auditd.service - Security Auditing Service..."
+  - rule: "100438"
+    line: >-
+      type=CONFIG_CHANGE msg=audit(1792067647.410:15212): auid=1000 ses=76 subj=unconfined op=remove_rule
+      key="identity" list=4 res=1
+  - rule: "80705"
+    line: >-
+      type=CONFIG_CHANGE msg=audit(1792067647.410:15213): auid=1001 ses=77 subj=unconfined op=remove_rule
+      key="identity" list=4 res=1
+  - rule: "100439"
+    line: >-
+      type=ANOM_PROMISCUOUS msg=audit(1792068280.429:138129): dev=fwpr4001p0 prom=256 old_prom=0
+      auid=4294967295 uid=0 gid=0 ses=4294967295
+  - rule: "80710"
+    line: >-
+      type=ANOM_PROMISCUOUS msg=audit(1792068280.429:138130): dev=enp3s0 prom=256 old_prom=0
+      auid=4294967295 uid=0 gid=0 ses=4294967295
+  - rule: "100440"
+    line: "Oct 10 09:20:00 pve03 zed[2345]: eid=34 class=statechange pool='tank' vdev=ata-WDC_WD60EFPX-part1 vdev_state=FAULTED"
+  - rule: "100442"
+    line: "Oct 10 02:30:00 pve01 vzdump[98765]: ERROR: Backup of VM 4111 failed - unable to connect to the backup server"
+  - rule: "100403"
+    line: >-
+      Oct 09 08:59:15 Dream-Machine-Pro-Max CEF:0|Ubiquiti|UniFi Network|10.6.106|203|Blocked by Firewall|4|UNIFIcategory=Security
+      UNIFIhost=Gateway proto=TCP spt=443 dpt=65358 act=blocked app=Other UNIFIrisk=low
+      UNIFIpolicyName=External to Internal (block new) UNIFIpolicyType=Firewall UNIFIdirection=incoming
+      deviceInboundInterface=Internet 1 deviceOutboundInterface=Default src=2001:db8::1
+      dst=2001:db8::2 UNIFIsrcZone=External UNIFIsrcRegion=US UNIFIdstRegion=US
+      UNIFIdstZone=Internal UNIFIfirewallPolicy=External to Internal (block new) UNIFItotalBytes=96 UNIFItotalPackets=1
+      UNIFIflowCount=1 UNIFIflowId=null UNIFIutcTime=2026-10-09T12:59:15.227Z msg=2001:db8::1 was blocked
+      from accessing 2001:db8::2 by the External to Internal (block new) Firewall Policy.
+  # Folded lines are joined with a space, so the JSON samples break only after a comma
+  - rule: "100102"
+    line: >-
+      Oct  8 21:30:00 edge01 caddy[812]: {"level":"info","ts":1791581400.1,"logger":"http.log.access.log0","msg":"handled request",
+      "request":{"remote_ip":"203.0.113.9","remote_port":"51515","client_ip":"203.0.113.9","proto":"HTTP/2.0","method":"GET",
+      "host":"sync.example.com","uri":"/rest/system/status","headers":{"User-Agent":["curl/8.5"]}},
+      "bytes_read":0,"user_id":"","duration":0.01,"size":0,"status":401,"resp_headers":{}}
+  - rule: "100203"
+    line: >-
+      Oct  8 21:30:00 idp01 authentik[901]: {"action": "login_failed", "client_ip": "203.0.113.9", "context": {"username": "alice"},
+      "event": "Created Event", "host": "auth.example.com", "level": "info", "logger": "authentik.events.models", "pid": 51,
+      "timestamp": "2026-10-08T21:30:00.000000", "user": {"email": "", "pk": 1, "username": "AnonymousUser"}}
+  # OpenTofu (bin/tf-ak) reading the signing key pair from a controller; the same from elsewhere is 100207
+  - rule: "100446"
+    line: >-
+      Oct 29 04:12:49 idp01 authentik[6123]: {"action": "secret_view", "auth_via": "api_token", "client_ip": "{{ wazuh_manager_automation_sources | first }}",
+      "context": {"http_request": {"args": {}, "method": "GET",
+      "path": "/api/v3/crypto/certificatekeypairs/00000000-0000-4000-8000-000000000000/view_private_key/",
+      "request_id": "3dfa4aeb5b064eb68ecfdba8a949c725", "user_agent": "authentik-terraform@2026.8.0"},
+      "secret": {"app": "authentik_crypto", "model_name": "certificatekeypair", "name": "authentik Self-signed Certificate",
+      "pk": "00000000000040008000000000000000"}, "type": "private_key"}, "domain_url": "auth.example.com", "event": "Created Event",
+      "host": "auth.example.com", "level": "info", "logger": "authentik.events.models", "pid": 943329,
+      "timestamp": "2026-10-29T04:12:49.416902", "user": {"email": "admin@example.com", "pk": 4, "username": "akadmin"}}
+  - rule: "100207"
+    line: >-
+      Oct 29 04:12:49 idp01 authentik[6123]: {"action": "secret_view", "auth_via": "session", "client_ip": "__SVC_NET__.99",
+      "context": {"http_request": {"args": {}, "method": "GET",
+      "path": "/api/v3/crypto/certificatekeypairs/00000000-0000-4000-8000-000000000000/view_private_key/",
+      "request_id": "3dfa4aeb5b064eb68ecfdba8a949c726", "user_agent": "Mozilla/5.0"},
+      "secret": {"app": "authentik_crypto", "model_name": "certificatekeypair", "name": "authentik Self-signed Certificate",
+      "pk": "00000000000040008000000000000000"}, "type": "private_key"}, "domain_url": "auth.example.com", "event": "Created Event",
+      "host": "auth.example.com", "level": "info", "logger": "authentik.events.models", "pid": 943329,
+      "timestamp": "2026-10-29T04:12:49.416902", "user": {"email": "admin@example.com", "pk": 4, "username": "akadmin"}}
+  # Real lines from the gateway (UniFi Network 10.6), as tcpdump showed them
+  - rule: "100303"
+    line: >-
+      Oct 08 18:40:31 Dream-Machine-Pro-Max CEF:0|Ubiquiti|UniFi Network|10.6.106|544|Network Accessed|4|UNIFIcategory=Audit
+      UNIFIhost=Gateway UNIFIaccessMethod=web UNIFIadmin=UniFi User src=__LAN_NET__.108
+      UNIFIutcTime=2026-10-08T22:40:31.864Z msg=UniFi User accessed UniFi Network using the web. Source IP: __LAN_NET__.108
+  - rule: "100306"
+    line: >-
+      Oct 08 18:40:07 Dream-Machine-Pro-Max CEF:0|Ubiquiti|UniFi Network|10.6.106|203|Blocked by Firewall|4|UNIFIcategory=Security
+      UNIFIhost=Gateway proto=UDP spt=56324 dpt=123 act=blocked app=NTP UNIFIrisk=low
+      UNIFIpolicyName=Management to Gateway (block new) UNIFIpolicyType=Firewall UNIFIdirection=local deviceInboundInterface=mgmt
+      UNIFIdstDeviceMac=00:00:5e:00:53:10 UNIFIdstDeviceName=Gateway UNIFIdstDeviceModel=Gateway
+      UNIFIdstDeviceIp=__LAN_NET__.1 UNIFIdstDeviceVersion=5.1.33 UNIFIsrcClientAlias=00:00:5e:00:53:0c UNIFIsrcClientIp=__MGMT_NET__.5
+      UNIFIsrcClientMac=00:00:5e:00:53:0c UNIFIsrcZone=Management UNIFIdstZone=Gateway
+      UNIFIfirewallPolicy=Management to Gateway (block new) UNIFItotalBytes=76 UNIFItotalPackets=1 UNIFIflowCount=1
+      UNIFIflowId=null UNIFIutcTime=2026-10-08T22:40:07.040Z
+      msg=00:00:5e:00:53:0c was blocked from accessing Gateway by the Management to Gateway (block new) Firewall Policy.
+  # The same admin line without the syslog header (fallback decoder)
+  - rule: "100303"
+    line: >-
+      CEF:0|Ubiquiti|UniFi Network|10.6.106|544|Network Accessed|4|UNIFIcategory=Audit UNIFIaccessMethod=web
+      UNIFIadmin=UniFi User src=__LAN_NET__.108 msg=UniFi User accessed UniFi Network using the web.
+
+# ---------------------------------------------------------------- dashboard login through Authentik (tasks/sso.yml)
+# Runs once this environment's SAML metadata is in the repo:
+#   bin/tf-ak <env> output -raw wazuh_saml_metadata > ansible/files/<env>/wazuh-saml-metadata.xml
+# Secret: wazuh_saml_exchange_key in sops (64 hex characters, bin/gen-service-secrets).
+wazuh_manager_saml_metadata_file: "{{ playbook_dir }}/../files/{{ lab_env }}/wazuh-saml-metadata.xml"
+# The address browsers use; must match wazuh_dashboard_url in tofu/authentik/<env>/main.tf (SAML ACS)
+wazuh_manager_dashboard_url: "https://{{ ansible_host }}"
+wazuh_manager_saml_entity_id: wazuh-saml
+# Backend roles sent by Authentik's "Roles" attribute, and what they become
+wazuh_manager_saml_admin_backend_role: wazuh-admins
+wazuh_manager_saml_readonly_backend_role: wazuh-readonly
+# Inside the indexer container (mounted from config/wazuh_indexer/saml/ on the host)
+wazuh_manager_saml_dir_container: "{{ wazuh_manager_indexer_home }}/config/opensearch-security/saml"

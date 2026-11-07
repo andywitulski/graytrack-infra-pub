@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Usage: bin/bao-import-sops <prod|labnode> [--dry-run | --cutover]
+# Moves an environment's service secrets from sops into OpenBao (docs/howto/secrets-openbao.md).
+#
+# Copy (default): every key in ansible/inventories/<env>/group_vars/all/secrets.sops.yml that is neither
+# sops_only nor tofu_owned (secrets/policy.yml) is merged into kv/services/<env>/<service>, where <service>
+# is the key name up to the first underscore (forgejo_db_pass goes to kv/services/prod/forgejo). Fields
+# already in OpenBao that sops does not have are kept; a service whose fields are identical is skipped, so
+# OpenBao's version history only records real changes. PENDING values are copied too: roles test for them.
+#
+# --cutover: after the copy, proves that every key leaving sops (copied ones and the tofu_owned ones, which
+# OpenTofu must have written by now) reads back from OpenBao with the same value, then removes those keys
+# from sops and sets secrets_file_version to 2. From then on bin/ap reads them from OpenBao and sops keeps
+# only the sops_only keys. prod also drops the flat kv/services/<service> paths of the first import.
+# Rollback: revert the commit of the sops file and run with LABSTACK_OPENBAO=off (bin/ap).
+#
+# Only key names are printed. labnode uses prod's OpenBao (bin/lib/platform.sh, platform_of).
+set -euo pipefail
+
+env=${1:?usage: bin/bao-import-sops <prod|labnode> [--dry-run | --cutover]}
+mode=${2:-copy}
+case "$env" in prod | labnode) ;; *) echo "unknown env: $env (prod or labnode)" >&2; exit 2 ;; esac
+case "$mode" in copy | --dry-run | --cutover) ;; *) echo "unknown option: $mode" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root"
+src="ansible/inventories/$env/group_vars/all/secrets.sops.yml"
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+secrets_policy "$root"
+penv=$(platform_of "$env")
+platform_env "$penv" "$root"
+bao_root_token "$penv" "$root"
+
+sops_all=$(sops decrypt --output-type json "$src" | jq -c 'del(.sops)')
+movable=$(printf '%s' "$sops_all" | jq -c --arg s "$GT_SOPS_ONLY" --arg t "$GT_TOFU_OWNED" \
+  'with_entries(select((.key | test($s)) or (.key | test($t)) | not))')
+
+# ---------------------------------------------------------------- copy
+for svc in $(printf '%s' "$movable" | jq -r 'keys[] | split("_")[0]' | sort -u); do
+  path="services/$env/$svc"
+  data=$(printf '%s' "$movable" | jq -cS --arg p "$svc" 'with_entries(select(.key | startswith($p + "_")))')
+  current=$(bao_api GET "kv/data/$path" 2> /dev/null | jq -cS '.data.data // {}') || current='{}'
+  fields=$(printf '%s' "$data" | jq -r 'keys | join(", ")')
+  if printf '%s\n%s\n' "$current" "$data" | jq -es '.[0] as $c | .[1] | to_entries | all(.value == $c[.key])' > /dev/null; then
+    echo "same    $path ($fields)"
+  elif [[ $mode == --dry-run ]]; then
+    echo "would   $path ($fields)"
+  else
+    printf '%s' "$data" | bao_kv_patch "$path"
+    echo "set     $path ($fields)"
+  fi
+done
+
+[[ $mode == --cutover ]] || {
+  echo
+  echo "sops still holds these keys. When the smoke test passes: bin/bao-import-sops $env --cutover"
+  exit 0
+}
+
+# ---------------------------------------------------------------- cutover
+leaving=$(printf '%s' "$sops_all" | jq -c --arg s "$GT_SOPS_ONLY" 'with_entries(select(.key | test($s) | not))')
+bao_env_load "$env"
+bad=$(printf '%s\n%s\n' "$leaving" "$GT_BAO_SECRETS" | jq -rs '.[1] as $b | .[0] | to_entries | map(select($b[.key] != .value) | .key) | join(" ")')
+if [[ -n $bad ]]; then
+  echo "not in OpenBao, or different there: $bad" >&2
+  if printf '%s\n' "$bad" | tr ' ' '\n' | grep -qE "$GT_TOFU_OWNED"; then
+    echo "(the tofu_owned ones come from OpenTofu: bin/tf-ak $penv apply)" >&2
+  fi
+  echo "nothing removed from sops" >&2
+  exit 1
+fi
+
+for key in $(printf '%s' "$leaving" | jq -r 'keys[]'); do
+  sops unset "$src" "[\"$key\"]"
+  echo "moved   $key -> $(printf '%s' "$GT_BAO_PATHS" | jq -r --arg k "$key" '.[$k]')"
+done
+sops set "$src" '["secrets_file_version"]' 2
+
+if [[ $env == prod ]]; then # the first import wrote kv/services/<service>, without the environment
+  for legacy in $(bao_api LIST kv/metadata/services 2> /dev/null | jq -r '.data.keys[]? | select(endswith("/") | not)' || true); do
+    bao_api DELETE "kv/metadata/services/$legacy" > /dev/null
+    echo "removed kv/services/$legacy (old layout)"
+  done
+fi
+
+echo
+echo "$src now holds only: $(sops decrypt --output-type json "$src" | jq -r 'del(.sops) | keys | join(", ")')"
+echo "Next: bin/ap $env playbooks/openbao-smoke.yml, then commit $src"

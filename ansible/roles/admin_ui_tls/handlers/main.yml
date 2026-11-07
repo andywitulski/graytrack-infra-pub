@@ -1,0 +1,14 @@
+---
+- name: Reload the PBS proxy
+  ansible.builtin.systemd_service:
+    name: proxmox-backup-proxy
+    state: reloaded
+
+# The certificate files are single-file bind mounts: only a new container sees the replaced files
+- name: Recreate the Wazuh dashboard
+  community.docker.docker_compose_v2:
+    project_src: "{{ admin_ui_tls_wazuh_dir }}"
+    services: [wazuh.dashboard]
+    recreate: always
+    dependencies: false
+    state: present

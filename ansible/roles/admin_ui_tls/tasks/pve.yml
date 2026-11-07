@@ -1,0 +1,36 @@
+---
+# Proxmox VE: pveproxy (8006) serves /etc/pve/nodes/<node>/pveproxy-ssl.{pem,key} when present; pvenode
+# installs them and restarts pveproxy. Node-to-node traffic keeps the cluster's own pve-ssl certificates.
+- name: Certificate for the web UI and API
+  ansible.builtin.include_role:
+    name: x509_cert
+  vars:
+    x509_cert_name: pveproxy
+    x509_cert_dns: ["{{ inventory_hostname }}", "{{ inventory_hostname }}.{{ base_domain }}"]
+    x509_cert_ips: ["{{ ansible_host }}"]
+
+- name: Certificate pveproxy serves now
+  ansible.builtin.shell: |
+    set -o pipefail
+    f=/etc/pve/nodes/{{ ansible_facts['hostname'] }}/pveproxy-ssl.pem
+    [ -f "$f" ] && openssl x509 -in "$f" -noout -fingerprint -sha256 | sed 's/^.*=//' || true
+  args:
+    executable: /bin/bash
+  register: admin_ui_tls_pve_live
+  changed_when: false
+  check_mode: false
+
+- name: Pveproxy uses the ca01 certificate
+  ansible.builtin.command:
+    argv: [pvenode, cert, set, "{{ x509_cert_path }}", "{{ x509_cert_key_path }}", --force, "1", --restart, "1"]
+  when:
+    - not ansible_check_mode
+    - admin_ui_tls_pve_live.stdout != x509_cert_fingerprint
+  changed_when: true
+
+- name: Pveproxy answers with it
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 8006
+    timeout: 60
+  when: not ansible_check_mode

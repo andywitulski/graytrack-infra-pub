@@ -1,0 +1,73 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - "[caddy_email, caddy_dns_module, caddy_dns_provider] | select('match', '^(<|$)') | list | length == 0"
+    fail_msg: "Set caddy_email, caddy_dns_module and caddy_dns_provider in group_vars/caddy.yml"
+    quiet: true
+
+- name: Caddy directory
+  ansible.builtin.file:
+    path: "{{ caddy_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Image build file (Caddy plus the DNS provider module)
+  ansible.builtin.template:
+    src: Dockerfile.j2
+    dest: "{{ caddy_dir }}/Dockerfile"
+    owner: root
+    group: root
+    mode: "0644"
+
+# The container mounts this directory, not the file: Ansible replaces files atomically (new inode),
+# and a single-file bind mount would keep showing the old one to Caddy.
+- name: Caddy configuration directory
+  ansible.builtin.file:
+    path: "{{ caddy_dir }}/conf"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Old single-file Caddyfile location is gone (moved into conf/)
+  ansible.builtin.file:
+    path: "{{ caddy_dir }}/Caddyfile"
+    state: absent
+
+# Before the Caddyfile: a reload with client_auth pointing at a missing file fails
+- name: Device trust CA bundle (ca01 root and intermediate; ADR-0006)
+  ansible.builtin.copy:
+    content: "{{ query('ansible.builtin.file', *caddy_device_trust_ca_files) | join('\n') }}\n"
+    dest: "{{ caddy_dir }}/conf/device-ca.pem"
+    owner: root
+    group: root
+    mode: "0644"
+  when: caddy_device_trust | bool
+  notify: Reload caddy
+
+- name: Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_dir }}/conf/Caddyfile"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload caddy
+
+# Resolve the template path here: vars passed to include_role are evaluated inside the
+# included role, where role_path would point at compose_app instead of this role.
+- name: Compose template path (this role)
+  ansible.builtin.set_fact:
+    caddy_compose_template_path: "{{ role_path }}/templates/compose.yml.j2"
+
+- name: Caddy stack
+  ansible.builtin.include_role:
+    name: compose_app
+  vars:
+    compose_app_name: caddy
+    compose_app_dir: "{{ caddy_dir }}"
+    compose_app_compose_template: "{{ caddy_compose_template_path }}"
+    compose_app_env: "{{ caddy_env }}"

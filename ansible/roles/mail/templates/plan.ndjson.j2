@@ -1,0 +1,69 @@
+{#
+  Stalwart configuration as code (NDJSON, one operation per line), applied with stalwart-cli apply.
+  Upserts match on a natural key and update in place; singletons are updated. Nothing here is a secret:
+  relay passwords are files (relay/<id>), the admin is an environment variable.
+
+  Listeners: IMAP and submission with implicit TLS, the account portal (HTTPS), management on loopback.
+  No port 25: in stage 1 nothing arrives from the internet.
+  Routes: one relay per external account; mail sent as that address leaves through that account's own
+  server (Gmail SMTP, or Proton Bridge on loopback with its self-signed certificate).
+  Senders: each person may send as their own external addresses (each account's login address and its
+  send_as list), nobody else's.
+  Relaying: mail_domain (lan.example.com, internal) stays inside; out to the internet only from an
+  external identity, through that identity's own server. example.com is Proton's: an @example.com
+  address is external here and goes out through Bridge like any other Proton address.
+#}
+{%- set ready = mail_accounts | selectattr('ready') | list -%}
+{%- set ops = [] -%}
+{%- set _ = ops.append({'@type': 'upsert', 'object': 'Domain', 'matchOn': ['name'], 'value': {'dom': {
+      'name': mail_domain,
+      'certificateManagement': {'@type': 'Manual'},
+      'dkimManagement': {'@type': 'Manual'},
+      'dnsManagement': {'@type': 'Manual'},
+      'subAddressing': {'@type': 'Enabled'}}}}) -%}
+{%- set _ = ops.append({'@type': 'update', 'object': 'SystemSettings', 'value': {
+      'defaultHostname': mail_hostname, 'defaultDomainId': '#dom'}}) -%}
+{%- for l in [
+      {'name': 'imaps', 'bind': '0.0.0.0:993', 'protocol': 'imap', 'tls': true},
+      {'name': 'submissions', 'bind': '0.0.0.0:465', 'protocol': 'smtp', 'tls': true},
+      {'name': 'https', 'bind': '0.0.0.0:443', 'protocol': 'http', 'tls': true},
+      {'name': 'management', 'bind': mail_api_url | regex_replace('^https?://', ''), 'protocol': 'http', 'tls': false}] -%}
+{%-   set _ = ops.append({'@type': 'upsert', 'object': 'NetworkListener', 'matchOn': ['name'], 'value': {'l-' ~ l.name: {
+        'name': l.name, 'bind': {l.bind: true}, 'protocol': l.protocol, 'implicitTls': l.tls, 'useTls': l.tls}}}) -%}
+{%- endfor -%}
+{%- for a in ready -%}
+{%-   if a.type == 'gmail' -%}
+{%-     set relay = {'host': mail_gmail_smtp_host, 'port': 465, 'implicitTls': true, 'allowInvalidCerts': false,
+                     'description': 'Gmail SMTP for ' ~ a.id} -%}
+{%-   else -%}
+{%-     set relay = {'host': '127.0.0.1', 'port': mail_bridge_smtp_port | int, 'implicitTls': false, 'allowInvalidCerts': true,
+                     'description': 'Proton Bridge for ' ~ a.id} -%}
+{%-   endif -%}
+{%-   set _ = ops.append({'@type': 'upsert', 'object': 'MtaRoute', 'matchOn': ['name'], 'value': {'r-' ~ a.id:
+        relay | combine({'@type': 'Relay', 'name': 'relay-' ~ a.id, 'protocol': 'smtp', 'authUsername': a.address,
+                         'authSecret': {'@type': 'File', 'filePath': mail_config_dir ~ '/relay/' ~ a.id}})}}) -%}
+{%- endfor -%}
+{%- set route_match = {'0': {'if': 'is_local_domain(rcpt_domain)', 'then': "'local'"}} -%}
+{%- for a in ready -%}
+{%-   for s in a.senders -%}
+{%-     set _ = route_match.update({(route_match | length | string): {'if': "sender == '" ~ s ~ "'", 'then': "'relay-" ~ a.id ~ "'"}}) -%}
+{%-   endfor -%}
+{%- endfor -%}
+{%- set _ = ops.append({'@type': 'update', 'object': 'MtaOutboundStrategy', 'value': {
+      'route': {'match': route_match, 'else': "'mx'"}}}) -%}
+{%- set sender_match = {} -%}
+{%- for u in mail_users -%}
+{%-   set addrs = ready | selectattr('user', 'equalto', u.name) | map(attribute='senders') | flatten | list -%}
+{%-   if addrs | length > 0 -%}
+{%-     set cond = "authenticated_as == '" ~ u.name ~ "@" ~ mail_domain ~ "' && ("
+                   ~ (addrs | map('regex_replace', '^(.*)$', "sender == '\\1'") | join(' || ')) ~ ")" -%}
+{%-     set _ = sender_match.update({(sender_match | length | string): {'if': cond, 'then': 'false'}}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- set _ = ops.append({'@type': 'update', 'object': 'MtaStageAuth', 'value': {
+      'mustMatchSender': {'match': sender_match, 'else': 'true'}}}) -%}
+{%- set _ = ops.append({'@type': 'update', 'object': 'MtaStageRcpt', 'value': {
+      'allowRelaying': {'match': {}, 'else': '!is_empty(authenticated_as) && !is_local_domain(sender_domain)'}}}) -%}
+{%- for op in ops %}
+{{ op | to_json }}
+{% endfor %}

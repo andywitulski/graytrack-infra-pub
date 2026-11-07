@@ -1,0 +1,9 @@
+---
+# Version and checksum: roles/openbao/defaults. Secrets from sops: openbao_seal_key, openbao_pg_password.
+
+# The agent also ships OpenBao's audit log (JSON, one request or response per line, secrets HMAC'd).
+# Same list as the wazuh_agent role default, plus the audit log.
+wazuh_agent_extra_logfiles:
+  - { location: /var/log/audit/audit.log, format: audit }
+  - { location: /var/log/pve-firewall.log, format: syslog }
+  - { location: /var/log/openbao/audit.log, format: json }

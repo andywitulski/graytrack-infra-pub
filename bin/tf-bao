@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Usage: bin/tf-bao <dev|prod> <tofu args...>
+# OpenTofu for OpenBao's configuration (tofu/openbao/<env>: kv engine, policies, AppRole identities).
+#   VAULT_ADDR, VAULT_CACERT   bin/lib/platform.sh (tofu/platform/<env>/client.env)
+#   VAULT_TOKEN                root_token from secrets/openbao-<env>.enc.yaml (stored by bin/bao-init)
+#   TF_VAR_state_passphrase    secrets/<env>.enc.env, as for bin/tf
+# The root token is the bootstrap credential. Once an admin auth method exists (OIDC via Authentik),
+# use a platform-admin token here and revoke the root token (docs/howto/platform-tier.md).
+set -euo pipefail
+
+env=${1:?usage: bin/tf-bao <dev|prod> <tofu args...>}
+shift
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+dir="$root/tofu/openbao/$env"
+bao_secrets="$root/secrets/openbao-$env.enc.yaml"
+
+# shellcheck source=lib/platform.sh
+source "$root/bin/lib/platform.sh"
+platform_env "$env" "$root"
+
+if platform_cmd_needs_backend "$@"; then
+  platform_need_backend || exit 1
+  [[ -f $bao_secrets ]] || { echo "missing $bao_secrets: initialize OpenBao first (bin/bao-init $env)" >&2; exit 1; }
+  VAULT_TOKEN=$(sops decrypt --extract '["root_token"]' "$bao_secrets")
+  export VAULT_TOKEN
+fi
+
+if [[ $env == prod && ${1:-} =~ ^(apply|destroy|import|state)$ ]]; then
+  platform_prod_confirm "openbao tofu $1"
+fi
+exec sops exec-env "$root/secrets/$env.enc.env" "tofu -chdir=$(printf '%q' "$dir") $(printf '%q ' "$@")"

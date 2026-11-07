@@ -1,0 +1,89 @@
+---
+# The storage node: ZFS pool layout, NFS exports, and the data containers' bind mounts.
+# Pool-wide sizing (zfs_arc_max_bytes) and hardware (GPU devices) stay in the env's host_vars.
+zfs_data_identities:
+  - { name: labdata, id: 2000 }
+  - { name: ncdata, id: 2033 }
+# ZFS properties as exact values: the zfs module compares strings, so 1M != 1048576 and never converges.
+# recordsize 1048576 = 1M, 131072 = 128K (the default)
+zfs_datasets:
+  - { name: tank/media, props: { recordsize: "1048576" }, owner: 2000, group: 2000, mode: "0755" }
+  - { name: tank/music, props: { recordsize: "1048576" }, owner: 2000, group: 2000, mode: "0755" }
+  # Live TV recordings: Jellyfin writes through the labdata group (setgid keeps new files in it)
+  - { name: tank/dvr, props: { recordsize: "1048576" }, owner: 2000, group: 2000, mode: "2775" }
+  # Audiobookshelf libraries: it writes uploads and podcast downloads through the labdata group
+  - { name: tank/audiobooks, props: { recordsize: "1048576" }, owner: 2000, group: 2000, mode: "2775" }
+  - { name: tank/podcasts, props: { recordsize: "1048576" }, owner: 2000, group: 2000, mode: "2775" }
+  - { name: tank/ebooks, props: {}, owner: 2000, group: 2000, mode: "2775" }
+  - { name: tank/shares, props: {}, owner: 0, group: 0, mode: "0755" }
+  - { name: tank/shares/archive, props: {}, owner: 2000, group: 2000, mode: "0770" }
+  # One dataset per private share (common/group_vars/samba.yml): own snapshots, quota-able, restorable alone
+  - { name: tank/shares/private, props: {}, owner: 0, group: 0, mode: "0755" }
+  - { name: tank/shares/private/alice, props: {}, owner: 2001, group: 2001, mode: "0700" }
+  - { name: tank/shares/private/bob, props: {}, owner: 2002, group: 2002, mode: "0700" }
+  - { name: tank/syncthing, props: {}, owner: 0, group: 0, mode: "0755" }
+  - { name: tank/syncthing/obsidian, props: {}, owner: 2000, group: 2000, mode: "0700" }
+  - { name: tank/nextcloud, props: {}, owner: 2033, group: 2033, mode: "0750" }
+  - { name: tank/backups, props: {}, owner: 0, group: 0, mode: "0755" }
+  - { name: tank/backups/pbs, props: { recordsize: "1048576" }, owner: 34, group: 34, mode: "0750" }
+  - { name: tank/backups/db, props: { recordsize: "1048576", compression: zstd }, owner: 0, group: 0, mode: "0750" }
+  - { name: tank/archive, props: { recordsize: "1048576", compression: zstd }, owner: 2000, group: 2000, mode: "0755" }
+
+# Clients are the guests' storage-network addresses (storage_address in the env's hosts.yml)
+nfs_server_exports:
+  - path: /tank/nextcloud
+    clients: "{{ groups['nextcloud'] | map('extract', hostvars, 'storage_address') | list }}"
+    options: "rw,sync,no_subtree_check,all_squash,anonuid=2033,anongid=2033"
+  - path: /tank/backups/pbs
+    clients: "{{ groups['pbs'] | map('extract', hostvars, 'storage_address') | list }}"
+    options: "rw,sync,no_subtree_check,all_squash,anonuid=34,anongid=34"
+
+# Snapshots (sanoid, roles/zfs_host). The only history the tank datasets have until the offsite copy
+# exists; a file deleted or overwritten over SMB comes back from .zfs/snapshot (docs/howto/media-drop.md).
+# working: hourly for a day, daily for a month, monthly for half a year. library: daily for a week, monthly for 3.
+# Not here: tank/backups (PBS and dumps keep their own history), tank/dvr (recordings come and go).
+zfs_host_sanoid:
+  - { dataset: tank/shares, template: working, recursive: true }
+  - { dataset: tank/syncthing, template: working, recursive: true }
+  - { dataset: tank/nextcloud, template: working }
+  - { dataset: tank/audiobooks, template: library }
+  - { dataset: tank/ebooks, template: library }
+  - { dataset: tank/podcasts, template: library }
+  - { dataset: tank/music, template: library }
+  - { dataset: tank/media, template: library }
+  - { dataset: tank/archive, template: library }
+
+# Hardware passthrough differs per environment (prod's Integrated GPU; none in dev)
+lxc_media_devices: []
+
+# pve_lxc_host role: bind mounts, UID 2000 identity map, devices. VMIDs come from the env's hosts.yml.
+pve_lxc_host_containers:
+  - vmid: "{{ hostvars[groups['media'][0]]['pve_vmid'] }}"
+    mounts:
+      - { key: mp0, src: /tank/media, dst: /media, ro: true }
+      - { key: mp1, src: /tank/music, dst: /srv/music, ro: false }
+      - { key: mp2, src: /tank/dvr, dst: /srv/dvr, ro: false }
+      - { key: mp3, src: /tank/audiobooks, dst: /srv/audiobooks, ro: false }
+      - { key: mp4, src: /tank/podcasts, dst: /srv/podcasts, ro: false }
+      - { key: mp5, src: /tank/ebooks, dst: /srv/ebooks, ro: false }
+    passthrough_ids: [2000]
+    devices: "{{ lxc_media_devices }}"
+  - vmid: "{{ hostvars[groups['syncthing'][0]]['pve_vmid'] }}"
+    mounts:
+      - { key: mp0, src: /tank/syncthing, dst: /srv/syncthing, ro: false }
+    passthrough_ids: [2000]
+    devices: []
+  - vmid: "{{ hostvars[groups['samba'][0]]['pve_vmid'] }}"
+    mounts:
+      # One mount per dataset: a bind of /tank/shares would not carry the child datasets into the container
+      - { key: mp0, src: /tank/shares/archive, dst: /srv/shares/archive, ro: false }
+      - { key: mp1, src: /tank/shares/private/alice, dst: /srv/shares/private/alice, ro: false }
+      - { key: mp2, src: /tank/shares/private/bob, dst: /srv/shares/private/bob, ro: false }
+      # The media libraries, so files dropped over SMB land where Audiobookshelf, Navidrome and Jellyfin read
+      # (samba.yml, library shares; docs/howto/media-drop.md)
+      - { key: mp3, src: /tank/audiobooks, dst: /srv/library/audiobooks, ro: false }
+      - { key: mp4, src: /tank/ebooks, dst: /srv/library/ebooks, ro: false }
+      - { key: mp5, src: /tank/music, dst: /srv/library/music, ro: false }
+      - { key: mp6, src: /tank/media, dst: /srv/library/media, ro: false }
+    passthrough_ids: [2000, 2001, 2002]
+    devices: []

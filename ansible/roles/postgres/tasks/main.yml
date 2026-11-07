@@ -1,0 +1,237 @@
+---
+# The zone policy (UniFi, and the Proxmox ipsets OpenTofu builds from it) and the inventory both name the
+# controllers. If they drift, the state database lets in addresses the firewalls do not, or the reverse.
+- name: Controllers agree with the zone policy (prod)
+  vars:
+    postgres_zp: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../network/zone_policy.yml') | from_yaml }}"
+  ansible.builtin.assert:
+    that: (lab_controllers | sort) == ([postgres_zp.unifi_workstation, postgres_zp.unifi_paw] | map('string') | sort)
+    fail_msg: >-
+      lab_controllers {{ lab_controllers }} (inventories/prod/group_vars/all/main.yml) differs from
+      unifi_workstation / unifi_paw in ansible/network/zone_policy.yml. Make them the same.
+    quiet: true
+  when: lab_env == 'prod'
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Database passwords are stored
+  ansible.builtin.assert:
+    that: item.password | default('PENDING') not in ['', 'PENDING']
+    fail_msg: "No password for role {{ item.owner }} (database {{ item.name }}). Run bin/gen-service-secrets {{ lab_env }}."
+    quiet: true
+  loop: "{{ postgres_databases }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+
+- name: PostgreSQL
+  ansible.builtin.apt:
+    name: "{{ ['postgresql', 'python3-psycopg2', 'acl'] + postgres_extra_packages }}" # psycopg2: the modules; acl: become_user postgres
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Installed major version is the one this role configures
+  ansible.builtin.stat:
+    path: "{{ postgres_conf_dir }}/postgresql.conf"
+  register: postgres_conf_stat
+  failed_when: not postgres_conf_stat.stat.exists
+
+- name: Server certificate (CA fetched to the repo for the clients)
+  ansible.builtin.include_role:
+    name: host_tls
+  vars:
+    host_tls_dir: "{{ postgres_tls_dir }}"
+    host_tls_group: postgres
+
+- name: Settings (listen address, TLS 1.3, SCRAM, connection logging)
+  ansible.builtin.template:
+    src: labstack.conf.j2
+    dest: "{{ postgres_conf_dir }}/conf.d/labstack.conf"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: Restart postgresql
+
+- name: Client authentication (the whole file)
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ postgres_conf_dir }}/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: Reload postgresql
+
+# At boot PostgreSQL can start before the host's address exists (seen on pg01, an LXC, after a node
+# reboot): it then binds localhost only, every client times out, and step-ca and OpenBao go down with it.
+# It waits for listen_addresses' network address first (60 s), and fails loudly instead of half-starting.
+- name: Drop-in directory for the PostgreSQL units
+  ansible.builtin.file:
+    path: /etc/systemd/system/postgresql@.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Wait-for-address script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/labstack-wait-addr
+    content: |
+      #!/bin/sh
+      # Managed by Ansible (labstack-infra, role postgres). Blocks until this IPv4 address is configured.
+      addr="${1:?address required}"
+      for i in $(seq 60); do
+        ip -4 -o addr show scope global | grep -q " $addr/" && exit 0
+        sleep 1
+      done
+      echo "$addr not configured after 60s" >&2
+      exit 1
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: PostgreSQL waits for its listen address at start
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/postgresql@.service.d/10-wait-addr.conf
+    content: |
+      # Managed by Ansible (labstack-infra, role postgres)
+      [Unit]
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      ExecStartPre=/usr/local/sbin/labstack-wait-addr {{ ansible_host }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Systemd knows the wait
+  ansible.builtin.meta: flush_handlers
+
+- name: PostgreSQL running
+  ansible.builtin.service:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: started
+    enabled: true
+
+- name: Apply settings before creating roles
+  ansible.builtin.meta: flush_handlers
+
+- name: PostgreSQL listens on its network address, not only on localhost
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 5432
+    timeout: 30
+  when: not ansible_check_mode
+
+- name: Owner roles (login only; no superuser, no createdb, no createrole)
+  community.postgresql.postgresql_user:
+    name: "{{ item.owner }}"
+    password: "{{ item.password }}"
+    role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOINHERIT
+  loop: "{{ postgres_databases }}"
+  loop_control:
+    label: "{{ item.owner }}"
+  become: true
+  become_user: postgres
+  no_log: true
+
+- name: Databases
+  community.postgresql.postgresql_db:
+    name: "{{ item.name }}"
+    owner: "{{ item.owner }}"
+    encoding: UTF-8
+    template: template0
+  loop: "{{ postgres_databases }}"
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+  become_user: postgres
+
+- name: Extensions (the superuser creates them; the owner then uses them)
+  community.postgresql.postgresql_ext:
+    name: "{{ item.1 }}"
+    login_db: "{{ item.0.name }}"
+  loop: "{{ postgres_databases | subelements('extensions', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }}: {{ item.1 }}"
+  become: true
+  become_user: postgres
+
+- name: Only the owner may connect (PUBLIC loses CONNECT)
+  community.postgresql.postgresql_privs:
+    login_db: "{{ item.name }}"
+    type: database
+    objs: "{{ item.name }}"
+    privs: CONNECT
+    roles: PUBLIC
+    state: absent
+  loop: "{{ postgres_databases }}"
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+  become_user: postgres
+
+# ---------------------------------------------------------------- nightly dumps
+- name: Dump directory
+  ansible.builtin.file:
+    path: "{{ postgres_dump_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Dump script
+  ansible.builtin.template:
+    src: labstack-pg-dump.sh.j2
+    dest: /usr/local/sbin/labstack-pg-dump
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Dump service and timer
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/labstack-pg-dump.{{ item.unit }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - unit: service
+      content: |
+        [Unit]
+        Description=Logical dumps of every PostgreSQL database (labstack)
+        After=postgresql.service
+
+        [Service]
+        Type=oneshot
+        User=postgres
+        Group=postgres
+        ExecStart=/usr/local/sbin/labstack-pg-dump
+        Nice=10
+        IOSchedulingClass=idle
+    - unit: timer
+      content: |
+        [Unit]
+        Description=Nightly PostgreSQL dumps, before the PBS backup (labstack)
+
+        [Timer]
+        OnCalendar=*-*-* {{ postgres_dump_time }}:00
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "labstack-pg-dump.{{ item.unit }}"
+  notify: Reload systemd
+
+- name: Systemd knows the dump units
+  ansible.builtin.meta: flush_handlers
+
+- name: Dump timer enabled
+  ansible.builtin.systemd_service:
+    name: labstack-pg-dump.timer
+    state: started
+    enabled: true

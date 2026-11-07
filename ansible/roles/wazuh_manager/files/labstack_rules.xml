@@ -1,0 +1,262 @@
+<!--
+  labstack custom rules. Managed by Ansible (roles/wazuh_manager); edits on the manager are overwritten.
+  ID ranges: 100100-100199 Caddy, 100200-100299 Authentik, 100300-100399 UniFi.
+  Level 0-2 rules only classify (no alert); alerts start at level 3.
+  Static fields (status, action, srcip, ...) need their own tags, not <field>. Their default match types
+  differ: <action> compares the exact string, <status> uses simple matching (^ and $ work).
+  Every rule with a test sample in roles/wazuh_manager/defaults is verified with wazuh-logtest on each run.
+-->
+
+<!-- ======================================================================== Caddy (edge proxy) -->
+<group name="caddy,web,">
+
+  <rule id="100100" level="0">
+    <decoded_as>caddy</decoded_as>
+    <description>Caddy log</description>
+  </rule>
+
+  <rule id="100101" level="0">
+    <if_sid>100100</if_sid>
+    <field name="msg">^handled request$</field>
+    <description>Caddy: request to $(request.host)</description>
+  </rule>
+
+  <rule id="100102" level="5">
+    <if_sid>100101</if_sid>
+    <status type="pcre2">^40[13]$</status>
+    <description>Caddy: $(request.host) denied $(request.method) $(request.uri) from $(request.client_ip) ($(status))</description>
+    <group>access_denied,</group>
+  </rule>
+
+  <rule id="100103" level="10" frequency="15" timeframe="120">
+    <if_matched_sid>100102</if_matched_sid>
+    <same_field>request.client_ip</same_field>
+    <description>Caddy: repeated denied requests from $(request.client_ip) (possible password guessing)</description>
+    <group>authentication_failures,attack,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+
+  <rule id="100104" level="0">
+    <if_sid>100101</if_sid>
+    <status>^404$</status>
+    <description>Caddy: not found on $(request.host)</description>
+  </rule>
+
+  <rule id="100105" level="8" frequency="40" timeframe="60">
+    <if_matched_sid>100104</if_matched_sid>
+    <same_field>request.client_ip</same_field>
+    <description>Caddy: $(request.client_ip) probing for paths (many 404s)</description>
+    <group>web_scan,recon,</group>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+  </rule>
+
+  <rule id="100106" level="4">
+    <if_sid>100101</if_sid>
+    <status type="pcre2">^5\d\d$</status>
+    <description>Caddy: upstream error $(status) on $(request.host)$(request.uri)</description>
+  </rule>
+
+  <rule id="100107" level="5">
+    <if_sid>100100</if_sid>
+    <field name="level">^error$</field>
+    <description>Caddy error: $(msg)</description>
+  </rule>
+
+  <rule id="100108" level="9">
+    <if_sid>100107</if_sid>
+    <field name="msg" type="pcre2">(?i)certificate|acme|obtain</field>
+    <description>Caddy: certificate problem: $(msg)</description>
+  </rule>
+
+</group>
+
+<!-- ======================================================================== Authentik (identity provider) -->
+<group name="authentik,identity,">
+
+  <rule id="100200" level="0">
+    <decoded_as>authentik</decoded_as>
+    <description>Authentik log</description>
+  </rule>
+
+  <rule id="100201" level="0">
+    <if_sid>100200</if_sid>
+    <field name="event">^Created Event$</field>
+    <description>Authentik event: $(action)</description>
+  </rule>
+
+  <rule id="100202" level="3">
+    <if_sid>100201</if_sid>
+    <action>login</action>
+    <description>Authentik: $(user.username) logged in from $(client_ip)</description>
+    <group>authentication_success,</group>
+  </rule>
+
+  <rule id="100203" level="5">
+    <if_sid>100201</if_sid>
+    <action>login_failed</action>
+    <description>Authentik: failed login for $(context.username) from $(client_ip)</description>
+    <group>authentication_failed,</group>
+  </rule>
+
+  <rule id="100204" level="10" frequency="5" timeframe="300">
+    <if_matched_sid>100203</if_matched_sid>
+    <same_field>client_ip</same_field>
+    <description>Authentik: repeated failed logins from $(client_ip) (possible password guessing)</description>
+    <group>authentication_failures,attack,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+
+  <rule id="100205" level="8">
+    <if_sid>100201</if_sid>
+    <action>suspicious_request</action>
+    <description>Authentik: suspicious request from $(client_ip)</description>
+  </rule>
+
+  <rule id="100206" level="6">
+    <if_sid>100201</if_sid>
+    <action>password_set</action>
+    <description>Authentik: password set for $(user.username)</description>
+    <group>account_changed,</group>
+  </rule>
+
+  <rule id="100207" level="8">
+    <if_sid>100201</if_sid>
+    <action>secret_view</action>
+    <description>Authentik: $(user.username) viewed a secret (token or key) from $(client_ip)</description>
+  </rule>
+
+  <rule id="100208" level="10">
+    <if_sid>100201</if_sid>
+    <action>impersonation_started</action>
+    <description>Authentik: $(user.username) started impersonating another user</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+  </rule>
+
+  <rule id="100209" level="3">
+    <if_sid>100201</if_sid>
+    <action type="pcre2">^model_(created|updated|deleted)$</action>
+    <description>Authentik: $(action) $(context.model.model_name) "$(context.model.name)" by $(user.username)</description>
+  </rule>
+
+  <!-- Identity objects: users, groups, tokens, roles and their permissions -->
+  <rule id="100210" level="7">
+    <if_sid>100209</if_sid>
+    <field name="context.model.app" type="pcre2">^authentik_(core|rbac)$</field>
+    <description>Authentik: $(action) $(context.model.model_name) "$(context.model.name)" by $(user.username)</description>
+    <group>account_changed,</group>
+  </rule>
+
+  <rule id="100211" level="7">
+    <if_sid>100201</if_sid>
+    <action type="pcre2">^(system_exception|system_task_exception|policy_exception|property_mapping_exception|configuration_error)$</action>
+    <description>Authentik: $(action)</description>
+  </rule>
+
+  <rule id="100212" level="3">
+    <if_sid>100201</if_sid>
+    <action>authorize_application</action>
+    <description>Authentik: $(user.username) authorized an application</description>
+  </rule>
+
+</group>
+
+<!-- ======================================================================== UniFi (gateway SIEM export) -->
+<!-- Built on real UniFi Network 10.6 output. Categories seen: Security (firewall), Audit (admin access).
+     Monitoring (client connects and roams) stays at level 2: stored with the event, never an alert. -->
+<group name="unifi,network,">
+
+  <!-- Two entry points (with and without a syslog header), one rule tree -->
+  <rule id="100398" level="0">
+    <decoded_as>unifi-cef</decoded_as>
+    <description>UniFi CEF (syslog header)</description>
+  </rule>
+
+  <rule id="100399" level="0">
+    <decoded_as>unifi-cef-bare</decoded_as>
+    <description>UniFi CEF (bare)</description>
+  </rule>
+
+  <rule id="100300" level="2">
+    <if_sid>100398, 100399</if_sid>
+    <description>UniFi: $(unifi.name)</description>
+  </rule>
+
+  <rule id="100301" level="3">
+    <if_sid>100300</if_sid>
+    <field name="unifi.category">^System$</field>
+    <description>UniFi system: $(unifi.name)</description>
+  </rule>
+
+  <rule id="100302" level="5">
+    <if_sid>100300</if_sid>
+    <field name="unifi.category">^Audit$</field>
+    <description>UniFi audit: $(unifi.msg)</description>
+  </rule>
+
+  <rule id="100303" level="6">
+    <if_sid>100302</if_sid>
+    <field name="unifi.access_method">\.+</field>
+    <description>UniFi admin access: $(dstuser) via $(unifi.access_method) from $(srcip)</description>
+    <group>authentication_success,</group>
+  </rule>
+
+  <rule id="100304" level="5">
+    <if_sid>100300</if_sid>
+    <field name="unifi.category">^Internet$</field>
+    <description>UniFi internet: $(unifi.name)</description>
+  </rule>
+
+  <rule id="100305" level="6">
+    <if_sid>100300</if_sid>
+    <field name="unifi.category">^Security$</field>
+    <description>UniFi security: $(unifi.name)</description>
+  </rule>
+
+  <rule id="100306" level="3">
+    <if_sid>100305</if_sid>
+    <field name="unifi.policy_type">^Firewall$</field>
+    <description>UniFi firewall $(unifi.act): $(srcip) ($(unifi.src_zone)) to $(dstip):$(dstport) ($(unifi.dst_zone)) by "$(unifi.policy)"</description>
+    <group>firewall_drop,</group>
+  </rule>
+
+  <rule id="100307" level="8" frequency="30" timeframe="60">
+    <if_matched_sid>100306</if_matched_sid>
+    <same_source_ip />
+    <description>UniFi firewall: many blocked connections from $(srcip) (scan or misbehaving host)</description>
+    <group>recon,</group>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+  </rule>
+
+  <!-- Anything from the edge (DMZ) blocked going inward is worth a look on its own -->
+  <rule id="100308" level="7">
+    <if_sid>100306</if_sid>
+    <field name="unifi.src_zone">^Dmz$</field>
+    <description>UniFi firewall: DMZ host $(srcip) blocked reaching $(dstip):$(dstport) ($(unifi.dst_zone))</description>
+    <group>firewall_drop,</group>
+  </rule>
+
+  <rule id="100309" level="10">
+    <if_sid>100305</if_sid>
+    <field name="unifi.name" type="pcre2">(?i)honeypot|intrusion|threat|ips</field>
+    <description>UniFi threat: $(unifi.name) from $(srcip)</description>
+    <group>ids,attack,</group>
+  </rule>
+
+  <!-- CEF severity runs 0-10 -->
+  <rule id="100310" level="10">
+    <if_sid>100300</if_sid>
+    <field name="unifi.severity" type="pcre2">^([7-9]|10)$</field>
+    <description>UniFi high severity ($(unifi.severity)): $(unifi.name)</description>
+  </rule>
+
+</group>

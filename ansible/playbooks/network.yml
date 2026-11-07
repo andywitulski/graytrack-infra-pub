@@ -1,0 +1,6 @@
+- name: Node network configuration (writes files only; apply with ifreload from the console)
+  hosts: pve_nodes
+  become: true
+  serial: 1
+  roles:
+    - pve_network

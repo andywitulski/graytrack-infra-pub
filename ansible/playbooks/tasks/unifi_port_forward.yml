@@ -1,0 +1,93 @@
+---
+# One WAN port forward, through the controller's REST API (playbooks/unifi_firewall.yml loops over
+# unifi_port_forward_https and unifi_port_forward_extra). Matched by name; the read-back fails the run if the
+# controller holds anything else. Needs unifi_pf_api, unifi_pf_headers and unifi_pf_list from the play.
+- name: "Port forward, wanted against the controller: {{ unifi_pf_item.name }}"
+  vars:
+    unifi_pf_found: "{{ unifi_pf_list.json.data | selectattr('name', 'equalto', unifi_pf_item.name) | list }}"
+    unifi_pf_spec:
+      name: "{{ unifi_pf_item.name }}"
+      enabled: true
+      proto: "{{ unifi_pf_item.protocol }}"
+      pfwd_interface: "{{ unifi_pf_item.interface | default('wan') }}"
+      src: any
+      dst_port: "{{ unifi_pf_item.dst_port }}"
+      fwd: "{{ unifi_pf_item.fwd_ip }}"
+      fwd_port: "{{ unifi_pf_item.fwd_port }}"
+      log: false
+  ansible.builtin.set_fact:
+    unifi_pf_want: "{{ unifi_pf_spec }}"
+    unifi_pf_have: "{{ unifi_pf_found | first | default({}) }}"
+    unifi_pf_count: "{{ unifi_pf_found | length }}"
+    unifi_pf_diff: >-
+      {%- set out = [] -%}{%- for k, v in unifi_pf_spec.items() -%}
+      {%- if (unifi_pf_found | first | default({})).get(k) | string != v | string -%}{%- set _ = out.append(k) -%}{%- endif -%}
+      {%- endfor -%}{{ out }}
+
+- name: "Port forward, at most one port forward carries the name: {{ unifi_pf_item.name }}"
+  ansible.builtin.assert:
+    that: unifi_pf_count | int <= 1
+    fail_msg: "{{ unifi_pf_count }} port forwards named '{{ unifi_pf_item.name }}'. Delete the extras in the UI."
+    quiet: true
+
+- name: "Port forward, changes: {{ unifi_pf_item.name }}"
+  ansible.builtin.debug:
+    msg:
+      - "exposure: {{ unifi_public_exposure }}; on the controller: {{ unifi_pf_count | int == 1 }}"
+      - "fields that differ: {{ unifi_pf_diff if unifi_public_exposure else 'n/a (removal)' }}"
+      - "controller has: fwd={{ unifi_pf_have.fwd | default('-') }} fwd_port={{ unifi_pf_have.fwd_port | default('-') }}"
+      - "enabled: {{ unifi_pf_have.enabled | default('-') }}"
+
+- name: "Port forward, create: {{ unifi_pf_item.name }}"
+  ansible.builtin.uri:
+    url: "{{ unifi_pf_api }}"
+    method: POST
+    headers: "{{ unifi_pf_headers }}"
+    body_format: json
+    body: "{{ unifi_pf_want }}"
+    validate_certs: false
+  changed_when: true
+  when: unifi_public_exposure | bool and unifi_pf_count | int == 0
+
+- name: "Port forward, update: {{ unifi_pf_item.name }}"
+  ansible.builtin.uri:
+    url: "{{ unifi_pf_api }}/{{ unifi_pf_have._id }}"
+    method: PUT
+    headers: "{{ unifi_pf_headers }}"
+    body_format: json
+    body: "{{ unifi_pf_want }}"
+    validate_certs: false
+  changed_when: true
+  when: unifi_public_exposure | bool and unifi_pf_count | int == 1 and unifi_pf_diff | length > 0
+
+- name: "Port forward, remove (exposure off): {{ unifi_pf_item.name }}"
+  ansible.builtin.uri:
+    url: "{{ unifi_pf_api }}/{{ unifi_pf_have._id }}"
+    method: DELETE
+    headers: "{{ unifi_pf_headers }}"
+    validate_certs: false
+  changed_when: true
+  when: not (unifi_public_exposure | bool) and unifi_pf_count | int == 1
+
+- name: "Port forward, read the port forwards back: {{ unifi_pf_item.name }}"
+  ansible.builtin.uri:
+    url: "{{ unifi_pf_api }}"
+    headers: "{{ unifi_pf_headers }}"
+    validate_certs: false
+  register: unifi_pf_after
+  when: not ansible_check_mode
+
+- name: "Port forward, the controller holds exactly what was asked (target address included): {{ unifi_pf_item.name }}"
+  vars:
+    unifi_pf_now: "{{ unifi_pf_after.json.data | selectattr('name', 'equalto', unifi_pf_item.name) | list }}"
+  ansible.builtin.assert:
+    that: >-
+      (unifi_pf_now | length == 0) if not (unifi_public_exposure | bool) else (
+        unifi_pf_now | length == 1
+        and unifi_pf_now[0].fwd | default('') == unifi_pf_item.fwd_ip
+        and unifi_pf_now[0].fwd_port | string == unifi_pf_item.fwd_port | string
+        and unifi_pf_now[0].dst_port | string == unifi_pf_item.dst_port | string
+        and unifi_pf_now[0].enabled | bool)
+    fail_msg: "Port forward on the controller is not as wanted: {{ unifi_pf_now }}"
+    quiet: true
+  when: not ansible_check_mode

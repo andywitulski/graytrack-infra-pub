@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Usage: bin/ap <dev|prod|labnode> <playbook> [ansible-playbook args...]
+# Decrypts that env's secrets and runs ansible-playbook against that env's inventory.
+#
+# SSH: once ca01 exists (bin/ca-init), the run logs in with a short-lived ansible certificate from
+# bin/ssh-cert, offered alone (IdentitiesOnly). LABSTACK_SSH picks the credential:
+#   (unset)     certificate first, then the static key ~/.ssh/id_ed25519_ansible (hosts not yet trusting the
+#               CA, or ca01 unable to issue)
+#   cert        certificate or stop
+#   static      static key only (first runs before the CA exists)
+#   breakglass  the certificate bin/ssh-cert <env> breakglass ansible signed offline
+# Runs as root (-e ansible_user=root, first runs of new LXCs and nodes) always use the static key.
+#
+# OpenBao: service secrets come from kv/services/<env>/ (plugins/vars/labstack_openbao.py, one read per run;
+# docs/howto/secrets-openbao.md). The plugin and any community.hashi_vault lookup log in with what
+# PLATFORM_BAO_AUTH (tofu/platform/<env>/client.env) says: approle (bin/bao-approle <env> ansible) or cert
+# (X.509 client certificate from ca01, no secret ID). LABSTACK_OPENBAO=off runs without OpenBao (bao01 down):
+# only the sops_only keys (secrets/policy.yml) are defined then.
+set -euo pipefail
+env="${1:?usage: bin/ap <dev|prod|labnode> <playbook> [args]}"; shift
+case "$env" in dev|prod|labnode) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+repo_root="$(git rev-parse --show-toplevel)"
+if [[ "$env" =~ ^(prod|labnode)$ && " $* " != *" --check "* && "${CI:-}" != "true" ]]; then
+  read -r -p "$(printf '%s' "$env" | tr '[:lower:]' '[:upper:]') ansible run. Type '$env' to continue: " ok
+  [[ "$ok" == "$env" ]] || { echo "aborted"; exit 1; }
+fi
+
+# shellcheck source=lib/platform.sh
+source "$repo_root/bin/lib/platform.sh"
+penv=$(platform_of "$env") # the platform tier this env uses (labnode: prod's CA and OpenBao)
+platform_env "$penv" "$repo_root"
+
+# macOS controller. Ansible forks a worker per task, and a forked worker that reads the system proxy
+# settings (urllib's _scproxy, which requests and so hvac call for every OpenBao lookup) is killed by the
+# Objective-C fork-safety check: "A worker was found in a dead state". The lab uses no HTTP proxy.
+if [[ $(uname -s) == Darwin ]]; then
+  export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+  export no_proxy="${no_proxy:-*}"
+fi
+mkdir -p "$HOME/.local/state/labstack" # ansible.cfg log_path
+
+# ---------------------------------------------------------------- SSH credential
+mode=${LABSTACK_SSH:-auto}
+[[ " $* " =~ [[:space:]]ansible_user=root[[:space:]] ]] && mode=static
+case "$mode" in
+  auto | cert)
+    if ssh_ca_ready "$penv" "$repo_root" && "$repo_root/bin/ssh-cert" "$penv" ansible --quiet; then
+      export ANSIBLE_PRIVATE_KEY_FILE="$LABSTACK_SSH_DIR/ansible"
+      ssh_extra="-o IdentitiesOnly=yes -o IdentityAgent=none"
+      # auto: the static key is offered after the certificate, for hosts that do not trust the CA yet
+      # (rollout, or a host never configured). It stops working on its own once ssh_ca_enforce removes it.
+      static_key="$HOME/.ssh/id_ed25519_ansible"
+      [[ $mode == auto && -f $static_key ]] && ssh_extra+=" -o IdentityFile=$static_key"
+      export ANSIBLE_SSH_EXTRA_ARGS=$ssh_extra
+      # roles/ssh_ca (ssh_ca_enforce) proves certificate logins with these before removing static keys
+      export LABSTACK_SSH_KEY_ansible="$LABSTACK_SSH_DIR/ansible"
+      if "$repo_root/bin/ssh-cert" "$penv" tofu --quiet; then
+        export LABSTACK_SSH_KEY_tofu="$LABSTACK_SSH_DIR/tofu"
+      fi
+    elif [[ $mode == cert ]]; then
+      echo "LABSTACK_SSH=cert: no ansible certificate for $penv" >&2
+      exit 1
+    elif ssh_ca_ready "$penv" "$repo_root"; then
+      echo "note: ca01 issued no certificate, this run uses the static key (gone from hosts once ssh_ca_enforce is on)" >&2
+    fi
+    ;;
+  breakglass)
+    key="$LABSTACK_SSH_DIR/breakglass-ansible"
+    [[ -f $key-cert.pub ]] || { echo "no break-glass certificate: bin/ssh-cert $penv breakglass ansible" >&2; exit 1; }
+    export ANSIBLE_PRIVATE_KEY_FILE=$key
+    export ANSIBLE_SSH_EXTRA_ARGS="-o IdentitiesOnly=yes -o IdentityAgent=none"
+    ;;
+  static) ;;
+  *) echo "LABSTACK_SSH: auto, cert, static or breakglass" >&2; exit 2 ;;
+esac
+
+# ---------------------------------------------------------------- OpenBao login for lookups
+bao_secrets="$repo_root/secrets/openbao-$penv.enc.yaml"
+if [[ $PLATFORM_BAO_AUTH == cert ]] && ssh_ca_ready "$penv" "$repo_root" &&
+  "$repo_root/bin/ssh-cert" "$penv" x509 ansible --quiet; then
+  export ANSIBLE_HASHI_VAULT_ADDR=$BAO_ADDR ANSIBLE_HASHI_VAULT_CA_CERT=$BAO_CACERT ANSIBLE_HASHI_VAULT_AUTH_METHOD=cert
+  export ANSIBLE_HASHI_VAULT_CERT_AUTH_PUBLIC_KEY="$LABSTACK_SSH_DIR/ansible-x509.crt"
+  export ANSIBLE_HASHI_VAULT_CERT_AUTH_PRIVATE_KEY="$LABSTACK_SSH_DIR/ansible-x509.key"
+  export ANSIBLE_HASHI_VAULT_ROLE_ID=ansible # the cert auth role (tofu/modules/openbao_config)
+elif [[ -f $bao_secrets ]] && sops decrypt --extract '["approle_ansible_secret_id"]' "$bao_secrets" > /dev/null 2>&1; then
+  [[ $PLATFORM_BAO_AUTH == cert ]] && echo "note: no X.509 certificate for OpenBao, falling back to the AppRole" >&2
+  ANSIBLE_HASHI_VAULT_ROLE_ID=$(sops decrypt --extract '["approle_ansible_role_id"]' "$bao_secrets")
+  ANSIBLE_HASHI_VAULT_SECRET_ID=$(sops decrypt --extract '["approle_ansible_secret_id"]' "$bao_secrets")
+  export ANSIBLE_HASHI_VAULT_ADDR=$BAO_ADDR ANSIBLE_HASHI_VAULT_CA_CERT=$BAO_CACERT ANSIBLE_HASHI_VAULT_AUTH_METHOD=approle
+  export ANSIBLE_HASHI_VAULT_ROLE_ID ANSIBLE_HASHI_VAULT_SECRET_ID
+fi
+# The plugin reads OpenBao wherever this platform has one (dev has none: sops only)
+if [[ -f $bao_secrets ]]; then
+  export LABSTACK_LAB_ENV=$env
+  [[ ${LABSTACK_OPENBAO:-} == off ]] && echo "note: LABSTACK_OPENBAO=off, no secrets from OpenBao in this run" >&2
+fi
+
+cd "$repo_root/ansible"
+# common first: the env inventory is loaded second, so its group_vars win
+exec sops exec-env "$repo_root/secrets/$env.enc.env" "ansible-playbook -i inventories/common -i inventories/$env $(printf '%q ' "$@")"

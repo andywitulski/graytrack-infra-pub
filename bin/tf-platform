@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Usage: bin/tf-platform <dev|prod> <tofu args...>
+#        bin/tf-platform <dev|prod> bootstrap
+#        bin/tf-platform <dev|prod> migrate
+# OpenTofu for the platform tier (tofu/platform/<env>: pg01, bao01, ca01). Same secrets as bin/tf.
+#
+# Its state lives in pg01, which this root creates, so the first build goes in two steps:
+#   bootstrap  apply on local state (encrypted, gitignored) through a temporary backend override
+#   migrate    after playbooks/platform.yml has configured pg01: copy the state into pg01, check it,
+#              drop the override, and set the local copy aside
+# Between the two, plain bin/tf-platform commands keep using the local state.
+# SSH to the nodes: the tofu certificate in a private agent once ca01 exists (as bin/tf).
+set -euo pipefail
+
+env=${1:?usage: bin/tf-platform <dev|prod> <tofu args...|bootstrap|migrate>}
+shift
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+dir="$root/tofu/platform/$env"
+secrets="$root/secrets/$env.enc.env"
+override="$dir/zz_bootstrap_override.tf"
+local_state="$dir/terraform.tfstate"
+
+# shellcheck source=lib/platform.sh
+source "$root/bin/lib/platform.sh"
+platform_env "$env" "$root"
+
+tofu_run() { sops exec-env "$secrets" "tofu -chdir=$(printf '%q' "$dir") $(printf '%q ' "$@")"; }
+
+if [[ ${1:-} == bootstrap || ${1:-} == migrate ]] || platform_cmd_needs_backend "$@"; then
+  tofu_cert_agent "$env" "$root" || exit 1
+  trap tofu_cert_agent_stop EXIT
+fi
+
+write_override() {
+  printf '%s\n' \
+    '# Written by bin/tf-platform bootstrap, removed by bin/tf-platform migrate. Never committed (.gitignore).' \
+    "# Until pg01 exists and is configured, this root's state is local (and still encrypted)." \
+    'terraform {' \
+    '  backend "local" {}' \
+    '}' > "$override"
+}
+
+case "${1:-}" in
+  bootstrap)
+    [[ $env == prod ]] && platform_prod_confirm "platform bootstrap (creates pg01 and bao01 on local state)"
+    [[ -f $override ]] || write_override
+    tofu_run init -reconfigure
+    tofu_run apply
+    echo
+    echo "Next: bin/ap $env playbooks/platform.yml --limit platform_guests -e ansible_user=root"
+    echo "      bin/ap $env playbooks/platform.yml"
+    echo "      bin/tf-platform $env migrate"
+    ;;
+
+  migrate)
+    [[ -f $override ]] || { echo "no bootstrap override in $dir: the state is already in pg01" >&2; exit 1; }
+    [[ -f $local_state ]] || { echo "no local state at $local_state" >&2; exit 1; }
+    platform_need_backend || exit 1
+    [[ $env == prod ]] && platform_prod_confirm "platform state migration into pg01"
+
+    before=$(tofu_run state list | sort)
+    rm -f "$override"
+    if ! tofu_run init -migrate-state -force-copy; then
+      write_override
+      tofu_run init -reconfigure > /dev/null
+      echo "migration failed: back on the local backend, the local state is untouched" >&2
+      exit 1
+    fi
+    after=$(tofu_run state list | sort)
+    if [[ "$before" != "$after" ]]; then
+      echo "state in pg01 does not match the local state. The local file is untouched: $local_state" >&2
+      diff <(echo "$before") <(echo "$after") >&2 || true
+      exit 1
+    fi
+    aside="$local_state.migrated-$(date +%Y%m%d%H%M%S)"
+    mv "$local_state" "$aside"
+    rm -f "$local_state.backup"
+    echo "State is in pg01 (schema platform, $(wc -l <<< "$after") resources)."
+    echo "The local copy is set aside (encrypted, gitignored): $aside"
+    echo "Delete it once bin/tf-platform $env plan shows no changes."
+    ;;
+
+  *)
+    if [[ ! -f $override ]] && platform_cmd_needs_backend "$@"; then platform_need_backend || exit 1; fi
+    if [[ $env == prod && ${1:-} =~ ^(apply|destroy|import|state)$ ]]; then
+      platform_prod_confirm "platform tofu $1"
+    fi
+    tofu_run "$@"
+    ;;
+esac

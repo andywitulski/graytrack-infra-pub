@@ -1,0 +1,318 @@
+---
+# Dashboard login through Authentik (SAML), following Wazuh's Authentik guide, with three deliberate
+# differences: everything is code, the indexer's reserved all_access mapping is left alone (two
+# labstack_* roles are mapped instead), and the Wazuh API role mapping is created through the API.
+# The internal password login stays first in line, so admin keeps working if Authentik is down.
+
+- name: SAML exchange key is stored
+  ansible.builtin.assert:
+    that: wazuh_saml_exchange_key | default('') is match('^[0-9a-f]{64}$')
+    fail_msg: "wazuh_saml_exchange_key must be 64 hex characters (bin/gen-service-secrets <env>)."
+    quiet: true
+  no_log: true
+
+# ---------------------------------------------------------------- identity provider metadata into the indexer
+# The security plugin wants the directory 0700 and the file 0600, owned by the user the indexer runs as
+- name: User the indexer runs as
+  check_mode: false
+  ansible.builtin.command:
+    cmd: docker compose exec -T wazuh.indexer id -u
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_indexer_uid
+  changed_when: false
+
+- name: SAML directory on the host
+  ansible.builtin.file:
+    path: "{{ wazuh_manager_dir }}/config/wazuh_indexer/saml"
+    state: directory
+    owner: "{{ wazuh_manager_indexer_uid.stdout | trim }}"
+    group: root
+    mode: "0700"
+
+- name: Authentik's SAML metadata (public)
+  ansible.builtin.copy:
+    src: "{{ wazuh_manager_saml_metadata_file }}"
+    dest: "{{ wazuh_manager_dir }}/config/wazuh_indexer/saml/authentik-metadata.xml"
+    owner: "{{ wazuh_manager_indexer_uid.stdout | trim }}"
+    group: root
+    mode: "0600"
+  register: wazuh_manager_saml_metadata
+
+- name: Compose override mounts it into the indexer
+  ansible.builtin.template:
+    src: docker-compose.override.yml.j2
+    dest: "{{ wazuh_manager_dir }}/docker-compose.override.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  register: wazuh_manager_override
+
+- name: Recreate the indexer with the mount  # noqa: no-handler (must finish before the next tasks read its config)
+  when: wazuh_manager_override is changed
+  block:
+    - name: Recreate the indexer
+      ansible.builtin.command:
+        cmd: docker compose up -d wazuh.indexer
+        chdir: "{{ wazuh_manager_dir }}"
+      changed_when: true
+
+    - name: Wait for the indexer
+      ansible.builtin.uri:
+        url: https://localhost:9200/_cluster/health
+        url_username: admin
+        url_password: "{{ wazuh_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: wazuh_manager_sso_wait
+      until: wazuh_manager_sso_wait.status == 200
+      retries: 30
+      delay: 10
+      no_log: true
+
+# ---------------------------------------------------------------- authentication: add SAML next to the password login
+- name: Read the indexer's security configuration
+  check_mode: false
+  ansible.builtin.uri:
+    url: https://localhost:9200/_plugins/_security/api/securityconfig
+    url_username: admin
+    url_password: "{{ wazuh_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+  register: wazuh_manager_secconfig
+  no_log: true
+
+- name: Desired authentication domains
+  vars:
+    wazuh_manager_authc_changes:
+      authc:
+        basic_internal_auth_domain:
+          order: 0
+          http_authenticator:
+            challenge: false
+        saml_auth_domain:
+          http_enabled: true
+          transport_enabled: false
+          order: 1
+          http_authenticator:
+            type: saml
+            challenge: true
+            config:
+              idp:
+                metadata_file: "{{ wazuh_manager_saml_dir_container }}/authentik-metadata.xml"
+                entity_id: "{{ wazuh_manager_saml_entity_id }}"
+              sp:
+                entity_id: "{{ wazuh_manager_saml_entity_id }}"
+              kibana_url: "{{ wazuh_manager_dashboard_url }}"
+              roles_key: Roles
+              exchange_key: "{{ wazuh_saml_exchange_key }}"
+          authentication_backend:
+            type: noop
+  ansible.builtin.set_fact:
+    wazuh_manager_secconfig_current: "{{ wazuh_manager_secconfig.json.config.dynamic }}"
+    wazuh_manager_secconfig_desired: "{{ wazuh_manager_secconfig.json.config.dynamic | combine(wazuh_manager_authc_changes, recursive=true) }}"
+  no_log: true
+
+# Rollback point: the security configuration as it was before SAML was ever added (written once, root only)
+- name: Backup directory
+  ansible.builtin.file:
+    path: "{{ wazuh_manager_dir }}/backups"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Keep the pre-SAML security configuration (first time only)
+  ansible.builtin.copy:
+    dest: "{{ wazuh_manager_dir }}/backups/securityconfig-before-saml.json"
+    content: "{{ {'_meta': {'type': 'config', 'config_version': 2}, 'config': {'dynamic': wazuh_manager_secconfig_current}} | to_nice_json }}"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+  when: "'saml_auth_domain' not in wazuh_manager_secconfig_current.authc"
+  no_log: true
+
+# Reloaded when the domains differ, or when the metadata changed (the SAML authenticator reads it on load)
+- name: Load the authentication domains (securityadmin, admin certificate)
+  when: >-
+    wazuh_manager_secconfig_desired != wazuh_manager_secconfig_current
+    or wazuh_manager_saml_metadata is changed
+  vars:
+    wazuh_manager_secconfig_file:
+      _meta:
+        type: config
+        config_version: 2
+      config:
+        dynamic: "{{ wazuh_manager_secconfig_desired }}"
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.indexer, bash, -c,
+           'I={{ wazuh_manager_indexer_home }}; F=$(mktemp /tmp/secconfig.XXXXXX.yml); trap "rm -f $F" EXIT;
+            cat > "$F"; export JAVA_HOME=$I/jdk;
+            bash $I/plugins/opensearch-security/tools/securityadmin.sh -f "$F" -t config -nhnv -icl -p 9200
+            -cacert $I/config/certs/root-ca.pem -cert $I/config/certs/admin.pem -key $I/config/certs/admin-key.pem']
+    chdir: "{{ wazuh_manager_dir }}"
+    stdin: "{{ wazuh_manager_secconfig_file | to_nice_yaml(indent=2) }}"
+  register: wazuh_manager_secadmin
+  changed_when: true
+  failed_when: "'Done with success' not in wazuh_manager_secadmin.stdout"
+  no_log: true
+
+# ---------------------------------------------------------------- indexer roles for the two backend roles
+- name: Indexer roles (own roles; the reserved all_access mapping stays untouched)
+  ansible.builtin.uri:
+    url: "https://localhost:9200/_plugins/_security/api/roles/{{ item.name }}"
+    method: PUT
+    body_format: json
+    body: "{{ item.role }}"
+    url_username: admin
+    url_password: "{{ wazuh_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: [200, 201]
+  loop:
+    - name: labstack_admin
+      role:
+        description: "Wazuh administrators from Authentik (managed by Ansible)"
+        cluster_permissions: [cluster_all]
+        index_permissions: [{ index_patterns: ["*"], allowed_actions: [indices_all] }]
+        tenant_permissions: [{ tenant_patterns: ["*"], allowed_actions: [kibana_all_write] }]
+    - name: labstack_readonly
+      role:
+        description: "Wazuh read-only users from Authentik (managed by Ansible)"
+        cluster_permissions: [cluster_composite_ops_ro]
+        index_permissions: [{ index_patterns: ["*"], allowed_actions: [read] }]
+        tenant_permissions: [{ tenant_patterns: [global_tenant], allowed_actions: [kibana_all_read] }]
+  loop_control:
+    label: "{{ item.name }}"
+  register: wazuh_manager_idx_roles
+  # PUT is idempotent; 201 means the role was new
+  changed_when: wazuh_manager_idx_roles.status == 201
+  no_log: false
+
+- name: Map the backend roles to them
+  ansible.builtin.uri:
+    url: "https://localhost:9200/_plugins/_security/api/rolesmapping/{{ item.role }}"
+    method: PUT
+    body_format: json
+    body:
+      backend_roles: ["{{ item.backend_role }}"]
+      description: "Authentik SAML backend role (managed by Ansible)"
+    url_username: admin
+    url_password: "{{ wazuh_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: [200, 201]
+  loop:
+    - { role: labstack_admin, backend_role: "{{ wazuh_manager_saml_admin_backend_role }}" }
+    - { role: labstack_readonly, backend_role: "{{ wazuh_manager_saml_readonly_backend_role }}" }
+  loop_control:
+    label: "{{ item.role }}"
+  register: wazuh_manager_idx_maps
+  changed_when: wazuh_manager_idx_maps.status == 201
+
+# ---------------------------------------------------------------- Wazuh API: same backend roles to its roles
+- name: Wazuh API token (wazuh-wui)
+  check_mode: false
+  ansible.builtin.uri:
+    url: https://localhost:55000/security/user/authenticate
+    method: POST
+    url_username: wazuh-wui
+    url_password: "{{ wazuh_api_password }}"
+    force_basic_auth: true
+    validate_certs: false
+  register: wazuh_manager_sso_token
+  no_log: true
+
+- name: Read the API's roles and rules
+  check_mode: false
+  ansible.builtin.uri:
+    url: "https://localhost:55000/security/{{ item }}?limit=500"
+    headers:
+      Authorization: "Bearer {{ wazuh_manager_sso_token.json.data.token }}"
+    validate_certs: false
+  loop: [roles, rules]
+  register: wazuh_manager_api_rbac
+  no_log: true
+
+- name: API rules matching the backend roles
+  vars:
+    wazuh_manager_rules_by_name: "{{ wazuh_manager_api_rbac.results[1].json.data.affected_items | items2dict(key_name='name', value_name='id') }}"
+  ansible.builtin.uri:
+    url: https://localhost:55000/security/rules
+    method: POST
+    headers:
+      Authorization: "Bearer {{ wazuh_manager_sso_token.json.data.token }}"
+    body_format: json
+    body:
+      name: "{{ item.name }}"
+      rule: { FIND: { backend_roles: "{{ item.backend_role }}" } }
+    validate_certs: false
+  loop:
+    - { name: labstack-saml-admins, backend_role: "{{ wazuh_manager_saml_admin_backend_role }}" }
+    - { name: labstack-saml-readonly, backend_role: "{{ wazuh_manager_saml_readonly_backend_role }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.name not in wazuh_manager_rules_by_name
+  changed_when: true
+  no_log: true
+
+- name: Read the API's rules again (with the new ones)
+  check_mode: false
+  ansible.builtin.uri:
+    url: https://localhost:55000/security/rules?limit=500
+    headers:
+      Authorization: "Bearer {{ wazuh_manager_sso_token.json.data.token }}"
+    validate_certs: false
+  register: wazuh_manager_api_rules
+  no_log: true
+
+- name: Link each rule to its API role
+  vars:
+    wazuh_manager_rules_by_name: "{{ wazuh_manager_api_rules.json.data.affected_items | items2dict(key_name='name', value_name='id') }}"
+    wazuh_manager_role: "{{ wazuh_manager_api_rbac.results[0].json.data.affected_items | selectattr('name', 'equalto', item.api_role) | first }}"
+    wazuh_manager_rule_id: "{{ wazuh_manager_rules_by_name[item.rule] | default(0) }}"
+  ansible.builtin.uri:
+    url: "https://localhost:55000/security/roles/{{ wazuh_manager_role.id }}/rules?rule_ids={{ wazuh_manager_rule_id }}"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ wazuh_manager_sso_token.json.data.token }}"
+    validate_certs: false
+  loop:
+    - { rule: labstack-saml-admins, api_role: administrator }
+    - { rule: labstack-saml-readonly, api_role: readonly }
+  loop_control:
+    label: "{{ item.rule }} -> {{ item.api_role }}"
+  when: (wazuh_manager_rule_id | int) not in (wazuh_manager_role.rules | default([]))
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- dashboard: offer both logins
+- name: Dashboard offers password and SAML login
+  ansible.builtin.blockinfile:
+    path: "{{ wazuh_manager_dir }}/config/wazuh_dashboard/opensearch_dashboards.yml"
+    marker: "# {mark} labstack SAML login (managed by Ansible)"
+    block: |
+      opensearch_security.auth.multiple_auth_enabled: true
+      opensearch_security.auth.type: ["basicauth","saml"]
+      server.xsrf.allowlist: ["/_opendistro/_security/saml/acs", "/_opendistro/_security/saml/logout", "/_opendistro/_security/saml/acs/idpinitiated"]
+  notify: Restart wazuh dashboard
+
+- name: Apply dashboard changes before the check
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------- verify
+- name: SAML login on the dashboard redirects to Authentik
+  check_mode: false
+  ansible.builtin.uri:
+    # the dashboard rejects the request (400) without redirectHash; the login page sends it the same way
+    url: "https://localhost/auth/saml/login?nextUrl=%2Fapp%2Fwz-home&redirectHash=false"
+    follow_redirects: none
+    validate_certs: false
+    status_code: [302, 303]
+  register: wazuh_manager_saml_login
+  until: wazuh_manager_saml_login.status in [302, 303]
+  retries: 18
+  delay: 10
+  failed_when: >-
+    wazuh_manager_saml_login.status not in [302, 303]
+    or wazuh_manager_saml_login.location | default('') is not search('/application/saml/')

@@ -1,0 +1,160 @@
+{#- Managed by Ansible (labstack-infra), role step_ca. ca.json for one instance (step_ca_unit). Built as data and
+    printed as JSON, so nothing here needs JSON quoting by hand. Holds the database password: 0640 root:step. -#}
+{%- set S = step_ca_secret -%}
+{%- set D = step_ca_dir -%}
+{%- set login = step_ca_unit == 'step-ca-login' -%}
+{%- set dsn = 'postgresql://' ~ step_ca_pg_user ~ ':' ~ (stepca_pg_password | urlencode | replace('/', '%2F'))
+             ~ '@' ~ step_ca_pg_host ~ ':5432/?sslmode=verify-full&sslrootcert=' ~ D ~ '/db/pg-ca.pem' -%}
+{%- set host_dns = step_ca_host_names -%}
+{%- set host_cn = step_ca_host_names | reject('search', '\\*') | list -%}
+{%- set provisioners = [] -%}
+{%- if login -%}
+{%-   set _ = provisioners.append({
+        'type': 'OIDC',
+        'name': 'authentik',
+        'clientID': step_ca_oidc_client_id,
+        'clientSecret': '',
+        'configurationEndpoint': step_ca_oidc_discovery,
+        'listenAddress': step_ca_oidc_listen,
+        'scopes': ['openid', 'email', 'profile'],
+        'groups': step_ca_oidc_groups,
+        'claims': {
+          'enableSSHCA': true,
+          'disableRenewal': true,
+          'minUserSSHCertDuration': '5m',
+          'defaultUserSSHCertDuration': step_ca_user_ssh_default,
+          'maxUserSSHCertDuration': step_ca_user_ssh_max,
+          'minTLSCertDuration': '5m',
+          'defaultTLSCertDuration': step_ca_user_ssh_default,
+          'maxTLSCertDuration': step_ca_user_ssh_max,
+        },
+        'options': {
+          'ssh': {'templateFile': D ~ '/templates/ssh/oidc-user.tpl'},
+          'x509': {'templateFile': D ~ '/templates/x509/oidc-user.tpl'},
+        },
+      }) -%}
+{#-   Devices (ADR-0006): X.509 only, its own Authentik client (step-ca keys OIDC provisioners by client ID) -#}
+{%-   if step_ca_device_enabled | bool -%}
+{%-     set _ = provisioners.append({
+          'type': 'OIDC',
+          'name': 'authentik-device',
+          'clientID': step_ca_device_client_id,
+          'clientSecret': '',
+          'configurationEndpoint': step_ca_device_discovery,
+          'listenAddress': step_ca_oidc_listen,
+          'scopes': ['openid', 'email', 'profile'],
+          'groups': step_ca_device_groups,
+          'claims': {
+            'enableSSHCA': false,
+            'disableRenewal': true,
+            'minTLSCertDuration': '5m',
+            'defaultTLSCertDuration': step_ca_device_tls_default,
+            'maxTLSCertDuration': step_ca_device_tls_max,
+          },
+          'options': {
+            'x509': {'templateFile': D ~ '/templates/x509/oidc-device.tpl'},
+          },
+        }) -%}
+{%-   endif -%}
+{%- else -%}
+{%-   for name, a in step_ca_automation.items() -%}
+{%-     set _ = provisioners.append({
+          'type': 'JWK',
+          'name': name,
+          'key': S.provisioners[name].key,
+          'encryptedKey': S.provisioners[name].encryptedKey,
+          'claims': {
+            'enableSSHCA': true,
+            'disableRenewal': true,
+            'minUserSSHCertDuration': '5m',
+            'defaultUserSSHCertDuration': a.ssh_default,
+            'maxUserSSHCertDuration': a.ssh_max,
+            'minTLSCertDuration': '5m',
+            'defaultTLSCertDuration': a.tls_default,
+            'maxTLSCertDuration': a.tls_max,
+          },
+          'options': {
+            'ssh': {'templateFile': D ~ '/templates/ssh/automation-' ~ name ~ '.tpl'},
+            'x509': {'templateFile': D ~ '/templates/x509/automation-' ~ name ~ '.tpl'},
+          },
+        }) -%}
+{%-   endfor -%}
+{%-   set _ = provisioners.append({
+        'type': 'JWK',
+        'name': 'hosts',
+        'key': S.provisioners.hosts.key,
+        'encryptedKey': S.provisioners.hosts.encryptedKey,
+        'claims': {
+          'enableSSHCA': true,
+          'disableRenewal': true,
+          'minHostSSHCertDuration': '5m',
+          'defaultHostSSHCertDuration': step_ca_host_ssh_duration,
+          'maxHostSSHCertDuration': step_ca_host_ssh_duration,
+          'minTLSCertDuration': '5m',
+          'defaultTLSCertDuration': step_ca_host_tls_default,
+          'maxTLSCertDuration': step_ca_host_tls_max,
+        },
+        'options': {'ssh': {'templateFile': D ~ '/templates/ssh/host.tpl'}},
+      }) -%}
+{%-   if step_ca_acme_enabled | bool -%}
+{%-     set _ = provisioners.append({
+          'type': 'ACME',
+          'name': 'acme',
+          'challenges': ['http-01', 'dns-01', 'tls-alpn-01'],
+          'claims': {
+            'enableSSHCA': false,
+            'defaultTLSCertDuration': step_ca_acme_tls_default,
+            'maxTLSCertDuration': step_ca_acme_tls_max,
+          },
+        }) -%}
+{%-   endif -%}
+{%- endif -%}
+{%- set ssh_keys = {'userKey': D ~ '/secrets/ssh_user_ca_key'} -%}
+{%- if not login -%}
+{%-   set _ = ssh_keys.update({'hostKey': D ~ '/secrets/ssh_host_ca_key'}) -%}
+{%- endif -%}
+{#- The login instance gets no host CA key at all (ssh_keys above), so it cannot sign host certificates;
+    its user certificates are shaped by the template (one principal, the Authentik username). -#}
+{%- if login -%}
+{%-   set policy = {} -%}
+{%- else -%}
+{%-   set policy = {
+        'x509': {'allow': {
+          'cn': step_ca_automation.keys() | list + host_cn,
+          'dns': host_dns,
+          'ip': step_ca_host_ips,
+        }},
+        'ssh': {
+          'user': {'allow': {'principal': step_ca_automation.keys() | list}},
+          'host': {'allow': {'dns': host_dns, 'ip': step_ca_host_ips}},
+        },
+      } -%}
+{%- endif -%}
+{%- set cfg = {
+      'root': D ~ '/certs/root_ca.crt',
+      'federatedRoots': none,
+      'crt': D ~ '/certs/intermediate_ca.crt',
+      'key': D ~ '/secrets/intermediate_ca_key',
+      'address': ':' ~ (step_ca_login_port if login else step_ca_port),
+      'insecureAddress': '',
+      'dnsNames': step_ca_dns_names,
+      'commonName': inventory_hostname,
+      'logger': {'format': 'json'},
+      'db': {'type': 'postgresql', 'dataSource': dsn, 'database': step_ca_pg_db},
+      'ssh': ssh_keys,
+      'authority': {
+        'enableAdmin': false,
+        'claims': {'enableSSHCA': true},
+        'policy': policy,
+        'provisioners': provisioners,
+        'template': {},
+        'backdate': '1m0s',
+      },
+      'tls': {
+        'cipherSuites': ['TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256', 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256'],
+        'minVersion': 1.2,
+        'maxVersion': 1.3,
+        'renegotiation': false,
+      },
+    } -%}
+{{ cfg | to_nice_json(indent=2) }}

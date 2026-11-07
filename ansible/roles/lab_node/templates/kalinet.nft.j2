@@ -1,0 +1,33 @@
+#!/usr/sbin/nft -f
+# Managed by Ansible (labstack-infra, role lab_node). kalinet (kali01) reaches the internet only.
+# Its own table: pve-firewall and SDN leave it alone. Deleted and recreated as a whole on every load.
+table inet labstack_kali
+delete table inet labstack_kali
+
+table inet labstack_kali {
+  set blocked4 {
+    type ipv4_addr
+    flags interval
+    elements = { {{ (labnode_kali_blocked + labnode_kali_blocked_extra) | join(', ') }} }
+  }
+
+  # To the node itself: DNS and DHCP on the gateway, nothing else (not the API, not SSH, not __MGMT_NET__.4)
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "{{ labnode_kali_vnet }}" ip daddr {{ labnode_kali_gw }} udp dport { 53, 67 } accept
+    iifname "{{ labnode_kali_vnet }}" ip daddr {{ labnode_kali_gw }} tcp dport 53 accept
+    iifname "{{ labnode_kali_vnet }}" ip daddr 255.255.255.255 udp dport 67 accept
+    iifname "{{ labnode_kali_vnet }}" limit rate 10/minute log prefix "labstack-kali-in-drop: "
+    iifname "{{ labnode_kali_vnet }}" counter drop
+  }
+
+  # Through the node: out to public addresses only, IPv4 only; in, replies only
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname "{{ labnode_kali_vnet }}" meta nfproto ipv6 counter drop
+    iifname "{{ labnode_kali_vnet }}" ip daddr @blocked4 limit rate 10/minute log prefix "labstack-kali-fwd-drop: "
+    iifname "{{ labnode_kali_vnet }}" ip daddr @blocked4 counter drop
+    oifname "{{ labnode_kali_vnet }}" ct state established,related accept
+    oifname "{{ labnode_kali_vnet }}" counter drop
+  }
+}

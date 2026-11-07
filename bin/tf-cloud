@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Usage: bin/tf-cloud prod <tofu args...>
+# OpenTofu for the Hetzner cloud resources (tofu/cloud/<env>): the mail VPS (docs/howto/mail-public-edge.md).
+# State lives in pg01 (schema "cloud") like the other roots; bin/lib/platform.sh supplies the backend.
+# The Hetzner API token and the state passphrase come from secrets/cloud-<env>.enc.env:
+#   HCLOUD_TOKEN, TF_VAR_state_passphrase
+# No Proxmox, no ssh-agent: this talks only to Hetzner's API over HTTPS.
+set -euo pipefail
+env="${1:?usage: bin/tf-cloud prod <tofu args>}"; shift
+case "$env" in prod) ;; *) echo "cloud resources run in prod only" >&2; exit 2 ;; esac
+repo_root="$(git rev-parse --show-toplevel)"
+secrets="$repo_root/secrets/cloud-$env.enc.env"
+[[ -f $secrets ]] || { echo "missing $secrets (HCLOUD_TOKEN, TF_VAR_state_passphrase)" >&2; exit 1; }
+# shellcheck source=lib/platform.sh
+source "$repo_root/bin/lib/platform.sh"
+platform_env "$env" "$repo_root"
+if platform_cmd_needs_backend "$@"; then platform_need_backend || exit 1; fi
+if [[ "${1:-}" =~ ^(apply|destroy|import|state)$ && "${CI:-}" != "true" ]]; then
+  read -r -p "PROD cloud tofu $1. Type 'prod' to continue: " ok
+  [[ "$ok" == "prod" ]] || { echo "aborted"; exit 1; }
+fi
+cd "$repo_root/tofu/cloud/$env"
+sops exec-env "$secrets" "tofu $(printf '%q ' "$@")"

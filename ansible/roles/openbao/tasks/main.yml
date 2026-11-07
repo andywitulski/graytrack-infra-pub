@@ -1,0 +1,167 @@
+---
+- name: Seal key and database password are in sops
+  ansible.builtin.assert:
+    that:
+      - openbao_seal_key | default('PENDING') not in ['', 'PENDING']
+      - openbao_seal_key | b64decode(encoding='latin-1') | length == 32
+      - openbao_pg_password | default('PENDING') not in ['', 'PENDING']
+      - not openbao_seal_previous_key_id or openbao_seal_previous_key | default('') | length > 0
+    fail_msg: >-
+      openbao_seal_key (32 random bytes, base64) and openbao_pg_password must be in sops
+      (bin/gen-service-secrets {{ lab_env }}); a previous seal key id needs openbao_seal_previous_key.
+    quiet: true
+  no_log: true
+
+- name: The database host's CA is in the repo (written when the postgres play configured it)
+  ansible.builtin.stat:
+    path: "{{ openbao_pg_ca_src }}"
+  delegate_to: localhost
+  become: false
+  register: openbao_pg_ca
+  failed_when: not openbao_pg_ca.stat.exists
+
+- name: Package cache directory
+  ansible.builtin.file:
+    path: /var/cache/openbao
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: OpenBao package (checksum pinned in defaults)
+  ansible.builtin.get_url:
+    url: "{{ openbao_deb_url }}"
+    dest: "/var/cache/openbao/openbao_{{ openbao_version }}_linux_amd64.deb"
+    checksum: "sha256:{{ openbao_deb_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: OpenBao installed
+  ansible.builtin.apt:
+    deb: "/var/cache/openbao/openbao_{{ openbao_version }}_linux_amd64.deb"
+  notify: Restart openbao
+
+- name: Server certificate (CA fetched to the repo for the clients)
+  ansible.builtin.include_role:
+    name: host_tls
+  vars:
+    host_tls_dir: "{{ openbao_tls_dir }}"
+    host_tls_group: openbao
+
+- name: Listener certificate from ca01 (renewed here and by playbooks/admin-tls.yml)
+  ansible.builtin.include_tasks: tls.yml
+  when: openbao_tls_ca01 | bool
+
+- name: Listener files
+  ansible.builtin.set_fact:
+    openbao_tls_cert: "{{ x509_cert_path if openbao_tls_ca01 | bool else openbao_tls_dir ~ '/server.crt' }}"
+    openbao_tls_key: "{{ x509_cert_key_path if openbao_tls_ca01 | bool else openbao_tls_dir ~ '/server.key' }}"
+    openbao_tls_ca: "{{ (x509_cert_path | dirname) ~ '/root.pem' if openbao_tls_ca01 | bool else openbao_tls_dir ~ '/ca.crt' }}"
+
+- name: Clients trust both the per-host CA and ca01 (bundle in the repo, committed)
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/../files/{{ lab_env }}/{{ inventory_hostname }}-trust.pem"
+    content: |
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/../files/' ~ lab_env ~ '/' ~ inventory_hostname ~ '-ca.pem') }}
+      {{ lookup('ansible.builtin.file', ssh_ca_root_pem) }}
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when: openbao_tls_ca01 | bool
+
+- name: CA to verify the database host against
+  ansible.builtin.copy:
+    src: "{{ openbao_pg_ca_src }}"
+    dest: /etc/openbao/pg-ca.pem
+    owner: root
+    group: openbao
+    mode: "0644"
+  notify: Restart openbao
+
+- name: Audit log directory
+  ansible.builtin.file:
+    path: "{{ openbao_audit_dir }}"
+    state: directory
+    owner: openbao
+    group: openbao
+    mode: "0750"
+
+- name: Audit log rotation (SIGHUP reopens the file)
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/openbao
+    content: |
+      {{ openbao_audit_dir }}/audit.log {
+          daily
+          rotate {{ openbao_audit_keep_days }}
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0640 openbao openbao
+          postrotate
+              systemctl reload openbao > /dev/null 2>&1 || true
+          endscript
+      }
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Server configuration
+  ansible.builtin.template:
+    src: openbao.hcl.j2
+    dest: /etc/openbao/openbao.hcl
+    owner: root
+    group: openbao
+    mode: "0640"
+  notify: Restart openbao
+
+- name: Server environment (database URL, seal key)
+  ansible.builtin.template:
+    src: openbao.env.j2
+    dest: /etc/openbao/openbao.env
+    owner: root
+    group: openbao
+    mode: "0640"
+  no_log: true
+  notify: Restart openbao
+
+- name: OpenBao running
+  ansible.builtin.service:
+    name: openbao
+    state: started
+    enabled: true
+
+- name: Apply changes now
+  ansible.builtin.meta: flush_handlers
+
+# 200 active, 429 standby, 501 not initialized, 503 sealed. Anything else, or no answer: not up yet.
+- name: OpenBao answers
+  ansible.builtin.uri:
+    url: "{{ openbao_api_addr }}/v1/sys/health"
+    ca_path: "{{ openbao_tls_ca }}"
+    status_code: [200, 429, 501, 503]
+  register: openbao_health
+  retries: 20
+  delay: 3
+  until: openbao_health.status | default(-1) in [200, 429, 501, 503]
+  when: not ansible_check_mode # --check applies nothing (no new certificate, no restart): nothing to probe
+
+- name: Static seal unsealed it (sealed and initialized means the seal key does not match)
+  ansible.builtin.assert:
+    that:
+      - openbao_health.status is defined
+      - openbao_health.status != 503
+    fail_msg: >-
+      {{ ('OpenBao is initialized but sealed: openbao_seal_key does not open its storage. Check the key id and
+      key in sops against the ones it was initialized with (docs/howto/platform-tier.md, seal key).')
+      if openbao_health.status | default(0) == 503 else
+      ('No HTTP answer from ' ~ openbao_api_addr ~ ' (TLS against ' ~ openbao_tls_ca ~ '): '
+       ~ (openbao_health.msg | default(openbao_health | to_json))) }}
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Next step
+  ansible.builtin.debug:
+    msg: "OpenBao is up and not initialized. Initialize it from the controller: bin/bao-init {{ lab_env }}"
+  when: not ansible_check_mode and openbao_health.status | default(0) == 501

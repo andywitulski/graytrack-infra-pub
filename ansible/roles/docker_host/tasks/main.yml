@@ -1,0 +1,41 @@
+---
+- name: Prerequisites
+  ansible.builtin.apt:
+    name: [ca-certificates, python3-debian, python3-requests, python3-docker]
+    state: present
+    update_cache: true
+
+- name: Docker apt repository (signed)
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: https://download.docker.com/linux/debian
+    suites: "{{ ansible_facts.distribution_release }}"
+    components: stable
+    signed_by: https://download.docker.com/linux/debian/gpg
+
+- name: Docker engine and compose plugin
+  ansible.builtin.apt:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    state: present
+    update_cache: true
+
+- name: Daemon settings (log rotation, keep containers up across daemon restarts)
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "5" },
+        "live-restore": true
+      }
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart docker
+
+- name: Docker running
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true

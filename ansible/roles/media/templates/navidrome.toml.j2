@@ -1,0 +1,16 @@
+# Managed by Ansible (labstack-infra).
+MusicFolder = "{{ media_navidrome_music }}"
+DataFolder = "/var/lib/navidrome"
+Address = "0.0.0.0"
+Port = 4533
+LogLevel = "{{ media_navidrome_log_level }}"
+
+# Sections must stay last: every line below a [section] header belongs to that section.
+[Scanner]
+Schedule = "@every 1h"
+
+# Must stay last: every line below a [section] header belongs to that section.
+[ExtAuth]
+# Login comes from Authentik via Caddy on the edge proxy; trust the user header only from it
+TrustedSources = "{{ media_navidrome_trusted_sources }}"
+UserHeader = "Remote-User"

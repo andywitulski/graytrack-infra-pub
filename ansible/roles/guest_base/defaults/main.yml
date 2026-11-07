@@ -1,0 +1,6 @@
+---
+guest_base_admin_user: ansible
+# From the repo, not the controller's home: the same key on the admin workstation and paw01, and the one
+# tofu puts into new guests (ansible/files/pubkeys/ansible.pub, as bootstrap.yml uses for the nodes)
+guest_base_admin_pubkey: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../files/pubkeys/ansible.pub') }}"
+guest_base_journald_max_use: 500M

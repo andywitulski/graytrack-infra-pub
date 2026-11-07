@@ -1,0 +1,41 @@
+---
+- name: Refresh boot configuration
+  ansible.builtin.command: "{{ 'proxmox-boot-tool refresh' if lab_node_systemd_boot else 'update-grub' }}"
+  changed_when: true
+
+- name: Update initramfs
+  ansible.builtin.command: update-initramfs -u -k all
+  changed_when: true
+
+- name: Restart logind
+  ansible.builtin.systemd_service:
+    name: systemd-logind
+    state: restarted
+
+- name: Restart dnsmasq
+  ansible.builtin.systemd_service:
+    name: dnsmasq
+    state: restarted
+
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Load kalinet rules
+  ansible.builtin.systemd_service:
+    name: labstack-kalinet-fw.service
+    state: restarted
+
+- name: Restart kalinet DNS
+  ansible.builtin.systemd_service:
+    name: labstack-kalinet-dns.service
+    state: restarted
+
+- name: Reload udev
+  ansible.builtin.command: udevadm control --reload
+  changed_when: true
+
+# ifup touches only this bridge; nothing else in /etc/network/interfaces is applied
+- name: Bring up the Thunderbolt bridge
+  ansible.builtin.command: ifup {{ labnode_tb_bridge }}
+  changed_when: true

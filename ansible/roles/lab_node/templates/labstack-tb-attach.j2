@@ -1,0 +1,20 @@
+#!/bin/sh
+# Managed by Ansible (labstack-infra, role lab_node).
+# Puts a Thunderbolt network interface (thunderbolt-net, host to host) into {{ labnode_tb_bridge }} with no
+# address of its own. udev runs it with the interface name when a cable comes up; the bridge's post-up
+# runs it with --all for a cable that was already there at boot.
+set -eu
+[ -d "/sys/class/net/{{ labnode_tb_bridge }}" ] || exit 0
+attach() {
+  sysctl -qw "net.ipv6.conf.$1.disable_ipv6=1"
+  ip link set "$1" mtu 1500
+  ip link set "$1" master {{ labnode_tb_bridge }}
+  ip link set "$1" up
+}
+if [ "${1:-}" = --all ]; then
+  for d in /sys/class/net/thunderbolt*; do
+    [ -e "$d" ] && attach "$(basename "$d")"
+  done
+  exit 0
+fi
+attach "$1"

@@ -1,0 +1,15 @@
+{#- People (Authentik OIDC): one principal, the Authentik username; the e-mail (or the subject) is the key
+    ID that sshd logs with every login. No username, no certificate: an empty principal must never be
+    signed. -#}
+{% raw %}{{- if not .Token.preferred_username }}{{ fail "identity token has no preferred_username (Authentik profile scope)" }}{{ end -}}
+{
+  "type": "user",
+  "keyId": {{ toJson (.Token.email | default .Token.sub) }},
+  "principals": [{{ toJson .Token.preferred_username }}],
+  "extensions": {
+    "permit-pty": "",
+    "permit-port-forwarding": "",
+    "permit-user-rc": ""
+  },
+  "criticalOptions": {}
+}{% endraw %}

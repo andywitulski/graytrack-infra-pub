@@ -1,0 +1,40 @@
+---
+- name: Debian components include non-free (driver) and non-free-firmware
+  ansible.builtin.replace:
+    path: /etc/apt/sources.list.d/debian.sources
+    regexp: '^Components: .*$'
+    replace: 'Components: main contrib non-free non-free-firmware'
+  register: nvidia_headless_sources
+
+# gpu01 boots Debian's "generic" image (full kernel; the genericcloud kernel lacks DRM and most PCI
+# drivers), so DKMS only needs the matching headers
+- name: Kernel headers for DKMS
+  ansible.builtin.apt:
+    name: linux-headers-amd64
+    state: present
+    update_cache: "{{ nvidia_headless_sources is changed }}"
+
+- name: Driver
+  ansible.builtin.apt:
+    name: "{{ nvidia_headless_packages }}"
+    state: present
+    update_cache: true
+  register: nvidia_headless_driver
+
+- name: Reboot onto the driver (nouveau blacklisted by the package)  # noqa: no-handler (the check below needs it)
+  when: nvidia_headless_driver is changed
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+
+- name: Persistence daemon (keeps the GPU initialized between requests)
+  ansible.builtin.systemd_service:
+    name: nvidia-persistenced
+    enabled: true
+    state: started
+
+- name: GPU visible to the driver
+  check_mode: false
+  ansible.builtin.command: nvidia-smi -L
+  register: nvidia_headless_smi
+  changed_when: false
+  failed_when: nvidia_headless_smi.rc != 0 or nvidia_headless_expect not in nvidia_headless_smi.stdout

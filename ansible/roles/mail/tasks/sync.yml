@@ -1,0 +1,120 @@
+---
+# mbsync keeps each external account and its folder tree in the person's mailbox the same, both ways:
+# read, flagged, moved, deleted on either side shows up on the other. One systemd timer per person.
+- name: Mbsync
+  ansible.builtin.apt:
+    name: isync
+    state: present
+
+- name: Sync user
+  ansible.builtin.user:
+    name: mailsync
+    system: true
+    home: "{{ mail_sync_state_dir }}"
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Sync directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: mailsync
+    mode: "0750"
+  loop:
+    - { path: "{{ mail_sync_dir }}", owner: root }
+    - { path: "{{ mail_sync_dir }}/secrets", owner: root }
+    - { path: "{{ mail_sync_state_dir }}", owner: mailsync }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: State directory per person
+  ansible.builtin.file:
+    path: "{{ mail_sync_state_dir }}/{{ item.name }}"
+    state: directory
+    owner: mailsync
+    group: mailsync
+    mode: "0750"
+  loop: "{{ mail_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# Stalwart's certificate is from ca01; mbsync connects to it as mail01.<domain>
+- name: Lab root for the local IMAP connection
+  ansible.builtin.copy:
+    src: "{{ ssh_ca_root_pem }}"
+    dest: "{{ mail_sync_dir }}/lab-ca.pem"
+    owner: root
+    group: mailsync
+    mode: "0644"
+
+- name: Bridge certificate for mbsync (exported during the Proton sign-in)
+  ansible.builtin.copy:
+    src: "{{ mail_bridge_home }}/tls/cert.pem"
+    dest: "{{ mail_sync_dir }}/bridge-cert.pem"
+    remote_src: true
+    owner: root
+    group: mailsync
+    mode: "0644"
+  when: mail_bridge_cert_present | default(false) | bool
+
+- name: Mailbox passwords (mbsync logs in to Stalwart as each person)
+  ansible.builtin.copy:
+    dest: "{{ mail_sync_dir }}/secrets/{{ item.name }}.local"
+    content: "{{ lookup('ansible.builtin.vars', 'mail_user_' ~ item.name ~ '_password') }}"
+    owner: root
+    group: mailsync
+    mode: "0640"
+  loop: "{{ mail_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+
+- name: External account passwords (Gmail app passwords, Bridge passwords)
+  ansible.builtin.copy:
+    dest: "{{ mail_sync_dir }}/secrets/{{ item.id }}"
+    content: "{{ lookup('ansible.builtin.vars', 'mail_' ~ item.id ~ '_password') }}"
+    owner: root
+    group: mailsync
+    mode: "0640"
+  loop: "{{ mail_accounts | selectattr('ready') | list }}"
+  loop_control:
+    label: "{{ item.id }}"
+  no_log: true
+
+- name: Sync configuration per person
+  ansible.builtin.template:
+    src: mbsyncrc.j2
+    dest: "{{ mail_sync_dir }}/{{ item.name }}.rc"
+    owner: root
+    group: mailsync
+    mode: "0640"
+  vars:
+    mail_user: "{{ item }}"
+    mail_user_accounts: "{{ mail_accounts | selectattr('ready') | selectattr('user', 'equalto', item.name) | list }}"
+  loop: "{{ mail_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: People with an account ready
+  ansible.builtin.set_fact:
+    mail_sync_users: "{{ mail_accounts | selectattr('ready') | map(attribute='user') | unique | list }}"
+
+- name: Sync units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [mailsync@.service, mailsync@.timer]
+
+- name: A sync timer for each person with an account ready
+  ansible.builtin.systemd_service:
+    name: "mailsync@{{ item.name }}.timer"
+    enabled: "{{ item.name in mail_sync_users }}"
+    state: "{{ 'started' if item.name in mail_sync_users else 'stopped' }}"
+    daemon_reload: true
+  loop: "{{ mail_users }}"
+  loop_control:
+    label: "{{ item.name }}"

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Usage: bin/bao-init <dev|prod>
+# One-time initialization of OpenBao on bao01. With the static seal (role openbao) it unseals itself from
+# the key Ansible delivers, so init returns recovery keys instead of unseal keys.
+#
+# The response goes from OpenBao straight into sops, secrets/openbao-<env>.enc.yaml:
+#   root_token          bootstrap credential for bin/tf-bao and bin/bao-*; revoke it once an admin auth
+#                       method exists (docs/howto/platform-tier.md)
+#   recovery_keys_b64   5 shares, any 3 of them: generate-root (a new root token) and rekey
+# Nothing secret is printed. Make the paper copy of the recovery keys the same day.
+set -euo pipefail
+
+env=${1:?usage: bin/bao-init <dev|prod>}
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root" # sops finds .sops.yaml from the working directory
+out="secrets/openbao-$env.enc.yaml"
+shares=5
+threshold=3
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+platform_env "$env" "$root"
+
+[[ -e $out ]] && { echo "$out exists: OpenBao was initialized before. Refusing to overwrite it." >&2; exit 1; }
+[[ -f $BAO_CACERT ]] || { echo "missing $BAO_CACERT: run playbooks/platform.yml first" >&2; exit 1; }
+
+status=$(bao_api GET sys/init)
+[[ $(jq -r .initialized <<< "$status") == false ]] || { echo "OpenBao at $BAO_ADDR is already initialized." >&2; exit 1; }
+seal=$(bao_api GET sys/seal-status | jq -r .type)
+[[ $seal == static ]] || { echo "OpenBao at $BAO_ADDR uses the '$seal' seal, expected 'static' (role openbao)." >&2; exit 1; }
+
+[[ $env == prod ]] && platform_prod_confirm "OpenBao initialization"
+
+umask 077
+resp=$(bao_api PUT sys/init "{\"recovery_shares\":$shares,\"recovery_threshold\":$threshold}")
+doc=$(printf '%s' "$resp" | jq --argjson t "$threshold" \
+  '{root_token, recovery_keys_b64: .recovery_keys_base64, recovery_threshold: $t, initialized_at: (now | todate)}')
+unset resp
+
+if ! printf '%s' "$doc" | sops encrypt --filename-override "$out" --input-type json --output-type yaml > "$out.tmp"; then
+  rm -f "$out.tmp"
+  # Losing this output means no root token and no recovery keys, ever: keep it rather than lose it
+  rescue="$HOME/openbao-$env-init-$(date +%Y%m%d%H%M%S).json"
+  printf '%s\n' "$doc" > "$rescue"
+  echo "sops failed. The init output is in $rescue (mode 600). Encrypt it into $out by hand, then shred it." >&2
+  exit 1
+fi
+mv "$out.tmp" "$out"
+unset doc
+
+echo "OpenBao ($env) initialized. Root token and $shares recovery keys ($threshold needed) are in $out."
+echo "Next: commit $out, print the recovery keys for the safe:"
+echo "  sops decrypt --extract '[\"recovery_keys_b64\"]' $out"
+echo "then bin/tf-bao $env init && bin/tf-bao $env apply"

@@ -1,0 +1,10 @@
+# Managed by Ansible (labstack-infra): next sync {{ mail_sync_interval }} after the previous one ended
+[Unit]
+Description=Mail sync for %i
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec={{ mail_sync_interval }}
+
+[Install]
+WantedBy=timers.target

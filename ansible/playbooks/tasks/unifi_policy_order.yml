@@ -1,0 +1,198 @@
+---
+# Order inside each zone pair, run by playbooks/unifi_firewall.yml after the policy batch.
+#
+# UniFi assigns a policy's index itself and renumbers a zone pair when policies are added, so the index
+# the batch sends decides nothing: a run that adds an allow can leave the pair's "(block new)" policy
+# above it, and that block then shadows every allow in the pair. The order is set here instead, through
+# the integration API (/proxy/network/integration/v1, same API key), one zone pair at a time:
+#   before the system-defined policies:  everything already there in its current order, then managed
+#                                        allows that had ended up after them, then the pair's block (last)
+#   after the system-defined policies:   what was there, minus managed allows and blocks
+# Managed allows include the explicit "(allow return)" policies; nothing relies on UniFi's generated
+# "(Return)" policies, which the ordering API cannot move. Any still on the controller for a managed
+# allow are listed at the end. Policies that are not in the batch keep their relative order. Every pair
+# that holds a managed policy is checked. --check prints the pairs that are out of order and changes nothing.
+# Verified against UniFi Network 10.6 (GET/PUT .../firewall/policies/ordering).
+
+- name: Integration API base
+  ansible.builtin.set_fact:
+    unifi_int_api: "{{ unifi_int_api_url | default('https://' ~ unifi_host ~ '/proxy/network/integration/v1') }}"
+    unifi_int_headers:
+      X-API-KEY: "{{ unifi_api_key }}"
+      Accept: application/json
+
+- name: Sites
+  ansible.builtin.uri:
+    url: "{{ unifi_int_api }}/sites?limit=200"
+    headers: "{{ unifi_int_headers }}"
+    validate_certs: false
+  register: unifi_int_sites
+  check_mode: false
+
+- name: Site ID of the default site
+  ansible.builtin.set_fact:
+    unifi_site_id: "{{ unifi_int_sites.json.data | selectattr('internalReference', 'equalto', 'default') | map(attribute='id') | first }}"
+
+- name: Zones
+  ansible.builtin.uri:
+    url: "{{ unifi_int_api }}/sites/{{ unifi_site_id }}/firewall/zones?limit=200"
+    headers: "{{ unifi_int_headers }}"
+    validate_certs: false
+  register: unifi_int_zones
+  check_mode: false
+
+- name: Policies, first page
+  ansible.builtin.uri:
+    url: "{{ unifi_int_api }}/sites/{{ unifi_site_id }}/firewall/policies?limit=200&offset=0"
+    headers: "{{ unifi_int_headers }}"
+    validate_certs: false
+  register: unifi_int_policies_first
+  check_mode: false
+
+- name: Policies, remaining pages
+  ansible.builtin.uri:
+    url: "{{ unifi_int_api }}/sites/{{ unifi_site_id }}/firewall/policies?limit=200&offset={{ item }}"
+    headers: "{{ unifi_int_headers }}"
+    validate_certs: false
+  register: unifi_int_policies_rest
+  check_mode: false
+  loop: "{{ range(200, unifi_int_policies_first.json.totalCount | int, 200) | list }}"
+
+- name: IDs of the managed allows and blocks, and the pairs to order
+  vars:
+    unifi_all_policies: >-
+      {{ unifi_int_policies_first.json.data
+         + (unifi_int_policies_rest.results | default([]) | map(attribute='json') | map(attribute='data') | flatten) }}
+    unifi_present: "{{ unifi_policy_batch | selectattr('state', 'equalto', 'present') | list }}"
+    unifi_present_names: "{{ unifi_present | map(attribute='name') | list }}"
+    unifi_generated_names: >-
+      {{ unifi_policy_batch | selectattr('action', 'equalto', 'ALLOW') | map(attribute='name')
+         | map('regex_replace', '$', ' (Return)') | list }}
+  ansible.builtin.set_fact:
+    unifi_zone_id: "{{ dict(unifi_int_zones.json.data | map(attribute='name') | zip(unifi_int_zones.json.data | map(attribute='id'))) }}"
+    unifi_policy_name: "{{ dict(unifi_all_policies | map(attribute='id') | zip(unifi_all_policies | map(attribute='name'))) }}"
+    unifi_block_ids: >-
+      {{ unifi_all_policies
+         | selectattr('name', 'in', unifi_present | selectattr('action', 'equalto', 'BLOCK') | map(attribute='name') | list)
+         | map(attribute='id') | list }}
+    unifi_allow_ids: >-
+      {{ unifi_all_policies
+         | selectattr('name', 'in', unifi_present | selectattr('action', 'equalto', 'ALLOW') | map(attribute='name') | list)
+         | map(attribute='id') | list }}
+    unifi_order_pairs: >-
+      {{ unifi_present | map(attribute='source') | map(attribute='zone')
+         | zip(unifi_present | map(attribute='destination') | map(attribute='zone'))
+         | map('list') | unique | list }}
+    unifi_generated_left: "{{ unifi_all_policies | selectattr('name', 'in', unifi_generated_names) | map(attribute='name') | list }}"
+    unifi_policy_count: "{{ unifi_all_policies | length }}"
+
+- name: Every policy was read (pagination) and every pair has known zones
+  ansible.builtin.assert:
+    that:
+      - unifi_policy_count | int == unifi_int_policies_first.json.totalCount | int
+      - unifi_order_pairs | flatten | difference(unifi_zone_id.keys() | list) | length == 0
+    fail_msg: >-
+      Read {{ unifi_policy_count }} of {{ unifi_int_policies_first.json.totalCount }} policies; zones unknown to
+      the controller: {{ unifi_order_pairs | flatten | difference(unifi_zone_id.keys() | list) }}
+    quiet: true
+
+- name: Current order of each zone pair with a managed policy
+  ansible.builtin.uri:
+    url: >-
+      {{ unifi_int_api }}/sites/{{ unifi_site_id }}/firewall/policies/ordering?sourceFirewallZoneId={{
+      unifi_zone_id[item.0] }}&destinationFirewallZoneId={{ unifi_zone_id[item.1] }}
+    headers: "{{ unifi_int_headers }}"
+    validate_certs: false
+  register: unifi_order_current
+  check_mode: false
+  loop: "{{ unifi_order_pairs }}"
+  loop_control:
+    label: "{{ item.0 }} to {{ item.1 }}"
+
+- name: Wanted order of each zone pair
+  vars:
+    unifi_b: "{{ item.json.orderedFirewallPolicyIds.beforeSystemDefined }}"
+    unifi_a: "{{ item.json.orderedFirewallPolicyIds.afterSystemDefined }}"
+    unifi_wanted_before: >-
+      {{ (unifi_b | reject('in', unifi_block_ids) | list)
+         + (unifi_a | select('in', unifi_allow_ids) | list)
+         + ((unifi_b + unifi_a) | select('in', unifi_block_ids) | list) }}
+    unifi_wanted_after: "{{ unifi_a | reject('in', unifi_block_ids) | reject('in', unifi_allow_ids) | list }}"
+  ansible.builtin.set_fact:
+    unifi_order_plan: >-
+      {{ unifi_order_plan | default([]) + [{
+           'pair': item.item[0] ~ ' to ' ~ item.item[1],
+           'src_id': unifi_zone_id[item.item[0]],
+           'dst_id': unifi_zone_id[item.item[1]],
+           'current': item.json.orderedFirewallPolicyIds,
+           'wanted': {'beforeSystemDefined': unifi_wanted_before, 'afterSystemDefined': unifi_wanted_after},
+           'change': unifi_wanted_before != unifi_b or unifi_wanted_after != unifi_a }] }}
+  loop: "{{ unifi_order_current.results }}"
+  loop_control:
+    label: "{{ item.item[0] }} to {{ item.item[1] }}"
+
+- name: Zone pairs out of order
+  ansible.builtin.debug:
+    msg:
+      - "{{ item.pair }}"
+      - "now:    {{ item.current.beforeSystemDefined | map('extract', unifi_policy_name) | list }} | system | {{
+                   item.current.afterSystemDefined | map('extract', unifi_policy_name) | list }}"
+      - "wanted: {{ item.wanted.beforeSystemDefined | map('extract', unifi_policy_name) | list }} | system | {{
+                   item.wanted.afterSystemDefined | map('extract', unifi_policy_name) | list }}"
+  loop: "{{ unifi_order_plan | selectattr('change') | list }}"
+  loop_control:
+    label: "{{ item.pair }}"
+
+- name: Put each pair in order (allows, then its block)
+  ansible.builtin.uri:
+    url: >-
+      {{ unifi_int_api }}/sites/{{ unifi_site_id }}/firewall/policies/ordering?sourceFirewallZoneId={{
+      item.src_id }}&destinationFirewallZoneId={{ item.dst_id }}
+    method: PUT
+    headers: "{{ unifi_int_headers }}"
+    body_format: json
+    body:
+      orderedFirewallPolicyIds: "{{ item.wanted }}"
+    validate_certs: false
+  changed_when: true
+  loop: "{{ unifi_order_plan | selectattr('change') | list }}"
+  loop_control:
+    label: "{{ item.pair }}"
+
+- name: Read the order back
+  ansible.builtin.uri:
+    url: >-
+      {{ unifi_int_api }}/sites/{{ unifi_site_id }}/firewall/policies/ordering?sourceFirewallZoneId={{
+      item.src_id }}&destinationFirewallZoneId={{ item.dst_id }}
+    headers: "{{ unifi_int_headers }}"
+    validate_certs: false
+  register: unifi_order_after
+  loop: "{{ unifi_order_plan }}"
+  loop_control:
+    label: "{{ item.pair }}"
+  when: not ansible_check_mode
+
+- name: In every pair, no managed allow or return after the system-defined policies, and the block last
+  vars:
+    unifi_b: "{{ item.json.orderedFirewallPolicyIds.beforeSystemDefined }}"
+    unifi_a: "{{ item.json.orderedFirewallPolicyIds.afterSystemDefined }}"
+    unifi_blocks_here: "{{ (unifi_b + unifi_a) | select('in', unifi_block_ids) | list }}"
+    unifi_allows_after: "{{ unifi_a | select('in', unifi_allow_ids) | list }}"
+  ansible.builtin.assert:
+    that:
+      - unifi_a | select('in', unifi_block_ids) | list | length == 0
+      - unifi_allows_after | length == 0
+      - unifi_b[(unifi_b | length) - (unifi_blocks_here | length):] == unifi_blocks_here
+    fail_msg: "{{ item.item.pair }}: the controller did not keep the order. Fix it in the UI and report this."
+    quiet: true
+  loop: "{{ unifi_order_after.results | default([]) | selectattr('json', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item.pair }}"
+
+- name: Generated "(Return)" policies still on the controller (from create_allow_respond, now off)
+  ansible.builtin.debug:
+    msg:
+      - "These sit below the system-defined Block All and do nothing. Delete them in the UI (or turn"
+      - "create_allow_respond off on the parent allow there); the explicit (allow return) policies replace them:"
+      - "{{ unifi_generated_left }}"
+  when: unifi_generated_left | length > 0

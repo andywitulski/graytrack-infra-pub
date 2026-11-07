@@ -1,0 +1,5 @@
+---
+# Your step ssh login certificate (principal alice) also opens the workstation account (roles/ssh_ca).
+# The workstation's key in authorized_keys (roles/paw) stays as the fallback when ca01 or Authentik is down.
+ssh_ca_local_principals:
+  labadmin: [alice]

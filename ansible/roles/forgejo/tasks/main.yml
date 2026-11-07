@@ -1,0 +1,174 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - "[forgejo_version, forgejo_domain] | select('match', '^(<|$)') | list | length == 0"
+    fail_msg: "Set forgejo_version and forgejo_domain in group_vars/forgejo.yml"
+    quiet: true
+
+# Resolve the template path here: vars passed to include_role are evaluated inside the
+# included role, where role_path would point at compose_app instead of this role.
+- name: Compose template path (this role)
+  ansible.builtin.set_fact:
+    forgejo_compose_template_path: "{{ role_path }}/templates/compose.yml.j2"
+
+- name: Forgejo stack
+  ansible.builtin.include_role:
+    name: compose_app
+  vars:
+    compose_app_name: forgejo
+    compose_app_dir: "{{ forgejo_dir }}"
+    compose_app_compose_template: "{{ forgejo_compose_template_path }}"
+    compose_app_env:
+      DB_PASS: "{{ forgejo_db_pass }}"
+      FORGEJO__database__PASSWD: "{{ forgejo_db_pass }}"
+      FORGEJO__security__SECRET_KEY: "{{ forgejo_secret_key }}"
+      FORGEJO__security__INTERNAL_TOKEN: "{{ forgejo_internal_token }}"
+      FORGEJO__oauth2__JWT_SECRET: "{{ forgejo_jwt_secret }}"
+      FORGEJO__server__LFS_JWT_SECRET: "{{ forgejo_lfs_jwt_secret }}"
+    compose_app_pg_dump: { service: db, user: forgejo, database: forgejo }
+
+- name: Forgejo answers
+  check_mode: false  # read-only; --check needs the real answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ forgejo_http_port }}/api/healthz"
+    status_code: 200
+  register: forgejo_health
+  until: forgejo_health.status == 200
+  retries: 30
+  delay: 5
+
+# ---------------------------------------------------------------- SSH certificates (ca01, roles/ssh_ca)
+# The container's own sshd (port 2222): a host certificate for the Forgejo domain, so clients that trust
+# the host CA (known_hosts @cert-authority) never see a first-connection prompt or a changed-key warning
+# after a rebuild; and ca01's user CA, so people can push with their step ssh login certificate.
+- name: Forgejo SSH with certificates
+  when: ssh_ca_enabled | bool
+  block:
+    - name: Host certificate for the container's SSH host key
+      ansible.builtin.include_role:
+        name: ssh_ca
+        tasks_from: host_cert
+      vars:
+        ssh_ca_cert_pubkey: "{{ forgejo_dir }}/data/ssh/ssh_host_ed25519_key.pub"
+        ssh_ca_cert_path: "{{ forgejo_dir }}/data/ssh/ssh_host_ed25519_key-cert.pub"
+        ssh_ca_cert_principals: ["{{ forgejo_domain }}"]
+        ssh_ca_cert_key_id: "host:{{ inventory_hostname }}:forgejo"
+
+    # The image writes sshd_config at container start, adding HostCertificate when the file exists
+    - name: Restart Forgejo so its sshd presents the certificate  # noqa: no-handler (host_cert.yml is shared)
+      ansible.builtin.command:
+        cmd: docker compose -f compose.yml restart forgejo
+        chdir: "{{ forgejo_dir }}"
+      when: ssh_ca_cert_changed | bool
+      changed_when: true
+
+    - name: Forgejo answers after the restart
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ forgejo_http_port }}/api/healthz"
+        status_code: 200
+      register: forgejo_health_ca
+      until: forgejo_health_ca.status == 200
+      retries: 30
+      delay: 5
+      when: ssh_ca_cert_changed | bool
+
+    - name: The container's sshd trusts ca01's user CA and presents the host certificate
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f compose.yml exec -T forgejo sh -c
+          'grep -c "^HostCertificate " /etc/ssh/sshd_config; cat "$(sed -n "s/^TrustedUserCAKeys //p" /etc/ssh/sshd_config)"'
+        chdir: "{{ forgejo_dir }}"
+      register: forgejo_ssh_ca_check
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        forgejo_ssh_ca_check.rc != 0
+        or (forgejo_ssh_ca_check.stdout_lines | first | default('0') | int) < 1
+        or (lookup('ansible.builtin.file', ssh_ca_user_ca_pub).splitlines() | first).split()[1] not in forgejo_ssh_ca_check.stdout
+
+- name: Read configured login sources
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u git forgejo forgejo admin auth list
+    chdir: "{{ forgejo_dir }}"
+  register: forgejo_auth_sources
+  changed_when: false
+  check_mode: false
+
+- name: Authentik login source (once the client secret exists)
+  ansible.builtin.command:
+    chdir: "{{ forgejo_dir }}"
+    argv:
+      - docker
+      - compose
+      - -f
+      - compose.yml
+      - exec
+      - -T
+      - -u
+      - git
+      - forgejo
+      - forgejo
+      - admin
+      - auth
+      - add-oauth
+      - --name
+      - authentik
+      - --provider
+      - openidConnect
+      - --key
+      - forgejo
+      - --secret
+      - "{{ forgejo_oidc_client_secret }}"
+      - --auto-discover-url
+      - "https://{{ forgejo_idp_domain }}/application/o/forgejo/.well-known/openid-configuration"
+      - --scopes
+      - "openid email profile"
+      - --group-claim-name
+      - groups
+      - --admin-group
+      - forgejo-admins
+  when:
+    - forgejo_oidc_client_secret | default('PENDING') != 'PENDING'
+    - "'authentik' not in forgejo_auth_sources.stdout"
+  changed_when: true
+  no_log: true
+
+- name: Read local users
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u git forgejo forgejo admin user list
+    chdir: "{{ forgejo_dir }}"
+  register: forgejo_users
+  changed_when: false
+  check_mode: false
+
+- name: Break-glass local admin (works when Authentik is down)
+  ansible.builtin.command:
+    chdir: "{{ forgejo_dir }}"
+    argv:
+      - docker
+      - compose
+      - -f
+      - compose.yml
+      - exec
+      - -T
+      - -u
+      - git
+      - forgejo
+      - forgejo
+      - admin
+      - user
+      - create
+      - --username
+      - "{{ forgejo_breakglass_user }}"
+      - --email
+      - "{{ forgejo_breakglass_email }}"
+      - --password
+      - "{{ forgejo_admin_password }}"
+      - --admin
+      - --must-change-password=false
+  when:
+    - forgejo_admin_password | default('PENDING') != 'PENDING'
+    - forgejo_users.stdout is not search('(?m)^\s*\d+\s+' ~ (forgejo_breakglass_user | regex_escape) ~ '\s')
+  changed_when: true
+  no_log: true

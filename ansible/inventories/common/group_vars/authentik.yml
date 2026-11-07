@@ -1,0 +1,11 @@
+---
+# Exact patch, not "2026.8": the stacks pull only missing tags, so a floating tag never moves once pulled.
+# 2026.8.2 fixed CVE-2026-94606, -94609, -94611, -94612, -94613 (email MFA, delegated admin, secrets, SAML).
+# renovate: datasource=docker depName=ghcr.io/goauthentik/server
+authentik_version: "2026.8.4"
+# Redis is gone from Authentik since 2025.10 (it keeps everything in PostgreSQL)
+authentik_use_redis: false
+authentik_domain: "auth.{{ base_domain }}"
+authentik_bootstrap_email: "admin@example.com"
+authentik_ldap_outpost_enabled: true # needs authentik_ldap_outpost_token in sops
+authentik_proxy_outpost_enabled: true # needs authentik_proxy_outpost_token in sops

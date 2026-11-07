@@ -1,0 +1,54 @@
+---
+# labnode: the standalone Proxmox node and its guests (inventories/labnode). Run from either controller (the
+# admin workstation or paw01); docs/howto/lab-node.md has the order:
+#   bin/ap labnode playbooks/bootstrap.yml -e ansible_user=root   automation accounts, tofu API identity
+#   bin/ap labnode playbooks/network.yml            NIC pin and vmbr0 (apply with ifreload from the console)
+#   bin/ap labnode playbooks/labnode.yml --limit labnode   node prep; reboot; run again for the GPU mapping
+#   bin/tf labnode apply                            pools, dev network, paw01, gpu01
+#   bin/ap labnode playbooks/labnode.yml --limit service_guests
+#   bin/ap labnode playbooks/ssh-ca.yml             the node trusts prod's CA too (guests get it here)
+#   bin/ap labnode playbooks/backups.yml            PBS storage on the node, nightly job for paw01 and gpu01
+
+- name: Node preparation (power, nested virtualization, GPU passthrough, VM storage, dev DNS, kalinet, Thunderbolt)
+  hosts: pve_nodes
+  become: true
+  roles:
+    - lab_node
+
+- name: Baseline every guest (as the prod guests in services.yml)
+  hosts: service_guests
+  become: true
+  roles:
+    - guest_base
+    - cis_baseline
+    - ssh_ca
+
+- name: Admin workstation
+  hosts: paw
+  become: true
+  roles:
+    - paw
+
+- name: GPU driver
+  hosts: gpu_guests
+  become: true
+  roles:
+    - nvidia_headless
+
+- name: Local LLM
+  hosts: ollama
+  become: true
+  roles:
+    - ollama
+
+- name: Vector database (rag, pgvector)
+  hosts: rag_db
+  become: true
+  roles:
+    - postgres
+
+- name: SIEM agents (report to prod's siem01)
+  hosts: wazuh_agents
+  become: true
+  roles:
+    - wazuh_agent

@@ -1,0 +1,20 @@
+---
+# Vaultwarden: a Bitwarden-compatible server (docs/howto/password-manager.md). The official Bitwarden apps
+# (iOS, Android, Windows, macOS, Linux, browser extensions, CLI) connect to it as a self-hosted server.
+vaultwarden_version: ""
+vaultwarden_domain: ""
+vaultwarden_dir: /opt/vaultwarden
+vaultwarden_http_port: 8180
+# Sign-in through Authentik (OIDC, client "vaultwarden"). The master password still decrypts the vault and
+# never reaches Authentik. SSO_ONLY stays off on purpose: with Authentik down, existing accounts still sign
+# in with email and master password.
+vaultwarden_sso: true
+vaultwarden_idp_domain: "auth.{{ base_domain }}"
+vaultwarden_sso_slug: vaultwarden
+# Accounts are created by signing in through Authentik, which only lets members of vaultwarden-users through.
+# Plain email signups stay closed.
+vaultwarden_sso_signups: true
+# Admin page (/admin, LAN-only in Caddy): off unless vaultwarden_admin_token (an argon2 PHC string, see the
+# runbook) is stored in OpenBao.
+# Mail: none. Organisation invites work without it (the invitee signs in through Authentik with that address).
+vaultwarden_extra_env: {}

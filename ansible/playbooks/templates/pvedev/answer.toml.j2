@@ -1,0 +1,25 @@
+# Proxmox unattended install answer file for {{ node.name }} (dev).
+# Validate with: proxmox-auto-install-assistant validate-answer <file>
+[global]
+keyboard = "en-us"
+country = "us"
+fqdn = "{{ node.name }}.dev.example.com"
+mailto = "root@localhost"
+timezone = "America/Indiana/Indianapolis"
+root-password-hashed = "{{ lookup('ansible.builtin.env', 'PVEDEV_ROOT_PW_HASH') }}"
+root-ssh-keys = [
+  "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../files/pubkeys/ansible.pub') | trim }}",
+]
+reboot-on-error = false
+
+# Static: Proxmox SDN on labnode runs no DHCP (libvirt's dnsmasq used to hand these out by MAC)
+[network]
+source = "from-answer"
+cidr = "{{ node.ip }}/24"
+gateway = "__DEV_NET__.1"
+dns = "__DEV_NET__.1"
+filter.ID_NET_NAME_MAC = "*{{ node.mac | replace(':', '') | lower }}"
+
+[disk-setup]
+filesystem = "ext4"
+disk-list = ["vda"]

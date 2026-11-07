@@ -1,0 +1,11 @@
+---
+- name: Restart headscale
+  ansible.builtin.systemd_service:
+    name: headscale
+    state: restarted
+
+# A policy change needs no restart: headscale rereads the file on SIGHUP (the unit's ExecReload)
+- name: Reload headscale
+  ansible.builtin.systemd_service:
+    name: headscale
+    state: reloaded

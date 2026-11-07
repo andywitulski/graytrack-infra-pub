@@ -1,0 +1,349 @@
+---
+# Wazuh single-node on Docker: deploy, replace every published default credential, enable
+# password-protected agent enrollment. Each credential step checks the live state first, so reruns
+# change nothing once the deployment matches sops.
+
+- name: Secrets are present and safe to template
+  ansible.builtin.assert:
+    that:
+      - item | default('') | length >= 12
+      - item is match('^[A-Za-z0-9!#%&()*+,./:;<=>?@^_~-]+$')
+    fail_msg: "Wazuh secrets must exist (bin/gen-service-secrets), be 12+ characters, and use only letters, digits and !#%&()*+,./:;<=>?@^_~-"
+    quiet: true
+  loop:
+    - "{{ wazuh_admin_password | default('') }}"
+    - "{{ wazuh_kibanaserver_password | default('') }}"
+    - "{{ wazuh_api_password | default('') }}"
+    - "{{ wazuh_enrollment_password | default('') }}"
+  no_log: true
+
+# ---------------------------------------------------------------- host prerequisites
+- name: Indexer requires a higher memory map count (OpenSearch refuses to start below 262144)
+  ansible.posix.sysctl:
+    name: vm.max_map_count
+    value: "262144"
+    sysctl_file: /etc/sysctl.d/90-wazuh.conf
+    state: present
+    reload: true
+
+# ---------------------------------------------------------------- release and certificates
+- name: Deployment directory
+  ansible.builtin.file:
+    path: "{{ wazuh_manager_docker_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Release (extracted once; never overwrites an existing deployment)
+  ansible.builtin.unarchive:
+    src: "{{ wazuh_manager_release_url }}"
+    dest: "{{ wazuh_manager_docker_dir }}"
+    remote_src: true
+    extra_opts: [--strip-components=1]
+    creates: "{{ wazuh_manager_dir }}/docker-compose.yml"
+
+- name: Certificates (generated once)
+  ansible.builtin.command:
+    cmd: docker compose -f generate-indexer-certs.yml run --rm generator
+    chdir: "{{ wazuh_manager_dir }}"
+    creates: "{{ wazuh_manager_dir }}/config/wazuh_indexer_ssl_certs/root-ca.pem"
+
+# ---------------------------------------------------------------- credentials the containers use
+- name: Compose environment carries the sops passwords
+  ansible.builtin.replace:
+    path: "{{ wazuh_manager_dir }}/docker-compose.yml"
+    regexp: '^(\s+- {{ item.var }}=).*$'
+    replace: '\g<1>{{ item.value }}'
+  loop:
+    - { var: INDEXER_PASSWORD, value: "{{ wazuh_admin_password }}" }
+    - { var: DASHBOARD_PASSWORD, value: "{{ wazuh_kibanaserver_password }}" }
+    - { var: API_PASSWORD, value: "{{ wazuh_api_password }}" }
+  no_log: true
+
+- name: Dashboard API configuration file present?
+  ansible.builtin.stat:
+    path: "{{ wazuh_manager_dir }}/config/wazuh_dashboard/wazuh.yml"
+  register: wazuh_manager_dashboard_conf
+
+- name: Dashboard API configuration carries the API password
+  ansible.builtin.replace:
+    path: "{{ wazuh_manager_dir }}/config/wazuh_dashboard/wazuh.yml"
+    regexp: '^(\s+password:\s*).*$'
+    replace: '\g<1>"{{ wazuh_api_password }}"'
+  when: wazuh_manager_dashboard_conf.stat.exists
+  no_log: true
+
+- name: Password-protected enrollment in the mounted manager config (applies to new deployments)
+  ansible.builtin.replace:
+    path: "{{ wazuh_manager_dir }}/config/wazuh_cluster/wazuh_manager.conf"
+    regexp: '<use_password>no</use_password>'
+    replace: '<use_password>yes</use_password>'
+
+- name: Containers up (recreated when their configuration changed)
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_up
+  changed_when: wazuh_manager_up.stderr is search('Recreate|Creat|Start')
+
+# ---------------------------------------------------------------- indexer users (admin, kibanaserver)
+- name: Indexer accepts the sops admin password?
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, -e, "P={{ wazuh_admin_password }}", wazuh.indexer, bash, -c,
+           'curl -sk -o /dev/null -w "%{http_code}" -u "admin:$P" https://localhost:9200/_cluster/health']
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_admin_check
+  until: wazuh_manager_admin_check.stdout in ['200', '401']
+  retries: "{{ wazuh_manager_indexer_wait_retries }}"
+  delay: 10
+  changed_when: false
+  # Exhausted retries fail the task even with failed_when: false; carry on so the next task can
+  # report the status code (no_log hides it here because the command line holds the password).
+  ignore_errors: true
+  no_log: true
+
+- name: Indexer reachable
+  ansible.builtin.assert:
+    that: wazuh_manager_admin_check.stdout | default('') in ['200', '401']
+    # stdout is only the HTTP code and stderr is docker's own error; neither carries the password
+    fail_msg: >-
+      {% if wazuh_manager_admin_check.stdout | default('') | length > 0 %}The indexer answered HTTP
+      {{ wazuh_manager_admin_check.stdout }} after {{ (wazuh_manager_indexer_wait_retries | int) * 10 }}s
+      (000: not listening, 503: security index not initialized).{% else %}docker compose exec into
+      wazuh.indexer failed (container not running?): {{ wazuh_manager_admin_check.stderr | default('no output') | trim }}.{% endif %}
+      On {{ inventory_hostname }}: cd {{ wazuh_manager_dir }} && docker compose ps -a &&
+      docker compose logs --tail 80 wazuh.indexer
+    quiet: true
+
+- name: Replace the indexer's default users
+  when: wazuh_manager_admin_check.stdout == '401'
+  block:
+    - name: Hash the new passwords with the indexer's own tool
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, -e, "PW={{ item.password }}", -e, "JAVA_HOME={{ wazuh_manager_indexer_home }}/jdk", wazuh.indexer,
+               bash, -c, '{{ wazuh_manager_indexer_home }}/plugins/opensearch-security/tools/hash.sh -p "$PW" | tail -n1']
+        chdir: "{{ wazuh_manager_dir }}"
+      loop:
+        - { user: admin, password: "{{ wazuh_admin_password }}" }
+        - { user: kibanaserver, password: "{{ wazuh_kibanaserver_password }}" }
+      register: wazuh_manager_hashes
+      changed_when: false
+      failed_when: wazuh_manager_hashes.stdout is not match('^\$2')
+      no_log: true
+
+    - name: New hashes into internal_users.yml
+      ansible.builtin.replace:
+        path: "{{ wazuh_manager_dir }}/config/wazuh_indexer/internal_users.yml"
+        regexp: '^({{ item.item.user }}:\n(?:[ \t].*\n)*?[ \t]+hash:[ \t]*)"[^"]*"'
+        replace: '\g<1>"{{ item.stdout }}"'
+        backup: true
+      loop: "{{ wazuh_manager_hashes.results }}"
+      no_log: true
+
+    # internal_users.yml is a single-file bind mount: a restart re-mounts the replaced file
+    - name: Restart the indexer so it sees the new file
+      ansible.builtin.command:
+        cmd: docker compose restart wazuh.indexer
+        chdir: "{{ wazuh_manager_dir }}"
+      changed_when: true
+
+    - name: Wait for the indexer after the restart
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, wazuh.indexer, bash, -c,
+               'curl -sk -o /dev/null -w "%{http_code}" https://localhost:9200/']
+        chdir: "{{ wazuh_manager_dir }}"
+      register: wazuh_manager_indexer_up
+      until: wazuh_manager_indexer_up.stdout in ['200', '401']
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Load the users into the indexer's security index
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, wazuh.indexer, bash, -c,
+               'I={{ wazuh_manager_indexer_home }}; export JAVA_HOME=$I/jdk;
+                bash $I/plugins/opensearch-security/tools/securityadmin.sh -cd $I/config/opensearch-security/ -nhnv
+                -cacert $I/config/certs/root-ca.pem -cert $I/config/certs/admin.pem -key $I/config/certs/admin-key.pem -p 9200 -icl']
+        chdir: "{{ wazuh_manager_dir }}"
+      register: wazuh_manager_securityadmin
+      changed_when: true
+      failed_when: "'Done with success' not in wazuh_manager_securityadmin.stdout"
+
+    - name: Restart manager and dashboard onto the new credentials
+      ansible.builtin.command:
+        cmd: docker compose restart wazuh.manager wazuh.dashboard
+        chdir: "{{ wazuh_manager_dir }}"
+      changed_when: true
+
+- name: Verify indexer credentials (new accepted, default refused)
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, -e, "P={{ item.password }}", wazuh.indexer, bash, -c,
+           'curl -sk -o /dev/null -w "%{http_code}" -u "{{ item.user }}:$P" https://localhost:9200/_cluster/health']
+    chdir: "{{ wazuh_manager_dir }}"
+  loop:
+    - { user: admin, password: "{{ wazuh_admin_password }}", expect: "200" }
+    - { user: kibanaserver, password: "{{ wazuh_kibanaserver_password }}", expect: "200" }
+    - { user: admin, password: "{{ wazuh_manager_default_admin_password }}", expect: "401" }
+  register: wazuh_manager_indexer_verify
+  changed_when: false
+  failed_when: wazuh_manager_indexer_verify.stdout != item.expect
+  no_log: true
+
+# ---------------------------------------------------------------- API user (wazuh-wui)
+- name: API accepts the sops password?
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.uri:
+    url: https://localhost:55000/security/user/authenticate
+    method: POST
+    url_username: wazuh-wui
+    url_password: "{{ wazuh_api_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: [200, 401]
+  register: wazuh_manager_api_check
+  until: wazuh_manager_api_check.status in [200, 401]
+  retries: 30
+  delay: 10
+  no_log: true
+
+- name: Replace the API user's default password
+  when: wazuh_manager_api_check.status == 401
+  block:
+    - name: Token with the published default
+      ansible.builtin.uri:
+        url: https://localhost:55000/security/user/authenticate
+        method: POST
+        url_username: wazuh-wui
+        url_password: "{{ wazuh_manager_default_api_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: wazuh_manager_api_token
+      no_log: true
+
+    - name: The API user's ID
+      ansible.builtin.uri:
+        url: https://localhost:55000/security/users?search=wazuh-wui
+        headers:
+          Authorization: "Bearer {{ wazuh_manager_api_token.json.data.token }}"
+        validate_certs: false
+      register: wazuh_manager_api_users
+      no_log: true
+
+    - name: Set the sops password
+      ansible.builtin.uri:
+        url: "https://localhost:55000/security/users/{{ wazuh_manager_api_user_id }}"
+      vars:
+        wazuh_manager_api_user_id: >-
+          {{ (wazuh_manager_api_users.json.data.affected_items | selectattr('username', 'equalto', 'wazuh-wui') | first).id }}
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ wazuh_manager_api_token.json.data.token }}"
+        body_format: json
+        body:
+          password: "{{ wazuh_api_password }}"
+        validate_certs: false
+      changed_when: true
+      no_log: true
+
+    - name: Restart the dashboard onto the new API password
+      ansible.builtin.command:
+        cmd: docker compose restart wazuh.dashboard
+        chdir: "{{ wazuh_manager_dir }}"
+      changed_when: true
+
+- name: Verify API credentials (new accepted, default refused)
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.uri:
+    url: https://localhost:55000/security/user/authenticate
+    method: POST
+    url_username: wazuh-wui
+    url_password: "{{ item.password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: ["{{ item.expect }}"]
+  loop:
+    - { password: "{{ wazuh_api_password }}", expect: 200 }
+    - { password: "{{ wazuh_manager_default_api_password }}", expect: 401 }
+  no_log: true
+
+# ---------------------------------------------------------------- agent enrollment
+# The manager runs from a persistent copy of its config: changes to the mounted file alone do not
+# reach an existing deployment, so the live file is checked and changed directly.
+- name: Live config requires an enrollment password?
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, grep, -c, '<use_password>yes</use_password>', /var/ossec/etc/ossec.conf]
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_live_use_password
+  changed_when: false
+  failed_when: false
+
+- name: Require an enrollment password in the live config
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, sed, -i, 's|<use_password>no</use_password>|<use_password>yes</use_password>|', /var/ossec/etc/ossec.conf]
+    chdir: "{{ wazuh_manager_dir }}"
+  when: wazuh_manager_live_use_password.stdout != '1'
+  changed_when: true
+  notify: Restart wazuh manager
+
+- name: Current enrollment password fingerprint
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, bash, -c, 'sha256sum < /var/ossec/etc/authd.pass 2>/dev/null | cut -d" " -f1']
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_authd_sum
+  changed_when: false
+  failed_when: false
+
+- name: Enrollment password
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, bash, -c,
+           'umask 027; cat > /var/ossec/etc/authd.pass; chown root:wazuh /var/ossec/etc/authd.pass']
+    chdir: "{{ wazuh_manager_dir }}"
+    stdin: "{{ wazuh_enrollment_password }}"
+    stdin_add_newline: true
+  when: wazuh_manager_authd_sum.stdout != ((wazuh_enrollment_password ~ '\n') | hash('sha256'))
+  changed_when: true
+  no_log: true
+  notify: Restart wazuh manager
+
+- name: Apply manager changes now (verification below needs them)
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify enrollment requires the password
+  # Read-only: runs in --check too, so check mode sees the real state
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, grep, -c, '<use_password>yes</use_password>', /var/ossec/etc/ossec.conf]
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_live_verify
+  changed_when: false
+  failed_when: wazuh_manager_live_verify.stdout != '1'
+
+# ---------------------------------------------------------------- log sources
+- name: Syslog listener, custom decoders and rules (with self-test)
+  ansible.builtin.include_tasks: sources.yml
+
+# ---------------------------------------------------------------- dashboard login through Authentik
+# A failed "tofu output > file" leaves an empty file behind: refuse it rather than load it
+- name: SAML metadata file is real SAML metadata
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.file', wazuh_manager_saml_metadata_file) is search('EntityDescriptor')
+    fail_msg: >-
+      {{ wazuh_manager_saml_metadata_file }} is not SAML metadata (empty?). Delete it, or write it again with
+      bin/tf-ak <env> output -raw wazuh_saml_metadata (docs/howto/siem-sso.md).
+    quiet: true
+  when: wazuh_manager_saml_metadata_file is file
+
+- name: SAML login (once this environment's SAML metadata is in the repo)
+  ansible.builtin.include_tasks: sso.yml
+  when: wazuh_manager_saml_metadata_file is file

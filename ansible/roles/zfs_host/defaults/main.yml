@@ -1,0 +1,3 @@
+---
+# Snapshots: [{ dataset, template: working|library, recursive }] (templates in templates/sanoid.conf.j2)
+zfs_host_sanoid: []

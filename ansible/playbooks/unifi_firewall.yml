@@ -1,0 +1,190 @@
+---
+# UniFi zone policies and the port forward, from ansible/network/zone_policy.yml.
+# Credentials: unifi_host and unifi_api_key in sops (group_vars/all/secrets.sops.yml).
+# Always: --check --diff first, review, then apply. The collection is alpha (pinned in requirements).
+#   bin/ap prod playbooks/unifi_firewall.yml --check --diff
+- name: UniFi zone policies
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../network/zone_policy.yml
+  vars:
+    unifi_pf_api: "https://{{ unifi_host }}/proxy/network/api/s/default/rest/portforward"
+    unifi_pf_headers:
+      X-API-KEY: "{{ unifi_api_key }}"
+      Accept: application/json
+  module_defaults:
+    group/hellqvio86.unifi.unifi:
+      host: "{{ unifi_host }}"
+      api_key: "{{ unifi_api_key }}"
+      site: default
+      validate_certs: false # the gateway's self-signed certificate; replace with ca_path once it has a real one
+
+  tasks:
+    - name: Credentials and addresses are filled in
+      ansible.builtin.assert:
+        that:
+          - unifi_host is defined and unifi_host | length > 0
+          - unifi_api_key is defined and unifi_api_key | length > 0
+          - "unifi_admins | select('match', '^<') | list | length == 0"
+        fail_msg: "Set unifi_host and unifi_api_key in sops, and unifi_workstation in network/zone_policy.yml"
+        quiet: true
+
+    # No generated return policies (create_allow_respond false): UniFi ties each "<name> (Return)" to its
+    # allow and keeps it below the zone pair's system-defined Block All, where it drops every reply, and
+    # the ordering API cannot move it. Replies get one explicit policy per zone pair instead (next task).
+    # One policy per port, built into a single list: the module then fetches the controller's
+    # policy list once (batch mode) instead of once per policy. Listing policies is slow on UniFi.
+    - name: Build the policy list
+      vars:
+        unifi_suffix: "{{ (' ' ~ item.0.protocol ~ '/' ~ item.1) if item.1 | length > 0 else '' }}"
+      ansible.builtin.set_fact:
+        unifi_policy_batch: >-
+          {{ unifi_policy_batch | default([]) + [{
+               'name': item.0.name ~ unifi_suffix,
+               'state': 'absent' if (item.0.public | default(false) and not (unifi_public_exposure | bool)) else 'present',
+               'action': item.0.action | default('ALLOW'),
+               'index': item.0.index | default(10000),
+               'protocol': item.0.protocol,
+               'ip_version': 'IPV4',
+               'create_allow_respond': false,
+               'logging': false,
+               'source': {
+                 'zone': item.0.src_zone,
+                 'matching_target': 'IP' if item.0.src_ips | length > 0 else 'ANY',
+                 'ips': item.0.src_ips },
+               'destination': {
+                 'zone': item.0.dst_zone,
+                 'matching_target': 'IP' if item.0.dst_ips | length > 0 else 'ANY',
+                 'ips': item.0.dst_ips,
+                 'port': item.1 } }] }}
+      loop: "{{ unifi_zone_policies | subelements('ports') }}"
+      loop_control:
+        label: "{{ item.0.name }} {{ item.1 }}"
+
+    - name: Allows that need a return path
+      ansible.builtin.set_fact:
+        unifi_return_allows: >-
+          {{ unifi_policy_batch | selectattr('action', 'equalto', 'ALLOW')
+             | rejectattr('destination.zone', 'in', ['Gateway', 'External'])
+             | rejectattr('source.zone', 'equalto', 'External') | list }}
+
+    # One return per zone pair that has allows: in the reverse pair, ALLOW all protocols, ESTABLISHED and
+    # RELATED only, so it passes replies to connections an allow admitted and can never start one. Named
+    # "<dst> to <src> (allow return)", ordered with the allows (tasks/unifi_policy_order.yml). Not for
+    # pairs toward Gateway or External, or from External: their rows in the zone matrix already allow
+    # replies, and UniFi rejects a second allow-return policy there (HTTP 400). Absent when every allow
+    # of the pair is absent.
+    - name: Add the explicit returns (one per zone pair)
+      vars:
+        unifi_src: "{{ item.split('|')[0] }}"
+        unifi_dst: "{{ item.split('|')[1] }}"
+        unifi_pair_present: >-
+          {{ unifi_return_allows | selectattr('source.zone', 'equalto', unifi_src)
+             | selectattr('destination.zone', 'equalto', unifi_dst)
+             | selectattr('state', 'equalto', 'present') | list | length > 0 }}
+      ansible.builtin.set_fact:
+        unifi_policy_batch: >-
+          {{ unifi_policy_batch + [{
+               'name': unifi_dst ~ ' to ' ~ unifi_src ~ ' (allow return)',
+               'state': 'present' if unifi_pair_present else 'absent',
+               'action': 'ALLOW',
+               'index': 10000,
+               'protocol': 'all',
+               'ip_version': 'IPV4',
+               'connection_state_type': 'CUSTOM',
+               'connection_states': ['ESTABLISHED', 'RELATED'],
+               'create_allow_respond': false,
+               'logging': false,
+               'source': {'zone': unifi_dst, 'matching_target': 'ANY', 'ips': []},
+               'destination': {'zone': unifi_src, 'matching_target': 'ANY', 'ips': [], 'port': ''} }] }}
+      loop: >-
+        {{ unifi_return_allows | map(attribute='source.zone')
+           | zip(unifi_return_allows | map(attribute='destination.zone')) | map('join', '|') | unique | list }}
+      loop_control:
+        label: "{{ item | replace('|', ' to ') }}"
+
+    - name: Add the explicit blocks (after every allow)
+      vars:
+        unifi_gateway_block: "{{ item.1 == 'Gateway' }}"
+      ansible.builtin.set_fact:
+        unifi_policy_batch: >-
+          {{ unifi_policy_batch + [{
+               'name': item.0.src_zone ~ ' to ' ~ item.1 ~ ' (block new)',
+               'state': 'absent' if (not (unifi_explicit_blocks_enabled | bool)
+                                    or (unifi_gateway_block and not (unifi_gateway_lockdown | bool))) else 'present',
+               'action': 'BLOCK',
+               'index': unifi_block_index,
+               'protocol': 'all',
+               'ip_version': 'BOTH',
+               'connection_state_type': 'CUSTOM',
+               'connection_states': ['NEW', 'INVALID'],
+               'create_allow_respond': false,
+               'logging': true,
+               'source': {'zone': item.0.src_zone, 'matching_target': 'ANY', 'ips': []},
+               'destination': {'zone': item.1, 'matching_target': 'ANY', 'ips': [], 'port': ''} }] }}
+      loop: "{{ unifi_explicit_blocks | subelements('dst_zones') }}"
+      loop_control:
+        label: "{{ item.0.src_zone }} to {{ item.1 }}"
+
+    - name: Remove retired policies
+      ansible.builtin.set_fact:
+        unifi_policy_batch: >-
+          {{ unifi_policy_batch + [{
+               'name': item.name, 'state': 'absent', 'action': 'BLOCK', 'protocol': 'all',
+               'source': {'zone': item.src_zone, 'matching_target': 'ANY', 'ips': []},
+               'destination': {'zone': item.dst_zone, 'matching_target': 'ANY', 'ips': [], 'port': ''} }] }}
+      loop: "{{ unifi_retired_policies }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Zone policies (one batch call; retried, since the controller can be slow to list policies)
+      hellqvio86.unifi.unifi_firewall_policy:
+        policies: "{{ unifi_policy_batch }}"
+      register: unifi_policy_result
+      # Retry only slow-controller timeouts; a rejection (HTTP 4xx) fails immediately.
+      until: unifi_policy_result is succeeded or 'timed out' not in (unifi_policy_result.info.msg | default(''))
+      retries: 3
+      delay: 15
+
+    - name: Read back the controller's policies
+      ansible.builtin.uri:
+        url: "https://{{ unifi_host }}/proxy/network/v2/api/site/default/firewall-policies"
+        headers:
+          X-API-KEY: "{{ unifi_api_key }}"
+        validate_certs: false
+      register: unifi_policies_after
+      check_mode: false
+
+    - name: Every policy in the data exists on the controller (catches silently dropped policies)
+      vars:
+        unifi_wanted: "{{ unifi_policy_batch | selectattr('state', 'equalto', 'present') | map(attribute='name') | list }}"
+        unifi_have: "{{ unifi_policies_after.json | map(attribute='name') | list }}"
+      ansible.builtin.assert:
+        that: (unifi_wanted | difference(unifi_have)) | length == 0
+        fail_msg: "Missing on the controller: {{ unifi_wanted | difference(unifi_have) }}"
+      when: not ansible_check_mode
+
+    # Order inside each zone pair: UniFi ignores the index sent above (see tasks/unifi_policy_order.yml)
+    - name: Zone pair order (allows, then the pair's block)
+      ansible.builtin.include_tasks: tasks/unifi_policy_order.yml
+
+    # Port forward through the controller's REST API directly. hellqvio86.unifi.unifi_port_forward (0.0.32
+    # and 0.0.33) sends the target as "fwd_ip"; the controller's field is "fwd". It created the forward with
+    # no destination, reported success, and the internet got timeouts until the target was set by hand
+    # (Nov 2 2026). Each forward is matched by name; the read-back fails the run if the target is wrong.
+    - name: Port forwards on the controller
+      ansible.builtin.uri:
+        url: "{{ unifi_pf_api }}"
+        headers: "{{ unifi_pf_headers }}"
+        validate_certs: false
+      register: unifi_pf_list
+      check_mode: false
+
+    - name: Each port forward (HTTPS to edge01, then unifi_port_forward_extra)
+      ansible.builtin.include_tasks: tasks/unifi_port_forward.yml
+      loop: "{{ [unifi_port_forward_https] + unifi_port_forward_extra | default([]) }}"
+      loop_control:
+        loop_var: unifi_pf_item
+        label: "{{ unifi_pf_item.name }}"

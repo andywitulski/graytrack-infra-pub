@@ -1,0 +1,144 @@
+---
+- name: Git
+  ansible.builtin.apt:
+    name: [git, openssh-client]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Repository directory (outside the synced folder)
+  ansible.builtin.file:
+    path: "{{ vault_git_dir | dirname }}"
+    state: directory
+    owner: "{{ vault_git_user }}"
+    group: "{{ vault_git_user }}"
+    mode: "0700"
+
+- name: Bare repository  # noqa: command-instead-of-module (the git module cannot init an empty repo)
+  become: true
+  become_user: "{{ vault_git_user }}"
+  ansible.builtin.command: "git init --bare --initial-branch={{ vault_git_branch }} {{ vault_git_dir }}"
+  args:
+    creates: "{{ vault_git_dir }}/HEAD"
+
+- name: Repository settings
+  become: true
+  become_user: "{{ vault_git_user }}"
+  community.general.git_config:
+    scope: file   # without it the module writes the system-wide /etc/gitconfig
+    file: "{{ vault_git_dir }}/config"
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+  loop:
+    - { name: core.bare, value: "false" }
+    - { name: core.worktree, value: "{{ vault_git_worktree }}" }
+    - { name: remote.origin.url, value: "{{ vault_git_remote }}" }
+    - { name: remote.origin.fetch, value: "+refs/heads/*:refs/remotes/origin/*" }
+    - { name: user.name, value: "{{ vault_git_author | regex_replace(' <.*$', '') }}" }
+    - { name: user.email, value: "{{ vault_git_author | regex_search('<(.*)>', '\\1') | first }}" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Files git ignores (Syncthing markers, trash, per-device layout)
+  ansible.builtin.copy:
+    dest: "{{ vault_git_dir }}/info/exclude"
+    content: "{{ vault_git_excludes | join('\n') }}\n"
+    owner: "{{ vault_git_user }}"
+    group: "{{ vault_git_user }}"
+    mode: "0600"
+
+- name: SSH directory
+  ansible.builtin.file:
+    path: "{{ vault_git_home }}/.ssh"
+    state: directory
+    owner: "{{ vault_git_user }}"
+    group: "{{ vault_git_user }}"
+    mode: "0700"
+
+- name: Deploy key (private half never leaves sync01)
+  become: true
+  become_user: "{{ vault_git_user }}"
+  ansible.builtin.command: >-
+    ssh-keygen -t ed25519 -N "" -C "vault-sync@{{ inventory_hostname }}"
+    -f {{ vault_git_home }}/.ssh/vault_deploy
+  args:
+    creates: "{{ vault_git_home }}/.ssh/vault_deploy"
+
+- name: Forgejo's SSH is on git01 port 2222 (git.<domain> itself points at the edge proxy)
+  ansible.builtin.copy:
+    dest: "{{ vault_git_home }}/.ssh/config"
+    content: |
+      # Managed by Ansible (labstack-infra)
+      Host git.{{ base_domain }}
+        HostName {{ lab_git_addr }}
+        Port 2222
+        User git
+        IdentityFile {{ vault_git_home }}/.ssh/vault_deploy
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+    owner: "{{ vault_git_user }}"
+    group: "{{ vault_git_user }}"
+    mode: "0600"
+
+- name: Commit-and-push script
+  ansible.builtin.template:
+    src: vault-git.sh.j2
+    dest: /usr/local/bin/vault-git
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Service and timer
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - name: vault-git.service
+      content: |
+        [Unit]
+        Description=Commit the Obsidian vault and push it to Forgejo
+        After=network-online.target
+        Wants=network-online.target
+
+        [Service]
+        Type=oneshot
+        User={{ vault_git_user }}
+        ExecStart=/usr/local/bin/vault-git
+    - name: vault-git.timer
+      content: |
+        [Unit]
+        Description=Obsidian vault to git every 15 minutes
+
+        [Timer]
+        OnCalendar={{ vault_git_interval }}
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  notify: Reload systemd
+
+- name: Apply unit changes before enabling
+  ansible.builtin.meta: flush_handlers
+
+- name: Deploy key to add in Forgejo
+  check_mode: false
+  ansible.builtin.command: "cat {{ vault_git_home }}/.ssh/vault_deploy.pub"
+  register: vault_git_pubkey
+  changed_when: false
+
+- name: Timer running
+  ansible.builtin.systemd_service:
+    name: vault-git.timer
+    enabled: true
+    state: started
+
+- name: Next step
+  ansible.builtin.debug:
+    msg: >-
+      Add this as a deploy key WITH write access on {{ vault_git_remote }} (Forgejo: repo Settings,
+      Deploy keys): {{ vault_git_pubkey.stdout }}

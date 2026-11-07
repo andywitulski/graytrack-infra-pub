@@ -1,0 +1,12 @@
+# Managed by Ansible (labstack-infra). Manual edits will be reverted.
+{% for s in item.value %}
+Types: deb
+URIs: {{ s.uri }}
+Suites: {{ ansible_facts.distribution_release }}
+Components: {{ s.component }}
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+Enabled: {{ s.enabled | ternary('true', 'false') }}
+{% if not loop.last %}
+
+{% endif %}
+{% endfor %}

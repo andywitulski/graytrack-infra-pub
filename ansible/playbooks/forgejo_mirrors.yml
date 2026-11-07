@@ -1,0 +1,270 @@
+---
+# Offsite copy of every Forgejo repository: a push mirror from Forgejo to a private repository in a GitHub
+# organization used only for backups (docs/howto/git-mirrors.md).
+#   bin/ap prod playbooks/forgejo_mirrors.yml
+#   bin/ap prod playbooks/forgejo_mirrors.yml -e forgejo_mirror_recreate=true   # after a new GitHub token
+# For each repository (all owners, users and organizations): creates the GitHub repository if missing (always
+# private; an existing public one stops the run), adds the push mirror if missing (sync on every push and
+# every forgejo_mirror_interval), triggers a sync of new mirrors, and fails at the end if any mirror's last
+# sync failed. Repositories that are themselves pull mirrors, and empty ones, are left out.
+# git01 pushes to github.com over HTTPS (zone policy: Services updates); the controller only calls the APIs.
+- name: Forgejo push mirrors to GitHub
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    fm_api: "https://{{ hostvars[groups['forgejo'][0]]['forgejo_domain'] }}/api/v1"
+    fm_org: "{{ forgejo_mirror_github_org | default('') }}"
+    fm_recreate: "{{ forgejo_mirror_recreate | default(false) | bool }}"
+    fm_forgejo_headers:
+      Authorization: "token {{ forgejo_mirror_api_token | default('') }}"
+      Accept: application/json
+    fm_github_headers:
+      Authorization: "Bearer {{ forgejo_mirror_github_token | default('') }}"
+      Accept: application/vnd.github+json
+      X-GitHub-Api-Version: "2022-11-28"
+    fm_page_size: 50
+    fm_github_api: https://api.github.com
+  tasks:
+    - name: Not configured (forgejo_mirror_github_org is empty)
+      when: fm_org | length == 0
+      block:
+        - name: Say so
+          ansible.builtin.debug:
+            msg: "Set forgejo_mirror_github_org in inventories/prod/group_vars/all/forgejo_mirrors.yml (docs/howto/git-mirrors.md)"
+        - name: Stop here
+          ansible.builtin.meta: end_play
+
+    - name: Tokens are stored
+      ansible.builtin.assert:
+        that:
+          - forgejo_mirror_api_token | default('PENDING') not in ['', 'PENDING']
+          - forgejo_mirror_github_token | default('PENDING') not in ['', 'PENDING']
+        fail_msg: >-
+          bin/bao-secret prod set forgejo_mirror_api_token and bin/bao-secret prod set forgejo_mirror_github_token
+          (docs/howto/git-mirrors.md)
+        quiet: true
+
+    # ---------------------------------------------------------------- what exists
+    - name: Forgejo repositories, first page (all owners; the token is an admin's)
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/search?limit={{ fm_page_size }}&page=1"
+        headers: "{{ fm_forgejo_headers }}"
+      register: fm_first
+      no_log: true
+
+    - name: Forgejo repositories, remaining pages
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/search?limit={{ fm_page_size }}&page={{ item }}"
+        headers: "{{ fm_forgejo_headers }}"
+      loop: "{{ range(2, ((fm_first.x_total_count | default(0) | int) / (fm_page_size | int)) | round(0, 'ceil') | int + 1) | list }}"
+      register: fm_more
+      no_log: true
+
+    - name: Repositories to mirror
+      vars:
+        fm_all: "{{ ([fm_first] + fm_more.results | default([])) | map(attribute='json') | map(attribute='data') | flatten }}"
+      ansible.builtin.set_fact:
+        fm_repos: >-
+          {% set out = [] %}{% for r in fm_all if not r.mirror and not r.empty
+             and r.full_name not in forgejo_mirror_exclude | default([]) %}{% set _ = out.append({
+             'owner': r.owner.login, 'name': r.name, 'full_name': r.full_name,
+             'target': r.owner.login ~ forgejo_mirror_separator | default('--') ~ r.name}) %}{% endfor %}{{ out }}
+        fm_skipped: "{{ fm_all | selectattr('mirror') | map(attribute='full_name') | list
+                        + fm_all | selectattr('empty') | map(attribute='full_name') | list }}"
+
+    # GitHub answers 404, not 403, when a token may not see something: check the org itself first, so a wrong
+    # org name or a token that cannot reach the org fails here with a clear reason
+    - name: GitHub token reaches the backup organization
+      ansible.builtin.uri:
+        url: "{{ fm_github_api }}/orgs/{{ fm_org }}"
+        headers: "{{ fm_github_headers }}"
+        status_code: [200, 401, 403, 404]
+      register: fm_gh_org
+      no_log: true
+
+    - name: The organization is there and the token may act in it
+      ansible.builtin.assert:
+        that: fm_gh_org.status == 200
+        fail_msg: >-
+          GitHub {{ fm_gh_org.status }} ({{ fm_gh_org.json.message | default('') }}) for organization '{{ fm_org }}'.
+          {{ 'The token is invalid or expired.' if fm_gh_org.status == 401 else
+             'Check, in this order: the org name in forgejo_mirrors.yml; the token was created with Resource owner = '
+             ~ fm_org ~ ' (not your account); the org allows fine-grained tokens and has approved this one'
+             ~ ' (org Settings, Personal access tokens, Pending requests).' }}
+        quiet: true
+
+    - name: GitHub repositories in the backup organization
+      ansible.builtin.uri:
+        url: "{{ fm_github_api }}/repos/{{ fm_org }}/{{ item.target }}"
+        headers: "{{ fm_github_headers }}"
+        status_code: [200, 404]
+      loop: "{{ fm_repos }}"
+      register: fm_gh
+      no_log: true
+
+    - name: An existing backup repository is never public
+      ansible.builtin.assert:
+        that: fm_public | length == 0
+        fail_msg: "Public repositories in {{ fm_org }}: {{ fm_public }}. Make them private on GitHub; nothing was pushed."
+        quiet: true
+      vars:
+        fm_public: "{{ fm_gh.results | selectattr('status', 'equalto', 200) | selectattr('json.private', 'equalto', false)
+                       | map(attribute='item.target') | list }}"
+
+    # ---------------------------------------------------------------- create what is missing
+    - name: Create missing backup repositories (private)
+      ansible.builtin.uri:
+        url: "{{ fm_github_api }}/orgs/{{ fm_org }}/repos"
+        method: POST
+        headers: "{{ fm_github_headers }}"
+        body_format: json
+        body:
+          name: "{{ item.item.target }}"
+          private: true
+          description: "Backup of {{ item.item.full_name }} (push mirror from Forgejo; do not push here)"
+          has_issues: false
+          has_projects: false
+          has_wiki: false
+          auto_init: false
+        status_code: [201, 401, 403, 404, 422]
+      loop: "{{ fm_gh.results | selectattr('status', 'equalto', 404) | list }}"
+      register: fm_created
+      changed_when: fm_created.status | default(0) == 201
+      no_log: true
+
+    - name: Every missing backup repository was created
+      ansible.builtin.assert:
+        that: fm_create_failed | length == 0
+        fail_msg: >-
+          GitHub refused to create: {{ fm_create_failed }}. A 404 or 403 here means the token lacks the Administration
+          (read and write) repository permission, or was not granted 'All repositories'; GitHub's permission hint
+          was {{ fm_created.results | map(attribute='x_accepted_github_permissions', default='') | unique | list }}.
+          Edit the token (github.com/settings/personal-access-tokens), then rerun.
+        quiet: true
+      vars:
+        fm_create_failed: >-
+          {{ fm_created.results | default([]) | rejectattr('status', 'equalto', 201)
+             | map(attribute='item.item.target') | zip(fm_created.results | default([]) | rejectattr('status', 'equalto', 201)
+             | map(attribute='status'), fm_created.results | default([]) | rejectattr('status', 'equalto', 201)
+             | map(attribute='json.message', default='')) | map('join', ' ') | list }}
+
+    - name: Push mirrors already set up
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/{{ item.owner }}/{{ item.name }}/push_mirrors"
+        headers: "{{ fm_forgejo_headers }}"
+      loop: "{{ fm_repos }}"
+      register: fm_mirrors
+      no_log: true
+
+    - name: Plan
+      vars:
+        fm_url: "https://github.com/{{ fm_org }}/"
+      ansible.builtin.set_fact:
+        fm_plan: >-
+          {% set out = [] %}{% for r in fm_mirrors.results %}{%
+             set want = fm_url ~ r.item.target ~ '.git' %}{%
+             set have = r.json | default([], true) | selectattr('remote_address', 'equalto', want) | list %}{%
+             set _ = out.append({'repo': r.item, 'want': want, 'have': have,
+                                 'add': (have | length == 0) or fm_recreate}) %}{% endfor %}{{ out }}
+
+    - name: Remove mirrors being recreated (-e forgejo_mirror_recreate=true)
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/{{ item.0.repo.owner }}/{{ item.0.repo.name }}/push_mirrors/{{ item.1.remote_name }}"
+        method: DELETE
+        headers: "{{ fm_forgejo_headers }}"
+        status_code: [204, 404]
+      loop: "{{ fm_plan | selectattr('add') | subelements('have') }}"
+      changed_when: true
+      no_log: true
+
+    - name: Add push mirrors
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/{{ item.repo.owner }}/{{ item.repo.name }}/push_mirrors"
+        method: POST
+        headers: "{{ fm_forgejo_headers }}"
+        body_format: json
+        body:
+          remote_address: "{{ item.want }}"
+          remote_username: "{{ forgejo_mirror_github_user }}"
+          remote_password: "{{ forgejo_mirror_github_token }}"
+          interval: "{{ forgejo_mirror_interval }}"
+          sync_on_commit: true
+        status_code: [200, 201]
+      loop: "{{ fm_plan | selectattr('add') | list }}"
+      changed_when: true
+      no_log: true
+
+    - name: First sync of the new ones
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/{{ item.repo.owner }}/{{ item.repo.name }}/push_mirrors-sync"
+        method: POST
+        headers: "{{ fm_forgejo_headers }}"
+        status_code: [200, 204]
+      loop: "{{ fm_plan | selectattr('add') | list }}"
+      changed_when: true
+      no_log: true
+
+    # ---------------------------------------------------------------- report
+    - name: Wait for the first syncs
+      ansible.builtin.pause:
+        seconds: 20
+      when: fm_plan | selectattr('add') | list | length > 0
+
+    - name: Mirror state now
+      ansible.builtin.uri:
+        url: "{{ fm_api }}/repos/{{ item.owner }}/{{ item.name }}/push_mirrors"
+        headers: "{{ fm_forgejo_headers }}"
+      loop: "{{ fm_repos }}"
+      register: fm_state
+      no_log: true
+
+    - name: Summary
+      vars:
+        fm_rows: >-
+          {% set out = [] %}{% for r in fm_state.results %}{%
+             set m = r.json | default([], true) | selectattr('remote_address', 'search', '/' ~ fm_org ~ '/') | list %}{%
+             set _ = out.append({'repo': r.item.full_name, 'github': fm_org ~ '/' ~ r.item.target,
+                                 'last_update': (m | first | default({})).last_update | default('never'),
+                                 'error': (m | first | default({})).last_error | default('')}) %}{% endfor %}{{ out }}
+      ansible.builtin.set_fact:
+        fm_failed: "{{ fm_rows | rejectattr('error', 'equalto', '') | list }}"
+        fm_report:
+          mirrored: "{{ fm_rows | map(attribute='repo') | list }}"
+          created_on_github: "{{ fm_created.results | default([]) | selectattr('status', 'equalto', 201) | map(attribute='item.item.target') | list }}"
+          mirrors_added: "{{ fm_plan | selectattr('add') | map(attribute='repo.full_name') | list }}"
+          left_out: "{{ fm_skipped + forgejo_mirror_exclude | default([]) }}"
+          last_sync: "{{ fm_rows | map(attribute='repo') | zip(fm_rows | map(attribute='last_update')) | map('join', ': ') | list }}"
+
+    - name: Report
+      ansible.builtin.debug:
+        var: fm_report
+
+    - name: Why the failed ones failed
+      ansible.builtin.debug:
+        msg:
+          repo: "{{ item.repo }}"
+          rejected: "{{ item.error | regex_findall('\\[remote rejected\\][^\\n]*|remote: [^\\n]*|fatal: [^\\n]*') | default([], true)
+                        or [item.error[-400:]] }}"
+          hint: "{{ fm_hint_workflow if item.error is search('workflow') else fm_hint_rename if (item.error is search('redirecting to')
+                    and item.error is not search('rejected')) else fm_hint_token if item.error is search('Authentication failed|403|could not read Username')
+                    else 'See the full error in Forgejo: the repository, Settings, Mirror settings.' }}"
+      vars:
+        fm_hint_workflow: >-
+          The token needs the Workflows (read and write) repository permission: this repository has .github/workflows
+          files, and GitHub refuses them from a token without it. Edit the token, then rerun (no recreate needed).
+        fm_hint_rename: >-
+          GitHub redirected: the organization was renamed. Set forgejo_mirror_github_org to the new name and rerun with
+          -e forgejo_mirror_recreate=true.
+        fm_hint_token: >-
+          The token was refused (expired, revoked, or no access): new token, bin/bao-secret prod set
+          forgejo_mirror_github_token, rerun with -e forgejo_mirror_recreate=true.
+      loop: "{{ fm_failed }}"
+      loop_control:
+        label: "{{ item.repo }}"
+
+    - name: Every mirror's last sync succeeded
+      ansible.builtin.assert:
+        that: fm_failed | length == 0
+        fail_msg: "Last sync failed: {{ fm_failed | map(attribute='repo') | join(', ') }} (reasons above)"
+        success_msg: "{{ fm_report.mirrored | length }} mirrors, no sync errors"

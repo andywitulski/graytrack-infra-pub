@@ -1,0 +1,98 @@
+# Managed by Ansible (labstack-infra): mail sync for {{ mail_user.name }}@{{ mail_domain }} (docs/howto/mail.md)
+# Far: the external account. Near: this person's mailbox on Stalwart, each account under its own folder;
+# the standard folders listed in mail_merged_folders go into the mailbox's own top-level folders instead.
+# Both ways: Expunge Both, flags, moves. Never removes a whole folder on either side (Remove None).
+{% if mail_user_accounts | length == 0 %}
+# No account ready yet: nothing to sync (the timer is off).
+{% else %}
+IMAPAccount local
+Host {{ inventory_hostname }}.{{ base_domain }}
+Port 993
+User {{ mail_user.name }}
+PassCmd "cat {{ mail_sync_dir }}/secrets/{{ mail_user.name }}.local"
+SSLType IMAPS
+CertificateFile {{ mail_sync_dir }}/lab-ca.pem
+AuthMechs LOGIN
+
+IMAPStore local
+Account local
+{% for a in mail_user_accounts %}
+{% if a.type == 'gmail' %}
+{#- Gmail: labels are folders; [Gmail]/All Mail, Important and Starred would only duplicate them -#}
+{% set fixed = [['INBOX', 'INBOX'], ['[Gmail]/Sent Mail', 'Sent'], ['[Gmail]/Trash', 'Trash'], ['[Gmail]/Spam', 'Spam']] %}
+{% set rest_far = '' %}
+{% set rest_exclude = '!INBOX !Sent !Trash !Spam !"[Gmail]" !"[Gmail]/*"' %}
+
+# ---- {{ a.id }}: Gmail, into "{{ a.folder }}/"
+IMAPAccount {{ a.id }}
+Host {{ mail_gmail_imap_host }}
+Port 993
+User {{ a.address }}
+PassCmd "cat {{ mail_sync_dir }}/secrets/{{ a.id }}"
+SSLType IMAPS
+CertificateFile /etc/ssl/certs/ca-certificates.crt
+AuthMechs LOGIN
+Timeout 120
+{% else %}
+{#- Proton Bridge: folders live under Folders/; labels and All Mail would only duplicate them -#}
+{% set fixed = [['INBOX', 'INBOX'], ['Sent', 'Sent'], ['Trash', 'Trash'], ['Spam', 'Spam'], ['Archive', 'Archive']] %}
+{% set rest_far = 'Folders/' %}
+{% set rest_exclude = '!INBOX !Sent !Trash !Spam !Archive' %}
+
+# ---- {{ a.id }}: Proton (through Bridge on 127.0.0.1), into "{{ a.folder }}/"
+IMAPAccount {{ a.id }}
+Host 127.0.0.1
+Port {{ mail_bridge_imap_port }}
+User {{ a.address }}
+PassCmd "cat {{ mail_sync_dir }}/secrets/{{ a.id }}"
+SSLType STARTTLS
+CertificateFile {{ mail_sync_dir }}/bridge-cert.pem
+AuthMechs LOGIN
+Timeout 120
+{% endif %}
+
+IMAPStore {{ a.id }}
+Account {{ a.id }}
+{% for f in fixed %}
+{% if f[1] in mail_merged_folders %}
+
+# {{ f[1] }} of every account in the mailbox's own "{{ mail_merged_folders[f[1]] }}". Pulls everything; pushes
+# back only flags and deletes (read, flagged, deleted, moved away), never new messages: a message in a shared
+# folder that is not this account's is not this channel's to upload, so no account's mail lands in another.
+# Each channel keeps its own state file: they share the near box, and mbsync names state by that box.
+Channel {{ a.id }}-{{ f[1] | lower }}-merged
+Far ":{{ a.id }}:{{ f[0] }}"
+Near ":local:{{ mail_merged_folders[f[1]] }}"
+Create Near
+Remove None
+Expunge Both
+CopyArrivalDate yes
+Sync Pull PushFlags PushDelete
+SyncState {{ mail_sync_state_dir }}/{{ mail_user.name }}/{{ a.id }}-{{ f[1] | lower }}-merged-
+{% else %}
+
+Channel {{ a.id }}-{{ f[1] | lower }}
+Far ":{{ a.id }}:{{ f[0] }}"
+Near ":local:{{ a.folder }}/{{ f[1] }}"
+Create Near
+Remove None
+Expunge Both
+CopyArrivalDate yes
+Sync All
+SyncState {{ mail_sync_state_dir }}/{{ mail_user.name }}/
+{% endif %}
+{% endfor %}
+
+# Everything else, both ways: a folder made on either side appears on the other
+Channel {{ a.id }}-folders
+Far ":{{ a.id }}:{{ rest_far }}"
+Near ":local:{{ a.folder }}/"
+Patterns * {{ rest_exclude }}
+Create Both
+Remove None
+Expunge Both
+CopyArrivalDate yes
+Sync All
+SyncState {{ mail_sync_state_dir }}/{{ mail_user.name }}/
+{% endfor %}
+{% endif %}

@@ -1,0 +1,10 @@
+{#- step-ca SSH template for the automation identity {{ step_ca_template_name }}. Rendered by Ansible first
+    (principal), then by step-ca at signing time (the raw block). Whatever the request asks for, the
+    certificate is a user certificate for exactly this principal. -#}
+{
+  "type": "user",
+  "keyId": {% raw %}{{ toJson .KeyID }}{% endraw %},
+  "principals": {{ [step_ca_template_name] | to_json }},
+  "extensions": {"permit-pty": ""},
+  "criticalOptions": {}
+}

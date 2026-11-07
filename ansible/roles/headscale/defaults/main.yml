@@ -1,0 +1,25 @@
+---
+headscale_version: ""
+headscale_deb_sha256: ""
+headscale_deb_url: "https://github.com/juanfont/headscale/releases/download/v{{ headscale_version }}/headscale_{{ headscale_version }}_linux_amd64.deb"
+headscale_domain: ""
+headscale_magic_domain: ""
+headscale_listen_port: 8080
+headscale_idp_domain: "auth.{{ base_domain }}"
+headscale_oidc_slug: headscale
+headscale_oidc_group: headscale-users
+# User devices sign in again through Authentik after this; tagged nodes (the router) never expire
+headscale_node_expiry: 180d
+headscale_users: []
+headscale_admins: []
+headscale_routes: []
+headscale_trusted_devices: {}
+headscale_acls: []
+headscale_split_domains: []
+headscale_dns_server: ""
+# The router's tag; the pre-auth key the router role asks for carries it
+headscale_router_tag: "tag:router"
+# Exit nodes (roles/tailscale_router with tailscale_router_role: exit), each with its own tag, and the
+# trusted devices that may send their internet traffic through it (names from headscale_trusted_devices).
+# A device sees only the exits it is granted: { <name>: { tag: tag:..., devices: [...] } }
+headscale_exits: {}

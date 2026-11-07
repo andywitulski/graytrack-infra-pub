@@ -1,0 +1,6 @@
+# Managed by Ansible (labstack-infra).
+FROM caddy:{{ caddy_version }}-builder AS builder
+RUN xcaddy build --with {{ caddy_dns_module }}
+
+FROM caddy:{{ caddy_version }}
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

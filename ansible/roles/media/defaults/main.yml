@@ -1,0 +1,43 @@
+---
+media_navidrome_version: ""
+media_navidrome_music: /srv/music
+media_navidrome_log_level: info
+# Only the edge proxy may assert a user (Remote-User header); derived from the inventory.
+media_navidrome_trusted_sources: "{{ hostvars[groups['caddy'][0]]['ansible_host'] }}/32"
+media_jellyfin_key_url: https://repo.jellyfin.org/jellyfin_team.gpg.key
+# Public CA certificate of this environment's Authentik LDAP outpost, written by:
+#   bin/tf-ak <env> output -raw ldap_ca_pem > ansible/files/<env>/ldap-outpost-ca.pem
+media_ldap_ca_file: "{{ playbook_dir }}/../files/{{ lab_env }}/ldap-outpost-ca.pem"
+
+# ---------------------------------------------------------------- Audiobookshelf
+# Debian package from the project's own repository (flat repo); "" installs the latest it publishes.
+media_abs_repo: https://advplyr.github.io/audiobookshelf-ppa
+media_abs_key_url: https://advplyr.github.io/audiobookshelf-ppa/KEY.gpg
+media_abs_version: ""
+media_abs_port: 13378
+media_abs_url: "http://127.0.0.1:{{ media_abs_port }}"
+media_abs_domain: "books.{{ base_domain }}"
+# Break-glass local account (password in OpenBao). Deliberately not anyone's Authentik username, so an
+# OIDC login can never be matched onto it; day-to-day sign-in is through Authentik.
+media_abs_root_user: abs-root
+media_abs_libraries:
+  - { name: Audiobooks, path: /srv/audiobooks, media_type: book, provider: audible }
+  - { name: Podcasts, path: /srv/podcasts, media_type: podcast, provider: itunes }
+  # EPUB, PDF, CBZ/CBR: read in the web reader and the apps. An audiobook's own EPUB goes in its folder in
+  # Audiobooks instead (one item with both).
+  - { name: Ebooks, path: /srv/ebooks, media_type: book, provider: google }
+# OIDC with Authentik (tofu modules/authentik_config): the abs_roles scope carries admin/user from the
+# audiobookshelf-admins / audiobookshelf-users groups; ABS refuses a login with neither.
+media_abs_oidc_slug: audiobookshelf
+media_abs_oidc_issuer: "https://auth.{{ base_domain }}/application/o/{{ media_abs_oidc_slug }}/"
+media_abs_oidc_group_claim: abs_roles
+# "" (callbacks at /auth/openid/...) or "/audiobookshelf"; must match the redirects in tofu modules/authentik_config
+media_abs_oidc_redirect_subfolder: ""
+# App callback schemes ABS may hand the OIDC result to (its own /auth/openid/mobile-redirect relays it, so
+# Authentik only ever sees that https redirect). audiobookshelf: the official app; prologue: Prologue (iOS).
+media_abs_oidc_mobile_redirect_uris: ["audiobookshelf://oauth", "prologue://oauth"]
+media_abs_oidc_button_text: Sign in with Authentik
+# Both, permanently: local keeps abs-root as break-glass and is how this role signs in to the API.
+# ["openid"] alone would break the role. abs-root's password is long and random; /login is rate limited.
+media_abs_auth_methods: [local, openid]
+media_abs_oidc_auto_launch: true

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# bin/render-placeholders <values.env>
+# Replaces every __TOKEN__ (and example.com, from BASE_DOMAIN) in tracked text files with your values.
+# Run once, in a PRIVATE fork. Rendered files describe your real network: do not push them to a public remote.
+set -euo pipefail
+values=${1:?usage: bin/render-placeholders <values.env>}
+root=$(git rev-parse --show-toplevel); cd "$root"
+[[ -f $values ]] || { echo "no such file: $values" >&2; exit 2; }
+if git remote -v | grep -q . && [[ ${RENDER_CONFIRM:-} != yes ]]; then
+  git remote -v
+  read -r -p "These remotes exist. Is every one of them private? Type 'private' to continue: " ok
+  [[ $ok == private ]] || { echo aborted; exit 1; }
+fi
+export PERL_VALUES=$values
+git ls-files -z | grep -zvE '^(bin/render-placeholders|config/placeholders\.example\.env|scripts/check-sanitized\.sh)$' |
+  xargs -0 perl -i -pe '
+    BEGIN {
+      open my $f, "<", $ENV{PERL_VALUES} or die $!;
+      while (<$f>) {
+        s/\s+#.*$//; next unless /^\s*(\S+?)=(\S+)\s*$/;
+        my ($k, $v) = ($1, $2);
+        if ($k eq "BASE_DOMAIN") { $domain = $v } else { $map{$k} = $v }
+      }
+    }
+    for my $k (keys %map) { s/\Q$k\E/$map{$k}/g }
+    s/\bexample\.com\b/$domain/g if defined $domain;
+  '
+if left=$(git grep -hoE '__[A-Z0-9_]+__' -- . ':!bin/render-placeholders' ':!config/placeholders.example.env' ':!scripts/check-sanitized.sh' | grep -vE '^__(pycache|init|file|name|main)__$' | sort -u) && [[ -n $left ]]; then
+  echo "Tokens with no value:"; echo "$left"; exit 1
+fi
+echo "Rendered. Next: docs/howto/platform-tier.md"

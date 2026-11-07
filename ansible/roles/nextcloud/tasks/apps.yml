@@ -1,0 +1,81 @@
+---
+# App store apps (nextcloud_apps) with their default settings, and Nextcloud Office pointed at Collabora.
+# occ runs as www-data inside the container: no admin password needed.
+
+- name: Read installed apps (before the app store apps)
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ app:list --output=json
+    chdir: "{{ nextcloud_dir }}"
+  register: nextcloud_store_apps
+  changed_when: false
+  check_mode: false
+
+- name: Install apps
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ app:install {{ item }}
+    chdir: "{{ nextcloud_dir }}"
+  loop: "{{ nextcloud_apps }}"
+  when:
+    - item not in (nextcloud_store_apps.stdout | from_json).enabled
+    - item not in (nextcloud_store_apps.stdout | from_json).disabled
+  changed_when: true
+
+- name: Enable apps that are installed but off
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ app:enable {{ item }}
+    chdir: "{{ nextcloud_dir }}"
+  loop: "{{ nextcloud_apps }}"
+  when: item in (nextcloud_store_apps.stdout | from_json).disabled
+  changed_when: true
+
+- name: Collabora answers
+  when: collabora_version | length > 0
+  check_mode: false  # read-only
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ collabora_http_port }}/hosting/discovery"
+    return_content: false
+  register: collabora_discovery
+  until: collabora_discovery.status == 200
+  retries: 30
+  delay: 5
+
+- name: Read Nextcloud Office settings
+  when: collabora_version | length > 0 and 'richdocuments' in nextcloud_apps
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ config:list richdocuments
+    chdir: "{{ nextcloud_dir }}"
+  register: nextcloud_office_config
+  changed_when: false
+  check_mode: false
+
+- name: Nextcloud Office uses Collabora
+  vars:
+    current: "{{ (nextcloud_office_config.stdout | from_json).apps.richdocuments | default({}) }}"
+    office_settings:
+      wopi_url: "https://{{ collabora_domain }}"
+      public_wopi_url: "https://{{ collabora_domain }}"
+      wopi_allowlist: "{{ collabora_wopi_allowlist }}"
+      disable_certificate_verification: ""
+  ansible.builtin.command:
+    chdir: "{{ nextcloud_dir }}"
+    argv: [docker, compose, -f, compose.yml, exec, -T, -u, www-data, app, php, occ,
+           config:app:set, richdocuments, "{{ item.key }}", "--value={{ item.value }}"]
+  loop: "{{ office_settings | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - collabora_version | length > 0
+    - "'richdocuments' in nextcloud_apps"
+    - current[item.key] | default('') != item.value
+  register: nextcloud_office_set
+  changed_when: true
+
+# Every run: reads Collabora's discovery through office.<base_domain> (Caddy and DNS must be in place,
+# docs/howto/nextcloud-office.md) and doubles as the health check for the whole path.
+- name: Nextcloud Office reaches Collabora and reads its discovery
+  when: collabora_version | length > 0 and 'richdocuments' in nextcloud_apps
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ richdocuments:activate-config
+    chdir: "{{ nextcloud_dir }}"
+  changed_when: false
+  check_mode: false

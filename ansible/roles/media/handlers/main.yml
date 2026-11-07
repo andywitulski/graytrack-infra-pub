@@ -1,0 +1,22 @@
+---
+- name: Restart jellyfin
+  ansible.builtin.systemd_service:
+    name: jellyfin
+    state: restarted
+
+- name: Restart navidrome
+  ansible.builtin.systemd_service:
+    name: navidrome
+    state: restarted
+    daemon_reload: true
+
+- name: Restart audiobookshelf
+  ansible.builtin.systemd_service:
+    name: audiobookshelf
+    state: restarted
+    daemon_reload: true
+
+- name: Rebuild CA store
+  ansible.builtin.command: update-ca-certificates
+  changed_when: true
+  notify: Restart jellyfin

@@ -1,0 +1,16 @@
+---
+collections:
+  - name: ansible.posix
+    version: "2.2.2"
+  - name: community.general
+    version: "13.4.0"
+  - name: community.sops
+    version: "2.4.0"
+  - name: community.docker
+    version: "5.3.0"
+  - name: community.postgresql # roles/postgres (pg01)
+    version: "4.2.0"
+  - name: community.hashi_vault # OpenBao lookups (bin/ap logs in with the ansible AppRole; needs pip hvac)
+    version: "7.1.0"
+  - name: hellqvio86.unifi
+    version: "0.0.32"

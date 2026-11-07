@@ -1,0 +1,4 @@
+---
+# { src: "__STOR_NET__.5:/tank/x", path: /mnt/x }
+nfs_client_mounts: []
+nfs_client_options: "vers=4.2,hard,noatime,_netdev"

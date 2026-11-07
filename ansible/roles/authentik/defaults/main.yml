@@ -1,0 +1,9 @@
+---
+authentik_version: ""
+authentik_domain: ""
+authentik_bootstrap_email: ""
+authentik_http_port: 9000
+authentik_use_redis: true # Authentik 2025.10 and later need no Redis: inventories/common sets false
+authentik_ldap_outpost_enabled: false
+authentik_proxy_outpost_enabled: false
+authentik_dir: /opt/authentik

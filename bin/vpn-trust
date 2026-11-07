@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# bin/vpn-trust <device-name> [--exit <exit>]
+# Trusts a device on the VPN (docs/howto/vpn.md, Trusting a device): looks up the device's tailnet address
+# in Headscale by its name and writes `<name>: <address>` into headscale_trusted_devices
+# (inventories/common/group_vars/headscale.yml). --exit also lets it use that exit node (headscale_exits).
+# It changes the file only; you review the diff, apply and commit (the commands are printed at the end).
+#
+#   bin/vpn-trust bob-iphone
+#   bin/vpn-trust alice-laptop --exit home
+#
+# Only for a device you have checked is yours, in your hands, updated and locked. The name is the one the
+# device shows in `headscale nodes list` (bin/mdm-tailscale sets it on iPhones and iPads).
+set -euo pipefail
+
+usage() { sed -n '2,3p' "$0" | sed 's/^# //' >&2; exit 2; }
+name=${1:-}
+[[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || usage
+shift
+exit_name=""
+while (($#)); do
+  case "$1" in
+    --exit) exit_name=${2:-}; [[ $exit_name =~ ^[a-z0-9][a-z0-9-]*$ ]] || usage; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+vars="$root/ansible/inventories/common/group_vars/headscale.yml"
+hosts="$root/ansible/inventories/prod/hosts.yml"
+command -v jq > /dev/null || { echo "jq missing" >&2; exit 1; }
+command -v python3 > /dev/null || { echo "python3 missing" >&2; exit 1; }
+
+hs=$(awk '/^ *hs01:$/ { f = 1; next } f && /ansible_host:/ { print $2; exit }' "$hosts")
+[[ -n $hs ]] || { echo "hs01's address not found in $hosts" >&2; exit 1; }
+
+nodes=$(ssh "ansible@$hs" 'sudo headscale nodes list --output json')
+match=$(printf '%s' "$nodes" | jq -c --arg n "$name" '[.[] | select(.given_name == $n)]')
+count=$(printf '%s' "$match" | jq length)
+if [[ $count -eq 0 ]]; then
+  echo "No device named $name in Headscale. Signed in yet? Names there:" >&2
+  printf '%s' "$nodes" | jq -r '.[] | "  " + .given_name' >&2
+  exit 1
+fi
+if [[ $count -gt 1 ]]; then
+  echo "$count devices are named $name (an old sign-in left behind?). Delete the stale one first:" >&2
+  printf '%s' "$match" | jq -r '.[] | "  id \(.id)  \(.ip_addresses[0])  last seen \(.last_seen // "?")"' >&2
+  echo "  ssh ansible@$hs 'sudo headscale nodes delete --identifier <id>'" >&2
+  exit 1
+fi
+node=$(printf '%s' "$match" | jq '.[0]')
+if [[ $(printf '%s' "$node" | jq '(.tags // []) | length') -gt 0 ]]; then
+  echo "$name is a tagged node (a router or exit node): those are never listed as trusted devices" >&2
+  exit 1
+fi
+addr=$(printf '%s' "$node" | jq -r '[.ip_addresses[] | select(test("^100\\."))][0] // empty')
+[[ -n $addr ]] || { echo "$name has no 100.x address in Headscale" >&2; exit 1; }
+owner=$(printf '%s' "$node" | jq -r '.user.name // "?"')
+
+python3 -I - "$vars" "$name" "$addr" "$exit_name" << 'EOF'
+import re, sys
+path, name, addr, exit_name = sys.argv[1:]
+lines = open(path).read().split("\n")
+
+def block(key):
+    """Index of `key:` at column 0 and the end of its indented block."""
+    start = next((i for i, l in enumerate(lines) if re.match(rf"^{key}:", l)), None)
+    if start is None:
+        sys.exit(f"{key} not found in {path}")
+    end = start + 1
+    while end < len(lines) and (lines[end].startswith(" ") or lines[end] == ""):
+        end += 1
+    while end > start + 1 and lines[end - 1] == "":
+        end -= 1
+    return start, end
+
+start, end = block("headscale_trusted_devices")
+if re.match(r"^headscale_trusted_devices:\s*\{\}\s*(#.*)?$", lines[start]):
+    lines[start] = "headscale_trusted_devices:"
+entries = {}
+for i in range(start + 1, end):
+    m = re.match(r"^  ([a-z0-9][a-z0-9-]*):\s*(\S+)", lines[i])
+    if m:
+        entries[m.group(1)] = (i, m.group(2))
+for other, (_, a) in entries.items():
+    if a == addr and other != name:
+        sys.exit(f"{addr} is already trusted as {other}: one device, one name (rename or remove that line first)")
+if name in entries:
+    i, old = entries[name]
+    if old == addr:
+        print(f"{name}: {addr} is already trusted")
+    else:
+        lines[i] = f"  {name}: {addr}"
+        print(f"{name}: address updated, {old} to {addr}")
+else:
+    last = max((i for i, _ in entries.values()), default=start)
+    lines.insert(last + 1, f"  {name}: {addr}")
+    print(f"{name}: {addr} added to headscale_trusted_devices")
+
+if exit_name:
+    start, end = block("headscale_exits")
+    e = next((i for i in range(start + 1, end) if re.match(rf"^  {exit_name}:", lines[i])), None)
+    if e is None:
+        sys.exit(f"exit {exit_name} not found under headscale_exits")
+    d = next((i for i in range(e + 1, end) if re.match(r"^    devices:", lines[i])), None)
+    m = re.match(r"^(    devices:\s*)\[([^\]]*)\](.*)$", lines[d]) if d is not None else None
+    if m is None:
+        sys.exit(f"headscale_exits.{exit_name}.devices is not a one-line [list]: add {name} by hand")
+    devs = [x.strip() for x in m.group(2).split(",") if x.strip()]
+    if name in devs:
+        print(f"{name} already uses exit {exit_name}")
+    else:
+        devs.append(name)
+        lines[d] = f"{m.group(1)}[{', '.join(devs)}]{m.group(3)}"
+        print(f"{name} may use exit {exit_name}")
+
+open(path, "w").write("\n".join(lines))
+EOF
+
+echo "Owner in Headscale: $owner. Check it is the right person's device before applying."
+git -C "$root" --no-pager diff -- "$vars"
+cat << EOF
+
+Apply and record it:
+  bin/ap prod playbooks/services.yml --limit hs01     # ends with "Rejected devices": should not list $name
+  git add ansible/inventories/common/group_vars/headscale.yml
+  git commit -m "headscale: trust $name"
+EOF

@@ -1,0 +1,42 @@
+---
+# Every change the role makes to the manager is a file under /var/ossec/etc, so the Wazuh daemons are
+# restarted inside the running container. Restarting the container itself re-ran the image's init: on
+# Nov 4 that left every daemon stopped (stale PIDs, wazuh-apid killed at start, the init script giving up),
+# so analysisd processed nothing until started by hand. The container restart is only the fallback.
+- name: Restart wazuh manager
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, /var/ossec/bin/wazuh-control, restart]
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_daemon_restart
+  changed_when: true
+  failed_when: false
+  listen: Restart wazuh manager
+
+- name: Restart the manager container (the daemons did not restart in place)
+  ansible.builtin.command:
+    cmd: docker compose restart wazuh.manager
+    chdir: "{{ wazuh_manager_dir }}"
+  when: wazuh_manager_daemon_restart.rc | default(1) != 0
+  changed_when: true
+  listen: Restart wazuh manager
+
+# The container's init can stop every daemon without the container exiting, so check the daemons
+- name: Manager daemons running after the restart
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, /var/ossec/bin/wazuh-control, status]
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_daemons
+  until: >-
+    'wazuh-analysisd is running' in wazuh_manager_daemons.stdout
+    and 'wazuh-remoted is running' in wazuh_manager_daemons.stdout
+    and 'wazuh-db is running' in wazuh_manager_daemons.stdout
+  retries: 12
+  delay: 10
+  changed_when: false
+  listen: Restart wazuh manager
+
+- name: Restart wazuh dashboard
+  ansible.builtin.command:
+    cmd: docker compose restart wazuh.dashboard
+    chdir: "{{ wazuh_manager_dir }}"
+  changed_when: true

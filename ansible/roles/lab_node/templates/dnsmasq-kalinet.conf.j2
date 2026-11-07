@@ -1,0 +1,20 @@
+# Managed by Ansible (labstack-infra, role lab_node). DNS and DHCP for kalinet only (kali01).
+# Its own instance (labstack-kalinet-dns.service), so the dev names on pvedev are never served here.
+interface={{ labnode_kali_vnet }}
+bind-dynamic
+except-interface=lo
+user=dnsmasq
+pid-file=/run/labstack-kalinet-dns.pid
+no-resolv
+no-hosts
+server={{ lab_node_upstream_dns }}
+domain-needed
+bogus-priv
+# The lab's names stay unanswered, and no public name may resolve to a private address
+local=/{{ base_domain }}/
+stop-dns-rebind
+dhcp-range={{ labnode_kali_dhcp_range[0] }},{{ labnode_kali_dhcp_range[1] }},255.255.255.0,12h
+dhcp-option=option:router,{{ labnode_kali_gw }}
+dhcp-option=option:dns-server,{{ labnode_kali_gw }}
+dhcp-authoritative
+dhcp-leasefile=/var/lib/misc/labstack-kalinet.leases

@@ -1,0 +1,39 @@
+# OpenTofu working dirs and state (state is encrypted but still never committed)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan
+# bin/tf-adopt: import blocks for a lost state, deleted once applied
+imports.tf
+crash.log
+crash.*.log
+# bin/tf-platform bootstrap: temporary local backend until pg01 holds the state
+zz_bootstrap_override.tf
+
+# Local variable files that may hold secrets
+*.auto.tfvars
+terraform.tfvars
+
+# Decrypted secrets, never commit
+*.dec.*
+.env
+keys.txt
+
+# Ansible
+*.retry
+ansible/collections/ansible_collections/
+ansible/.ansible/
+ansible/collections/ansible_collections/
+.obsidian/
+__pycache__/
+.DS_Store
+
+# Public repository guard: real keys, certificates and encrypted secrets stay in a private fork
+secrets/*.enc.*
+*.sops.yml
+*.sops.yaml
+!.sops.yaml
+ansible/files/**
+!ansible/files/README.md
+placeholders.env

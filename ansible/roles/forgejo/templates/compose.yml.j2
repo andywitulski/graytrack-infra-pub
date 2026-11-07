@@ -1,0 +1,59 @@
+# Managed by Ansible (labstack-infra).
+services:
+  db:
+    image: docker.io/library/postgres:16.15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: forgejo
+      POSTGRES_USER: forgejo
+      POSTGRES_PASSWORD: ${DB_PASS}
+    volumes:
+      - ./database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d forgejo -U forgejo"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:{{ forgejo_version }}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: db:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: forgejo
+      FORGEJO__server__DOMAIN: {{ forgejo_domain }}
+      FORGEJO__server__ROOT_URL: https://{{ forgejo_domain }}/
+      FORGEJO__server__SSH_DOMAIN: {{ forgejo_domain }}
+      FORGEJO__server__SSH_PORT: "{{ forgejo_ssh_port }}"
+      FORGEJO__server__LFS_START_SERVER: "true"
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__service__DISABLE_REGISTRATION: "false"
+      FORGEJO__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"
+      FORGEJO__openid__ENABLE_OPENID_SIGNIN: "false"
+      FORGEJO__oauth2_client__ENABLE_AUTO_REGISTRATION: "true"
+      FORGEJO__repository__ENABLE_PUSH_CREATE_USER: "{{ forgejo_push_create | lower }}"
+      FORGEJO__repository__DEFAULT_PRIVATE: "{{ forgejo_default_private }}"
+      FORGEJO__repository__DEFAULT_PUSH_CREATE_PRIVATE: "true"
+      FORGEJO__server__LANDING_PAGE: "{{ forgejo_landing_page }}"
+      FORGEJO__service__DEFAULT_KEEP_EMAIL_PRIVATE: "true"
+      FORGEJO__service__REQUIRE_SIGNIN_VIEW: "false"
+      FORGEJO__ui__SHOW_USER_EMAIL: "false"
+{% if ssh_ca_enabled | default(false) | bool %}
+      # SSH certificates from ca01 (step ssh login): accepted for a user whose principal (their username)
+      # is registered under Settings > SSH / GPG Keys > Manage principals. docs/howto/using-certificates.md
+      FORGEJO__server__SSH_TRUSTED_USER_CA_KEYS: "{{ lookup('ansible.builtin.file', ssh_ca_user_ca_pub).splitlines() | select | join(',') }}"
+      FORGEJO__server__SSH_AUTHORIZED_PRINCIPALS_ALLOW: username
+{% endif %}
+    ports:
+      - "{{ forgejo_http_port }}:3000"
+      - "{{ forgejo_ssh_port }}:22"
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy

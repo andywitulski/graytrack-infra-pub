@@ -1,0 +1,23 @@
+---
+# NIC names pinned to the VM MACs (inventories/labnode/group_vars/all/pvedev.yml, read by tofu/envs/labnode)
+pve_nic_pins:
+  - { name: nic0, mac: "00:00:5e:00:53:05" }
+  - { name: nic1, mac: "00:00:5e:00:53:06" }
+pve_net_bridge_port: nic0
+pve_net_address: __DEV_NET__.13/24
+pve_net_gateway: __DEV_NET__.1
+pve_net_storage:
+  iface: nic1
+  bridge: vmbr1
+  address: __DEV_STOR_NET__.13/24
+pve_net_eee_off: []
+pve_blacklist_modules: []
+
+# Pool built from the four blank data disks (prod's was created by hand on 4x 6TB).
+# Keep the vdev layout the same as prod: compare with `zpool status tank` on pve03.
+zfs_host_pool:
+  name: tank
+  vdevs: >-
+    mirror /dev/disk/by-id/virtio-tank0 /dev/disk/by-id/virtio-tank1
+    mirror /dev/disk/by-id/virtio-tank2 /dev/disk/by-id/virtio-tank3
+zfs_arc_max_bytes: 1073741824

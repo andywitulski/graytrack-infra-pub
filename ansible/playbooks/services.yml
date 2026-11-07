@@ -1,0 +1,127 @@
+---
+# Service guests, in dependency order.
+# LXCs start with root keys only; their first run creates the ansible account:
+#   bin/ap prod playbooks/services.yml --limit lxc_guests -e ansible_user=root
+# (-e is needed: the inventory's ansible_user outranks -u.)
+
+- name: Baseline every guest
+  hosts: service_guests
+  become: true
+  roles:
+    - guest_base
+    - cis_baseline
+    - ssh_ca
+
+- name: Docker hosts
+  hosts: docker_hosts
+  become: true
+  roles:
+    - docker_host
+
+- name: NFS clients on the storage network
+  hosts: nfs_clients
+  become: true
+  roles:
+    - nfs_client
+
+- name: Edge proxy
+  hosts: caddy
+  become: true
+  roles:
+    - caddy
+
+- name: Identity provider
+  hosts: authentik
+  become: true
+  roles:
+    - authentik
+
+- name: Git forge
+  hosts: forgejo
+  become: true
+  roles:
+    - forgejo
+
+- name: Password manager
+  hosts: vaultwarden
+  become: true
+  roles:
+    - vaultwarden
+
+- name: Device management
+  hosts: fleet
+  become: true
+  roles:
+    - fleet
+
+- name: Mail (stage 1)
+  hosts: mail
+  become: true
+  roles:
+    - mail
+
+- name: VPN coordination server
+  hosts: headscale
+  become: true
+  roles:
+    - headscale
+
+- name: VPN subnet router
+  hosts: tailscale_router
+  become: true
+  roles:
+    - tailscale_router
+
+- name: VPN exit node
+  hosts: tailscale_exit
+  become: true
+  roles:
+    - tailscale_router
+
+- name: Nextcloud
+  hosts: nextcloud
+  become: true
+  roles:
+    - nextcloud
+
+- name: File shares
+  hosts: samba
+  become: true
+  roles:
+    - samba
+
+- name: Syncthing
+  hosts: syncthing
+  become: true
+  roles:
+    - syncthing
+    - vault_git
+
+- name: Media
+  hosts: media
+  become: true
+  roles:
+    - media
+
+- name: Local LLM
+  hosts: ollama
+  become: true
+  roles:
+    - ollama
+
+- name: Backup server
+  hosts: pbs
+  become: true
+  roles:
+    - pbs
+- name: SIEM server
+  hosts: wazuh_manager
+  become: true
+  roles:
+    - wazuh_manager
+
+- name: SIEM agents
+  hosts: wazuh_agents:!wazuh_manager
+  become: true
+  roles:
+    - wazuh_agent

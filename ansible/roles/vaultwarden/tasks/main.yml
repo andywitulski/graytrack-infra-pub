@@ -1,0 +1,78 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - vaultwarden_version | length > 0
+      - vaultwarden_domain | length > 0
+      - vaultwarden_db_pass | default('PENDING') not in ['', 'PENDING']
+    fail_msg: >-
+      Set vaultwarden_version and vaultwarden_domain (inventories/common/group_vars/vaultwarden.yml), and
+      vaultwarden_db_pass (bin/gen-service-secrets {{ lab_env }})
+    quiet: true
+
+# The SSO client secret is written to OpenBao by bin/tf-ak; until then the server runs with password login only
+- name: Sign-in through Authentik is configured once its client secret exists
+  ansible.builtin.set_fact:
+    vaultwarden_sso_ready: >-
+      {{ vaultwarden_sso | bool and vaultwarden_oidc_client_secret | default('PENDING') not in ['', 'PENDING'] }}
+    vaultwarden_admin_enabled: "{{ vaultwarden_admin_token | default('') | length > 0 }}"
+
+- name: Compose template path (this role)
+  ansible.builtin.set_fact:
+    vaultwarden_compose_template_path: "{{ role_path }}/templates/compose.yml.j2"
+
+- name: App directory
+  ansible.builtin.file:
+    path: "{{ vaultwarden_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# A file, not the environment: the argon2 string is full of "$", which Compose would try to expand
+- name: Admin page token (argon2 PHC string from OpenBao)
+  ansible.builtin.copy:
+    dest: "{{ vaultwarden_dir }}/admin_token"
+    content: "{{ vaultwarden_admin_token | default('') }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: vaultwarden_admin_enabled | bool
+  no_log: true
+
+- name: No admin page token when the admin page is off
+  ansible.builtin.file:
+    path: "{{ vaultwarden_dir }}/admin_token"
+    state: absent
+  when: not vaultwarden_admin_enabled | bool
+
+- name: Vaultwarden stack
+  ansible.builtin.include_role:
+    name: compose_app
+  vars:
+    compose_app_name: vaultwarden
+    compose_app_dir: "{{ vaultwarden_dir }}"
+    compose_app_compose_template: "{{ vaultwarden_compose_template_path }}"
+    compose_app_env: >-
+      {{ {'DB_PASS': vaultwarden_db_pass,
+          'DATABASE_URL': 'postgresql://vaultwarden:' ~ vaultwarden_db_pass ~ '@db:5432/vaultwarden'}
+         | combine({'SSO_CLIENT_SECRET': vaultwarden_oidc_client_secret} if vaultwarden_sso_ready | bool else {}) }}
+    compose_app_pg_dump: { service: db, user: vaultwarden, database: vaultwarden }
+
+- name: Vaultwarden answers
+  check_mode: false  # read-only; --check needs the real answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vaultwarden_http_port }}/alive"
+    status_code: 200
+  register: vaultwarden_health
+  until: vaultwarden_health.status == 200
+  retries: 30
+  delay: 5
+
+- name: Sign-in through Authentik
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Authentik sign-in is on (https://' ~ vaultwarden_domain ~ ', "Use single sign-on").'
+         if vaultwarden_sso_ready | bool else
+         'Authentik sign-in is off until bin/tf-ak ' ~ ('prod' if lab_env == 'labnode' else lab_env)
+         ~ ' apply has written vaultwarden_oidc_client_secret to OpenBao; then run this play again.' }}

@@ -1,0 +1,23 @@
+---
+# One API token on the backup user (pbs_token_name), included by main.yml only when it does not exist.
+- name: Generate the token {{ pbs_token_name }}
+  ansible.builtin.command: "proxmox-backup-manager user generate-token {{ pbs_cluster_user }} {{ pbs_token_name }}"
+  register: pbs_new_token
+  changed_when: true
+  no_log: true
+
+- name: Leave the token for sops
+  ansible.builtin.copy:
+    dest: "{{ pbs_token_drop_dir }}/pbs-{{ pbs_token_name }}-token.json"
+    content: "{{ pbs_new_token.stdout }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Next step
+  ansible.builtin.debug:
+    msg: >-
+      New token in {{ inventory_hostname }}:{{ pbs_token_drop_dir }}/pbs-{{ pbs_token_name }}-token.json.
+      Store its "value" as pbs_cluster_token_secret: bin/bao-secret {{ 'labnode' if pbs_token_name == 'labnode'
+      else lab_env }} set pbs_cluster_token_secret (docs/howto/backups-pbs.md), then delete the file.

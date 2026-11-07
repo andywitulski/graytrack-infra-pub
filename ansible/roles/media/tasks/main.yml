@@ -1,0 +1,134 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that: media_navidrome_version is not match('^(<|$)')
+    fail_msg: "Set media_navidrome_version in group_vars/media.yml"
+    quiet: true
+
+- name: Repository tooling
+  ansible.builtin.apt:
+    name: [python3-debian, ca-certificates]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Jellyfin repository (check it publishes this Debian release)
+  ansible.builtin.deb822_repository:
+    name: jellyfin
+    types: deb
+    uris: https://repo.jellyfin.org/debian
+    suites: "{{ ansible_facts.distribution_release }}"
+    components: main
+    signed_by: "{{ media_jellyfin_key_url }}"
+
+- name: Jellyfin
+  ansible.builtin.apt:
+    name: jellyfin
+    state: present
+    update_cache: true
+
+- name: Shared data identity (labdata, same UID/GID 2000 as on the storage node)
+  ansible.builtin.include_role:
+    name: lab_data_identity
+
+- name: Jellyfin may use the iGPU (Quick Sync) and write recordings (labdata)
+  ansible.builtin.user:
+    name: jellyfin
+    groups: [render, video, labdata]
+    append: true
+  notify: Restart jellyfin
+
+- name: Navidrome account
+  ansible.builtin.user:
+    name: navidrome
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/navidrome
+    create_home: true
+
+- name: Navidrome release directory
+  ansible.builtin.file:
+    path: "/opt/navidrome/{{ media_navidrome_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Navidrome release
+  ansible.builtin.unarchive:
+    src: "https://github.com/navidrome/navidrome/releases/download/v{{ media_navidrome_version }}/navidrome_{{ media_navidrome_version }}_linux_amd64.tar.gz"
+    dest: "/opt/navidrome/{{ media_navidrome_version }}"
+    remote_src: true
+    creates: "/opt/navidrome/{{ media_navidrome_version }}/navidrome"
+    owner: root
+    group: root
+  notify: Restart navidrome
+
+- name: Current Navidrome version
+  ansible.builtin.file:
+    src: "/opt/navidrome/{{ media_navidrome_version }}"
+    dest: /opt/navidrome/current
+    state: link
+  notify: Restart navidrome
+
+- name: Navidrome configuration
+  ansible.builtin.template:
+    src: navidrome.toml.j2
+    dest: /etc/navidrome.toml
+    owner: root
+    group: navidrome
+    mode: "0640"
+  notify: Restart navidrome
+
+- name: Navidrome service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/navidrome.service
+    content: |
+      [Unit]
+      Description=Navidrome music server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=navidrome
+      Group=navidrome
+      ExecStart=/opt/navidrome/current/navidrome --configfile /etc/navidrome.toml
+      WorkingDirectory=/var/lib/navidrome
+      Restart=on-failure
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ReadWritePaths=/var/lib/navidrome
+      ProtectHome=true
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart navidrome
+
+- name: Audiobookshelf
+  ansible.builtin.include_tasks: audiobookshelf.yml
+
+- name: Media services running
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: [jellyfin, navidrome]
+
+- name: Trust the LDAP outpost certificate (once this environment's Authentik has issued it)
+  ansible.builtin.copy:
+    src: "{{ media_ldap_ca_file }}"
+    dest: /usr/local/share/ca-certificates/ldap-outpost.crt
+    owner: root
+    group: root
+    mode: "0644"
+  when: media_ldap_ca_file is file
+  notify: Rebuild CA store
+
+- name: LDAP client tools (for testing binds)
+  ansible.builtin.apt:
+    name: ldap-utils
+    state: present

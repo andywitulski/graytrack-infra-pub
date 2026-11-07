@@ -1,0 +1,27 @@
+---
+# Shared settings (files, enable switch, enforce, people, revocations): inventories/common/group_vars/all/ssh_ca.yml
+
+# Accounts that accept the automation certificates (principal = account name). tofu exists on the nodes
+# only (bootstrap.yml), for the Proxmox provider's SSH uploads.
+ssh_ca_automation_accounts: "{{ ['ansible'] + (['tofu'] if inventory_hostname in groups['pve_nodes'] else []) }}"
+# Existing local accounts (not created by this role) that also accept certificates: account: [principals].
+# Set per host. paw01: {labadmin: [alice]}, so your step ssh login certificate opens the workstation
+# account. The account's own authorized_keys stays as the fallback when ca01 or Authentik is down.
+ssh_ca_local_principals: {}
+
+# Names this host's SSH host certificate is valid for (what people and Ansible type to reach it)
+ssh_ca_host_principals:
+  - "{{ inventory_hostname }}"
+  - "{{ inventory_hostname }}.{{ base_domain }}"
+  - "{{ ansible_host }}"
+# Host certificates last 90 days (roles/step_ca); a run renews one when fewer days than this are left
+ssh_ca_host_cert_renew_days: 30
+
+# Controller side (localhost): issuing host certificates, and trusting them in known_hosts
+ssh_ca_secrets_file: "{{ playbook_dir }}/../../secrets/ca-{{ lab_env }}.enc.yaml"
+ssh_ca_known_hosts: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/known_hosts"
+# Every managed host by name and address, any name under the env's domain, and Forgejo's SSH port
+ssh_ca_known_hosts_patterns: >-
+  {{ ((groups['pve_nodes'] + groups['service_guests']) | unique | sort)
+     + ((groups['pve_nodes'] + groups['service_guests']) | map('extract', hostvars, 'ansible_host') | unique | sort)
+     + ['*.' ~ base_domain, '[*.' ~ base_domain ~ ']:*'] }}

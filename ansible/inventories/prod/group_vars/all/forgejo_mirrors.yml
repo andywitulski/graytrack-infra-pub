@@ -1,0 +1,15 @@
+---
+# Offsite copies of every Forgejo repository (playbooks/forgejo_mirrors.yml, docs/howto/git-mirrors.md).
+# Empty org: the playbook does nothing (the weekly run on paw01 skips it until this is set).
+forgejo_mirror_github_org: your-backup-org
+# Username for the HTTPS push; GitHub ignores it for tokens but git needs one
+forgejo_mirror_github_user: your-github-user
+# Backup repository name in the org: <owner><separator><repo> (two Forgejo owners can share a repo name)
+forgejo_mirror_separator: "--"
+forgejo_mirror_interval: 8h0m0s
+# Forgejo repositories left out, as owner/name
+forgejo_mirror_exclude: []
+# Secrets (OpenBao, kv/services/prod/forgejo; bin/bao-secret prod set ...):
+#   forgejo_mirror_api_token     Forgejo token of an admin, scopes read:user, read:organization, write:repository
+#   forgejo_mirror_github_token  GitHub fine-grained token, owner = the org, all repositories,
+#                                Administration, Contents and Workflows read and write

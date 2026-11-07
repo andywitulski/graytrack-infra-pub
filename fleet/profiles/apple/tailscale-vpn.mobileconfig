@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by labstack-infra (fleet/, docs/howto/mdm.md, docs/howto/vpn.md).
+     The Tailscale app's VPN configuration, installed by MDM (Tailscale's documented payload), with Connect On
+     Demand always on and the toggle locked, so the tunnel to the lab comes back by itself and stays up.
+     Split tunnel: only the lab's names and routes use it (Headscale decides that, not this profile). -->
+<plist version="1.0">
+<dict>
+	<key>PayloadDisplayName</key>
+	<string>labstack: VPN (Tailscale)</string>
+	<key>PayloadIdentifier</key>
+	<string>net.labstack.mdm.tailscale-vpn</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>23E41233-EFFF-44D9-89AE-3D1914F47AA9</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>Tailscale</string>
+			<key>PayloadIdentifier</key>
+			<string>net.labstack.mdm.tailscale-vpn.vpn</string>
+			<key>PayloadType</key>
+			<string>com.apple.vpn.managed</string>
+			<key>PayloadUUID</key>
+			<string>7E3433FE-B0A5-4E82-B512-E06F28DC67D4</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>UserDefinedName</key>
+			<string>labstack (Tailscale)</string>
+			<key>VPNType</key>
+			<string>VPN</string>
+			<key>VPNSubType</key>
+			<string>io.tailscale.ipn.ios</string>
+			<key>VPN</key>
+			<dict>
+				<key>RemoteAddress</key>
+				<string>Tailscale Mesh</string>
+				<key>AuthenticationMethod</key>
+				<string>Password</string>
+				<key>ProviderBundleIdentifier</key>
+				<string>io.tailscale.ipn.ios.network-extension</string>
+				<!-- Connect On Demand: on every network, always; the user cannot switch it off in Settings -->
+				<key>OnDemandEnabled</key>
+				<integer>1</integer>
+				<key>OnDemandUserOverrideDisabled</key>
+				<true/>
+				<key>OnDemandRules</key>
+				<array>
+					<dict>
+						<key>Action</key>
+						<string>Connect</string>
+					</dict>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

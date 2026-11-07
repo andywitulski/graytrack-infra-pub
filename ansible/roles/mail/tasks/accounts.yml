@@ -1,0 +1,54 @@
+---
+# Mailboxes are created once, with the generated password (mail_user_<name>_password); after that the
+# account belongs to its owner (app passwords, 2FA in the portal) and this never touches its credentials.
+# Removing a person is by hand (docs/howto/mail.md).
+- name: The mail domain's id
+  ansible.builtin.command:
+    argv: [stalwart-cli, query, Domain, --json, --fields, name]
+  environment: "{{ mail_cli_env }}"
+  register: mail_domains
+  changed_when: false
+  check_mode: false
+
+# A domain left from an earlier mail_domain (example.com before Nov 2026) would still count as local:
+# Stalwart would keep delivering its mail itself instead of sending it to Proton. Reset (mail.md, Recovery).
+- name: Only the mail domain is local
+  ansible.builtin.assert:
+    that: mail_domains.stdout_lines | map('from_json') | map(attribute='name') | reject('equalto', mail_domain) | list | length == 0
+    fail_msg: >-
+      Stalwart also has the domain(s)
+      {{ mail_domains.stdout_lines | map('from_json') | map(attribute='name') | reject('equalto', mail_domain) | join(', ') }}
+      (an earlier mail_domain). Reset Stalwart's store: docs/howto/mail.md, "Start Stalwart over".
+    quiet: true
+
+- name: Mailboxes that exist
+  ansible.builtin.command:
+    argv: [stalwart-cli, query, Account, --json, --fields, name]
+  environment: "{{ mail_cli_env }}"
+  register: mail_existing
+  changed_when: false
+  check_mode: false
+
+- name: Mailbox for each person
+  vars:
+    mail_domain_id: "{{ (mail_domains.stdout_lines | map('from_json') | selectattr('name', 'equalto', mail_domain) | first).id }}"
+  ansible.builtin.command:
+    argv:
+      - stalwart-cli
+      - create
+      - Account/User
+      - --field
+      - "name={{ item.name }}"
+      - --field
+      - "domainId={{ mail_domain_id }}"
+      - --field
+      - "description={{ item.full_name | default(item.name) }}"
+      - --field
+      - "credentials={{ {'0': {'@type': 'Password', 'secret': lookup('ansible.builtin.vars', 'mail_user_' ~ item.name ~ '_password')}} | to_json }}"
+  environment: "{{ mail_cli_env }}"
+  loop: "{{ mail_users }}"
+  loop_control:
+    label: "{{ item.name }}@{{ mail_domain }}"
+  when: item.name not in (mail_existing.stdout_lines | map('from_json') | map(attribute='name') | list)
+  changed_when: true
+  no_log: true

@@ -1,0 +1,35 @@
+---
+- name: Stack directory
+  ansible.builtin.file:
+    path: "/opt/{{ stack_name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Compose file
+  ansible.builtin.template:
+    src: "{{ stack_compose_template }}"
+    dest: "/opt/{{ stack_name }}/compose.yml"
+    owner: root
+    group: root
+    mode: "0640"
+  register: compose_stack_compose_file
+
+- name: Environment file (secrets, rendered from OpenBao)
+  ansible.builtin.template:
+    src: "{{ stack_env_template }}"
+    dest: "/opt/{{ stack_name }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  register: compose_stack_env_file
+
+- name: Stack up
+  community.docker.docker_compose_v2:
+    project_src: "/opt/{{ stack_name }}"
+    state: present
+    pull: missing
+    recreate: "{{ 'always' if (compose_stack_compose_file.changed or compose_stack_env_file.changed) else 'auto' }}"
+  when: stack_start | default(true)

@@ -1,0 +1,34 @@
+exclude: '^ansible/(\.ansible|collections/ansible_collections)/'
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: detect-private-key
+      - id: check-added-large-files
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+  - repo: local
+    hooks:
+      - id: check-sanitized
+        name: no real environment data
+        entry: scripts/check-sanitized.sh
+        language: system
+        pass_filenames: false
+      - id: tofu-fmt
+        name: tofu fmt
+        entry: tofu fmt -check -recursive tofu/
+        language: system
+        pass_filenames: false
+        files: \.tf$
+      - id: ansible-lint
+        name: ansible-lint
+        entry: bash -c 'cd ansible && ansible-lint'
+        language: system
+        pass_filenames: false
+        files: ^ansible/

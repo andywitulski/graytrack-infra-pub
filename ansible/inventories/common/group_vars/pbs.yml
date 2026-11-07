@@ -1,0 +1,9 @@
+---
+pbs_datastore_name: tank
+pbs_datastore_path: /mnt/datastore/tank
+pbs_repo_key_url: "https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg"
+# Also read by the cluster side (playbooks/backups.yml) through hostvars, so not only role defaults
+pbs_cluster_user: pve@pbs
+pbs_cluster_token: cluster
+nfs_client_mounts:
+  - { src: "{{ lab_nfs_server }}:/tank/backups/pbs", path: /mnt/datastore/tank }

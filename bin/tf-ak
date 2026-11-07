@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# bin/tf-ak <dev|prod> <tofu args...>
+# OpenTofu for the Authentik configuration (tofu/authentik/<env>), with credentials from
+# secrets/authentik-<env>.enc.yaml: AUTHENTIK_URL, AUTHENTIK_TOKEN, TF_VAR_state_passphrase.
+# prod also writes the OIDC client secrets into OpenBao (VAULT_TOKEN from the tf-authentik AppRole).
+# State lives in pg01 (tofu/platform/<env>); bin/lib/platform.sh supplies the backend connection.
+set -euo pipefail
+
+env=${1:?usage: bin/tf-ak <dev|prod> <tofu args...>}
+shift
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+dir="$root/tofu/authentik/$env"
+secrets="$root/secrets/authentik-$env.enc.yaml"
+
+[[ -d $dir ]] || { echo "no such environment: $dir" >&2; exit 1; }
+[[ -f $secrets ]] || { echo "missing secrets file: $secrets" >&2; exit 1; }
+
+# shellcheck source=lib/platform.sh
+source "$root/bin/lib/platform.sh"
+platform_env "$env" "$root"
+if platform_cmd_needs_backend "$@"; then platform_need_backend || exit 1; fi
+
+# OpenBao: a root that writes the client secrets into kv/services/<env>/tf-authentik (tofu/authentik/prod)
+# logs in as the tf-authentik AppRole (bin/bao-approle <env> tf-authentik), which may write that one path.
+if grep -qs '^provider "vault"' "$dir"/*.tf && [[ ${1:-} =~ ^(plan|apply|destroy|refresh|import|console|state)$ ]]; then
+  if bao_approle_login "$env" "$root" tf-authentik; then
+    export VAULT_TOKEN=$BAO_TOKEN
+    unset BAO_TOKEN
+  else
+    echo "no OpenBao login for tf-authentik: bin/tf-bao $env apply, then bin/bao-approle $env tf-authentik" >&2
+    exit 1
+  fi
+fi
+
+if [[ $env == prod && ${1:-} =~ ^(apply|destroy|import|state)$ ]]; then
+  read -r -p "PROD authentik tofu $1. Type 'prod' to continue: " answer
+  [[ $answer == prod ]] || { echo "aborted" >&2; exit 1; }
+fi
+
+args=$(printf '%q ' "$@")
+exec sops exec-env "$secrets" "tofu -chdir=$dir $args"

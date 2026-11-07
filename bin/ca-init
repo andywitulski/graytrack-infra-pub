@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Usage: bin/ca-init <dev|prod>
+# Creates the certificate authority for ca01 (step-ca), once per environment, on the controller. Nothing is
+# generated on ca01 and the root key never reaches it.
+#
+#   root CA            ECDSA P-256, 10 years. Signs the intermediate only. Key and password go to
+#                      secrets/ca-<env>-root.enc.yaml, which no playbook reads (docs/howto/certificate-authority.md).
+#   intermediate CA    signs every X.509 certificate ca01 issues
+#   SSH user CA        signs user certificates (people, ansible, tofu)
+#   SSH host CA        signs host certificates (every node and guest, Forgejo's SSH server)
+#   JWK provisioners   ansible, tofu, hosts: one password each, for bin/ssh-cert and roles/ssh_ca
+#
+# Private material: secrets/ca-<env>.enc.yaml (read by roles/step_ca and bin/ssh-cert). The intermediate
+# and SSH CA keys are encrypted PEMs under their own password (ca_password), not the root's.
+# Public material, commit it: ansible/files/<env>/ca01-{root.pem,intermediate.pem,ssh-user-ca.pub,ssh-host-ca.pub}
+# Nothing secret is printed.
+set -euo pipefail
+
+env=${1:?usage: bin/ca-init <dev|prod>}
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root" # sops finds .sops.yaml from the working directory
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+platform_env "$env" "$root"
+
+ca_secrets="secrets/ca-$env.enc.yaml"
+root_secrets="secrets/ca-$env-root.enc.yaml"
+files="ansible/files/$env"
+provisioners=(ansible tofu hosts)
+
+for f in "$ca_secrets" "$root_secrets"; do
+  [[ -e $f ]] && { echo "$f exists: the CA for $env was created before. Refusing to overwrite it." >&2; exit 1; }
+done
+for t in step jq sops openssl; do
+  command -v "$t" > /dev/null || { echo "missing $t (docs/howto/certificate-authority.md, Controllers)" >&2; exit 1; }
+done
+
+ca_host=${PLATFORM_CA_URL#https://}
+ca_host=${ca_host%%[:/]*}
+domain=$(sed -n 's/^base_domain: *//p' "ansible/inventories/$env/group_vars/all/main.yml" | tr -d '"')
+[[ -n $domain ]] || { echo "no base_domain in ansible/inventories/$env/group_vars/all/main.yml" >&2; exit 1; }
+
+[[ $env == prod ]] && platform_prod_confirm "CA creation for ca01"
+
+umask 077
+work=$(gt_tmpdir) # tmpfs when there is a Linux login session
+trap 'gt_shred_dir "$work"' EXIT
+export STEPPATH="$work/step" NO_COLOR=1
+
+pw() { openssl rand -base64 33 | tr -d '\n' > "$1"; }
+pw "$work/root.pw"
+pw "$work/ca.pw"
+pw "$work/bootstrap.pw"
+for p in "${provisioners[@]}"; do pw "$work/prov-$p.pw"; done
+
+log="$work/step.log"
+run() { "$@" >> "$log" 2>&1 || { cat "$log" >&2; echo "failed: $1 $2 $3" >&2; exit 1; }; }
+
+echo "creating root, intermediate and SSH CA keys for $env ..."
+run step ca init --deployment-type standalone --name "labstack $env" \
+  --dns ca01 --dns "ca01.$domain" --dns "$ca_host" --address :443 \
+  --provisioner bootstrap --password-file "$work/root.pw" --provisioner-password-file "$work/bootstrap.pw" \
+  --ssh --no-db
+
+# The online keys get their own password, so ca01 never holds anything that opens the root key
+for k in intermediate_ca_key ssh_host_ca_key ssh_user_ca_key; do
+  run step crypto change-pass "$STEPPATH/secrets/$k" --password-file "$work/root.pw" \
+    --new-password-file "$work/ca.pw" --force
+done
+
+# Offline edit of the local ca.json. step first asks the CA's admin API; pointing it at a closed local
+# port makes that fail as a network error, which is what selects the offline path (never the real ca01).
+for p in "${provisioners[@]}"; do
+  run step ca provisioner add "$p" --type JWK --create --password-file "$work/prov-$p.pw" \
+    --ca-config "$STEPPATH/config/ca.json" --ca-url https://127.0.0.1:1 --root "$STEPPATH/certs/root_ca.crt"
+done
+
+# Public halves of the JWK provisioners (key, encryptedKey): claims and templates are set by roles/step_ca
+jq '[.authority.provisioners[] | select(.type == "JWK" and .name != "bootstrap") | {(.name): {key, encryptedKey}}] | add' \
+  "$STEPPATH/config/ca.json" > "$work/provisioners.json"
+
+c="$STEPPATH/certs"
+s="$STEPPATH/secrets"
+jq -n \
+  --rawfile ca_password "$work/ca.pw" \
+  --rawfile intermediate_ca_crt "$c/intermediate_ca.crt" \
+  --rawfile intermediate_ca_key "$s/intermediate_ca_key" \
+  --rawfile ssh_host_ca_key "$s/ssh_host_ca_key" \
+  --rawfile ssh_user_ca_key "$s/ssh_user_ca_key" \
+  --slurpfile prov "$work/provisioners.json" \
+  --rawfile p_ansible "$work/prov-ansible.pw" \
+  --rawfile p_tofu "$work/prov-tofu.pw" \
+  --rawfile p_hosts "$work/prov-hosts.pw" \
+  '{
+     ca_password: $ca_password,
+     intermediate_ca_crt: $intermediate_ca_crt,
+     intermediate_ca_key: $intermediate_ca_key,
+     ssh_host_ca_key: $ssh_host_ca_key,
+     ssh_user_ca_key: $ssh_user_ca_key,
+     provisioners: ($prov[0] | with_entries(.value.password = {ansible: $p_ansible, tofu: $p_tofu, hosts: $p_hosts}[.key])),
+     created_at: (now | todate)
+   }' > "$work/ca.json"
+
+jq -n \
+  --rawfile root_ca_crt "$c/root_ca.crt" \
+  --rawfile root_ca_key "$s/root_ca_key" \
+  --rawfile root_ca_password "$work/root.pw" \
+  '{root_ca_crt: $root_ca_crt, root_ca_key: $root_ca_key, root_ca_password: $root_ca_password, created_at: (now | todate)}' \
+  > "$work/root.json"
+
+sops encrypt --filename-override "$ca_secrets" --input-type json --output-type yaml "$work/ca.json" > "$work/ca.enc"
+sops encrypt --filename-override "$root_secrets" --input-type json --output-type yaml "$work/root.json" > "$work/root.enc"
+mv "$work/ca.enc" "$ca_secrets"
+mv "$work/root.enc" "$root_secrets"
+
+mkdir -p "$files"
+umask 022
+cp "$c/root_ca.crt" "$files/ca01-root.pem"
+cp "$c/intermediate_ca.crt" "$files/ca01-intermediate.pem"
+cp "$c/ssh_user_ca_key.pub" "$files/ca01-ssh-user-ca.pub"
+cp "$c/ssh_host_ca_key.pub" "$files/ca01-ssh-host-ca.pub"
+
+fp=$(step certificate fingerprint "$files/ca01-root.pem")
+echo
+echo "CA for $env created. Root fingerprint (SHA-256): $fp"
+echo "  private, sops:   $ca_secrets (ca01 and automation), $root_secrets (root key: never deployed)"
+echo "  public, commit:  $files/ca01-root.pem ca01-intermediate.pem ca01-ssh-user-ca.pub ca01-ssh-host-ca.pub"
+echo "Next: git add those files, then bin/ap $env playbooks/platform.yml --limit step_ca"

@@ -1,0 +1,113 @@
+---
+- name: App name and compose template are set
+  ansible.builtin.assert:
+    that:
+      - compose_app_name | length > 0
+      - compose_app_compose_template | length > 0
+    quiet: true
+
+- name: App directory
+  ansible.builtin.file:
+    path: "{{ compose_app_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# The header line is left as it was before the OpenBao move: changing it would rewrite every .env, and the
+# cutover's check run must show no change at all (the values come from OpenBao now, they are the same).
+- name: Environment file (secrets, rendered from OpenBao)
+  ansible.builtin.copy:
+    dest: "{{ compose_app_dir }}/.env"
+    content: |
+      # Managed by Ansible (labstack-infra). Values come from sops.
+      {% for key, value in compose_app_env | dictsort %}
+      {{ key }}={{ value }}
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Compose file
+  ansible.builtin.template:
+    src: "{{ compose_app_compose_template }}"
+    dest: "{{ compose_app_dir }}/compose.yml"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Stack is up (recreates containers whose config or environment changed)
+  community.docker.docker_compose_v2:
+    project_src: "{{ compose_app_dir }}"
+    files: [compose.yml]
+    state: present
+    pull: "{{ compose_app_pull }}"
+    build: "{{ compose_app_build }}"
+    remove_orphans: "{{ compose_app_remove_orphans | bool }}"
+
+- name: Nightly database dump
+  when: compose_app_pg_dump | length > 0
+  block:
+    - name: Backup directory
+      ansible.builtin.file:
+        path: "{{ compose_app_dir }}/backups"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Dump script
+      ansible.builtin.copy:
+        dest: "/usr/local/sbin/pgdump-{{ compose_app_name }}"
+        content: |
+          #!/bin/sh
+          # Managed by Ansible (labstack-infra). Nightly dump, 14 days kept.
+          set -eu
+          cd {{ compose_app_dir }}
+          out="backups/{{ compose_app_pg_dump.database }}-$(date +%F).dump"
+          docker compose -f compose.yml exec -T {{ compose_app_pg_dump.service }} \
+            pg_dump -U {{ compose_app_pg_dump.user }} -Fc {{ compose_app_pg_dump.database }} > "$out"
+          find backups -name '*.dump' -mtime +14 -delete
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Dump service
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/pgdump-{{ compose_app_name }}.service"
+        content: |
+          [Unit]
+          Description=pg_dump for {{ compose_app_name }}
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/pgdump-{{ compose_app_name }}
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Dump timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/pgdump-{{ compose_app_name }}.timer"
+        content: |
+          [Unit]
+          Description=Nightly pg_dump for {{ compose_app_name }}
+
+          [Timer]
+          OnCalendar=*-*-* 02:30:00
+          RandomizedDelaySec=900
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Dump timer enabled
+      ansible.builtin.systemd_service:
+        name: "pgdump-{{ compose_app_name }}.timer"
+        enabled: true
+        state: started
+        daemon_reload: true

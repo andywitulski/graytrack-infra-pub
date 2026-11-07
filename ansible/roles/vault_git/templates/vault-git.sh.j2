@@ -1,0 +1,11 @@
+#!/bin/sh
+# Managed by Ansible (labstack-infra): commit the Syncthing vault and push it to Forgejo.
+set -eu
+export GIT_DIR={{ vault_git_dir }} GIT_WORK_TREE={{ vault_git_worktree }}
+git add -A
+if ! git diff --cached --quiet; then
+  git commit -q -m "vault: $(date -u +%Y-%m-%dT%H:%MZ) ($(git diff --cached --name-only | wc -l) files)" \
+    --author="{{ vault_git_author }}"
+fi
+# Commits stay local when Forgejo is unreachable and go out on the next run
+git push -q origin {{ vault_git_branch }}

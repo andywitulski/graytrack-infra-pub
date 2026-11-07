@@ -1,0 +1,52 @@
+# Managed by Ansible (labstack-infra). Manual edits will be reverted.
+[global]
+   server role = standalone server
+   workgroup = WORKGROUP
+   server min protocol = SMB3
+   smb encrypt = desired
+   disable netbios = yes
+   smb ports = 445
+   map to guest = never
+   restrict anonymous = 2
+   interfaces = lo {{ samba_interface }}
+   bind interfaces only = yes
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+   logging = file
+   # fruit: macOS Finder metadata in xattrs instead of ._ files; catia maps characters Windows cannot store
+   vfs objects = catia fruit streams_xattr acl_xattr
+   map acl inherit = yes
+   fruit:metadata = stream
+   fruit:veto_appledouble = yes
+   fruit:delete_empty_adfiles = yes
+   fruit:wipe_intentionally_left_blank_rfork = yes
+{% for share in samba_shares %}
+
+[{{ share.name }}]
+{% if share.comment is defined %}
+   comment = {{ share.comment }}
+{% endif %}
+   path = {{ share.path }}
+   valid users = {{ share.valid_users | default(samba_users) | join(' ') }}
+   read only = no
+{% if share.force_user is defined %}
+   force user = {{ share.force_user }}
+{% endif %}
+{% if share.force_group is defined %}
+   force group = {{ share.force_group }}
+{% endif %}
+{% if share.library | default(false) %}
+   force user = {{ samba_library_owner }}
+   force group = {{ samba_library_owner }}
+   create mask = 0664
+   force create mode = 0664
+   directory mask = 2775
+   force directory mode = 2775
+   # Junk a library scanner would pick up as media, or trip over
+   veto files = /._*/.DS_Store/.AppleDouble/Thumbs.db/desktop.ini/$RECYCLE.BIN/
+   delete veto files = yes
+{% else %}
+   create mask = {{ share.create_mask | default('0600') }}
+   directory mask = {{ share.directory_mask | default('0700') }}
+{% endif %}
+{% endfor %}

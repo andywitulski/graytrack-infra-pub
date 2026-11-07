@@ -1,0 +1,13 @@
+# Managed by Ansible (labstack-infra). Manual edits will be reverted (role postgres).
+# The whole file: anything not listed is rejected.
+# Network clients: TLS only, SCRAM only, each database for its owner from its listed addresses.
+# TYPE    DATABASE        USER            ADDRESS                 METHOD
+local     all             postgres                                peer
+local     all             all                                     peer
+{% for db in postgres_databases %}
+{% for client in db.clients %}
+hostssl   {{ '%-15s' | format(db.name) }} {{ '%-15s' | format(db.owner) }} {{ '%-23s' | format(client) }} scram-sha-256
+{% endfor %}
+{% endfor %}
+host      all             all             0.0.0.0/0               reject
+host      all             all             ::/0                    reject

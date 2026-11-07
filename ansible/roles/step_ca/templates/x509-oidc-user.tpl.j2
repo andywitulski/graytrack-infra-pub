@@ -1,0 +1,8 @@
+{#- People: a client certificate for the Authentik username, e-mail as SAN -#}
+{% raw %}{{- if not .Token.preferred_username }}{{ fail "identity token has no preferred_username (Authentik profile scope)" }}{{ end -}}
+{
+  "subject": {"commonName": {{ toJson .Token.preferred_username }}},
+  "sans": [{"type": "email", "value": {{ toJson .Token.email }}}],
+  "keyUsage": ["digitalSignature"],
+  "extKeyUsage": ["clientAuth"]
+}{% endraw %}

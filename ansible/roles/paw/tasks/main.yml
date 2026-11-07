@@ -1,0 +1,282 @@
+---
+- name: Admin key for this workstation is in the repo
+  ansible.builtin.assert:
+    that: paw_user_pubkey_file is file
+    fail_msg: "Add the workstation's public key as {{ paw_user_pubkey_file }} (public key only)."
+    quiet: true
+
+- name: Packages
+  ansible.builtin.apt:
+    name: "{{ paw_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# mise installs age, sops, opentofu and tflint at the versions pinned in the repo's mise.toml
+- name: Mise apt repository (signed)
+  ansible.builtin.deb822_repository:
+    name: mise
+    types: deb
+    uris: https://mise.jdx.dev/deb
+    suites: stable
+    components: main
+    signed_by: https://mise.jdx.dev/gpg-key.pub
+
+- name: Mise
+  ansible.builtin.apt:
+    name: mise
+    state: present
+    update_cache: true
+
+- name: Admin account, without sudo (root work on this host goes through the ansible account)
+  ansible.builtin.user:
+    name: "{{ paw_user }}"
+    shell: /usr/bin/zsh
+    create_home: true
+
+- name: Admin SSH key (exclusive)
+  ansible.posix.authorized_key:
+    user: "{{ paw_user }}"
+    key: "{{ lookup('ansible.builtin.file', paw_user_pubkey_file) }}"
+    exclusive: true
+
+- name: Working directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ paw_user }}"
+    group: "{{ paw_user }}"
+    mode: "0750"
+  loop:
+    - "/home/{{ paw_user }}/src"
+    - "/home/{{ paw_user }}/.local/state/labstack"   # ansible.cfg log_path
+    - "{{ paw_iso_dir }}"
+    - "{{ paw_iso_dir }}/pvedev"
+
+- name: Rootless podman for the admin account (subordinate IDs)
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: "^{{ paw_user }}:"
+    line: "{{ paw_user }}:200000:65536"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [/etc/subuid, /etc/subgid]
+
+- name: Python tools
+  become: true
+  become_user: "{{ paw_user }}"
+  community.general.pipx:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ paw_pipx_packages }}"
+
+- name: OpenBao client library in Ansible's environment (community.hashi_vault lookups run on the controller)
+  become: true
+  become_user: "{{ paw_user }}"
+  community.general.pipx:
+    name: ansible-core
+    state: inject
+    inject_packages: [hvac]
+
+# bin/ssh-cert and bin/ca-init: same pinned release as ca01 (inventories/common, step_cli_*)
+- name: Step CLI package (checksum pinned)
+  ansible.builtin.get_url:
+    url: "{{ step_cli_deb_url }}"
+    dest: "/var/cache/apt/archives/{{ step_cli_deb_url | basename }}"
+    checksum: "sha256:{{ step_cli_deb_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Step CLI installed
+  ansible.builtin.apt:
+    deb: "/var/cache/apt/archives/{{ step_cli_deb_url | basename }}"
+
+# bin/device-cert: the device key lives in the vTPM (ADR-0006)
+- name: Step KMS plugin package (checksum pinned)
+  ansible.builtin.get_url:
+    url: "{{ paw_step_kms_plugin_url }}"
+    dest: "/var/cache/apt/archives/{{ paw_step_kms_plugin_url | basename }}"
+    checksum: "sha256:{{ paw_step_kms_plugin_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Step KMS plugin installed
+  ansible.builtin.apt:
+    deb: "/var/cache/apt/archives/{{ paw_step_kms_plugin_url | basename }}"
+
+# /dev/tpmrm0 is root:tss 0660 (tpm2-tss udev rule). The admin account uses the TPM for its own key only;
+# the resource manager keeps each client's objects apart.
+- name: Admin account may use the TPM resource manager
+  ansible.builtin.user:
+    name: "{{ paw_user }}"
+    groups: [tss]
+    append: true
+
+- name: Dev cluster names (dev's own DNS answers on its network; this host resolves through Management)
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} labstack dev cluster (managed by Ansible)"
+    block: |
+      {% for name, ip in labnode_dev_hosts.items() %}
+      {{ ip }} {{ name }}.{{ labnode_dev_domain }} {{ name }}
+      {% endfor %}
+      {{ labnode_dev_edge_ip }} {{ labnode_dev_service_names | map('regex_replace', '$', '.' ~ labnode_dev_domain) | join(' ') }}
+
+- name: PowerShell package (checksum pinned)
+  ansible.builtin.get_url:
+    url: "{{ paw_powershell_release }}/{{ paw_powershell_deb }}"
+    dest: "/var/cache/apt/archives/{{ paw_powershell_deb }}"
+    checksum: "sha256:{{ paw_powershell_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: PowerShell installed (pwsh)
+  ansible.builtin.apt:
+    deb: "/var/cache/apt/archives/{{ paw_powershell_deb }}"
+
+# ---------------------------------------------------------------- the admin user's toolchain (mise, global)
+- name: Mise configuration directory
+  ansible.builtin.file:
+    path: "/home/{{ paw_user }}/.config/mise"
+    state: directory
+    owner: "{{ paw_user }}"
+    group: "{{ paw_user }}"
+    mode: "0755"
+
+- name: Global tools (Go, Neovim, uv, node, language servers, shell tools)
+  ansible.builtin.copy:
+    dest: "/home/{{ paw_user }}/.config/mise/config.toml"
+    content: |
+      # Managed by Ansible (labstack-infra, roles/paw, paw_user_tools). Edit there, not here.
+      [tools]
+      {% for name, version in paw_user_tools.items() %}
+      {{ name | to_json }} = {{ version | string | to_json }}
+      {% endfor %}
+    owner: "{{ paw_user }}"
+    group: "{{ paw_user }}"
+    mode: "0644"
+
+# Go first: the go: entries (gopls, dlv) are built with it
+- name: Global tools installed
+  become: true
+  become_user: "{{ paw_user }}"
+  ansible.builtin.shell: mise install --yes go && mise install --yes
+  args:
+    chdir: "/home/{{ paw_user }}"
+  environment:
+    MISE_YES: "1"
+  register: paw_mise_global
+  changed_when: "'installed' in paw_mise_global.stderr"
+
+# Browsers, curl, tofu and the step CLI on this workstation then accept the lab's admin UIs and APIs, whose
+# certificates come from ca01 (playbooks/admin-tls.yml). The root is public; its key is offline in sops.
+- name: Ca01's root in the system trust store
+  ansible.builtin.copy:
+    src: "{{ ssh_ca_root_pem }}"
+    dest: /usr/local/share/ca-certificates/labstack-ca01-root.crt
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Rebuild the trust store
+
+- name: User bin directory
+  ansible.builtin.file:
+    path: "/home/{{ paw_user }}/.local/bin"
+    state: directory
+    owner: "{{ paw_user }}"
+    group: "{{ paw_user }}"
+    mode: "0755"
+
+- name: Debian's renamed binaries under their usual names (fd, bat)
+  ansible.builtin.file:
+    src: "{{ item.src }}"
+    dest: "/home/{{ paw_user }}/.local/bin/{{ item.name }}"
+    state: link
+    owner: "{{ paw_user }}"
+    group: "{{ paw_user }}"
+  loop:
+    - { name: fd, src: /usr/bin/fdfind }
+    - { name: bat, src: /usr/bin/batcat }
+
+- name: Repository checked out?
+  ansible.builtin.stat:
+    path: "{{ paw_repo_dir }}/.git"
+  register: paw_repo
+
+- name: Pinned tools from mise.toml (after the repository is cloned)
+  when: paw_repo.stat.exists
+  become: true
+  become_user: "{{ paw_user }}"
+  ansible.builtin.shell: mise trust --yes && mise install
+  args:
+    chdir: "{{ paw_repo_dir }}"
+  register: paw_mise
+  changed_when: "'installed' in paw_mise.stderr"
+
+# Certificates from ca01 renewed without anyone remembering: bin/renew-certs, weekly. Only once the repo is
+# cloned (the unit runs it from there). A failed run leaves the unit failed, which the patch run's health
+# check and Wazuh (the journal) both see: systemctl status labstack-renew-certs.
+- name: Weekly certificate renewal (bin/renew-certs)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - name: labstack-renew-certs.service
+      content: |
+        [Unit]
+        Description=Renew the lab's ca01 certificates (labstack bin/renew-certs)
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        Type=oneshot
+        User={{ paw_user }}
+        WorkingDirectory={{ paw_repo_dir }}
+        Environment=HOME=/home/{{ paw_user }}
+        Environment=PATH=/home/{{ paw_user }}/.local/share/mise/shims:/home/{{ paw_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+        Environment=SOPS_AGE_KEY_FILE=/home/{{ paw_user }}/.config/sops/age/keys.txt
+        ExecStart={{ paw_repo_dir }}/bin/renew-certs
+        TimeoutStartSec=2h
+    - name: labstack-renew-certs.timer
+      content: |
+        [Unit]
+        Description=Weekly renewal of the lab's ca01 certificates (labstack)
+
+        [Timer]
+        OnCalendar={{ paw_renew_certs_on_calendar }}
+        RandomizedDelaySec=30m
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  notify: Reload systemd
+  when: paw_renew_certs | bool and paw_repo.stat.exists | default(false)
+
+- name: Systemd knows the renewal units
+  ansible.builtin.meta: flush_handlers
+
+- name: Renewal timer on
+  ansible.builtin.systemd_service:
+    name: labstack-renew-certs.timer
+    enabled: "{{ paw_renew_certs | bool }}"
+    state: "{{ 'started' if paw_renew_certs | bool else 'stopped' }}"
+  when: paw_repo.stat.exists | default(false)
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Next steps
+  when: not paw_repo.stat.exists
+  ansible.builtin.debug:
+    msg: >-
+      Restore keys and clone the repo as {{ paw_user }} (docs/howto/lab-node.md, step 7), then run
+      this play again for the repo's pinned tools. Dotfiles: clone ~/dotfiles and stow it; the shell needs
+      eval "$(mise activate zsh)" for the tools above.

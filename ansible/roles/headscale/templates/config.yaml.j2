@@ -1,0 +1,97 @@
+# Managed by Ansible (labstack-infra): roles/headscale, docs/howto/vpn.md
+server_url: https://{{ headscale_domain }}
+listen_addr: 0.0.0.0:{{ headscale_listen_port }}
+metrics_listen_addr: 127.0.0.1:9090
+# gRPC (remote CLI) stays on loopback: administration is `headscale ...` on this host
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+# Caddy on edge01 is the only client; its X-Forwarded-For is the real client address
+trusted_proxies: ["{{ lab_edge_addr }}/32"]
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  # random, not sequential: a deleted device's address is not handed straight to the next device to join
+  # (lab access is granted by address, headscale_trusted_devices)
+  allocation: random
+
+# Relays for when two devices cannot reach each other directly: Tailscale's public DERP servers. They only
+# ever see WireGuard ciphertext. The embedded DERP server would need its own public UDP port.
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  paths: []
+  auto_update_enabled: true
+  update_frequency: 3h
+
+disable_check_updates: true
+
+node:
+  expiry: {{ headscale_node_expiry }}
+  ephemeral:
+    inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+tls_cert_path: ""
+tls_key_path: ""
+
+log:
+  level: info
+  format: text
+
+policy:
+  mode: file
+  path: /etc/headscale/policy.hujson
+
+# Split DNS only: the lab's names go to the lab's DNS through the tunnel, everything else stays with the
+# device's own resolver (override_local_dns false, no global nameservers).
+dns:
+  magic_dns: true
+  base_domain: {{ headscale_magic_domain }}
+  override_local_dns: false
+  nameservers:
+    global: []
+    split:
+{% for d in headscale_split_domains %}
+      {{ d }}: ["{{ headscale_dns_server }}"]
+{% endfor %}
+  search_domains: []
+  extra_records: []
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+
+{% if headscale_oidc_ready | bool %}
+# Sign-in through Authentik. Only members of {{ headscale_oidc_group }} get through (Authentik's policy
+# binding, and allowed_groups here as a second check). Waits for Authentik at start: started without it,
+# headscale would fall back to CLI registration until the next restart. systemd retries every 5 s, and
+# connected devices keep their tunnels while the coordination server is down.
+oidc:
+  only_start_if_oidc_is_available: true
+  issuer: https://{{ headscale_idp_domain }}/application/o/{{ headscale_oidc_slug }}/
+  client_id: {{ headscale_oidc_slug }}
+  client_secret_path: /etc/headscale/oidc_client_secret
+  scope: ["openid", "profile", "email"]
+  allowed_groups: ["{{ headscale_oidc_group }}"]
+  pkce:
+    enabled: true
+    method: S256
+{% endif %}
+
+logtail:
+  enabled: false
+taildrop:
+  enabled: false
+auto_update:
+  enabled: false

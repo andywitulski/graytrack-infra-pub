@@ -1,0 +1,197 @@
+---
+# Results: x509_cert_changed, x509_cert_path (leaf plus intermediate), x509_cert_key_path,
+# x509_cert_fingerprint (sha256 of the leaf, as OpenSSL prints it).
+- name: Certificate settings are complete ({{ x509_cert_name }})
+  ansible.builtin.assert:
+    that:
+      - x509_cert_name | length > 0
+      - (x509_cert_dns + x509_cert_ips) | length > 0
+    fail_msg: "x509_cert_name and at least one name or address"
+    quiet: true
+
+- name: Directory ({{ x509_cert_name }})
+  ansible.builtin.file:
+    path: "{{ x509_cert_dir }}"
+    state: directory
+    owner: root
+    group: "{{ x509_cert_group }}"
+    mode: "0750"
+
+- name: Ca01 root on the host (public; checks what signed the certificate)
+  ansible.builtin.copy:
+    src: "{{ ssh_ca_root_pem }}"
+    dest: "{{ x509_cert_dir }}/root.pem"
+    owner: root
+    group: "{{ x509_cert_group }}"
+    mode: "0644"
+
+- name: Private key (made once on this host; never leaves it)
+  ansible.builtin.shell: umask 077 && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "{{ x509_cert_dir }}/key.pem"
+  args:
+    creates: "{{ x509_cert_dir }}/key.pem"
+
+- name: Key readable by the service's group only
+  ansible.builtin.file:
+    path: "{{ x509_cert_dir }}/key.pem"
+    owner: root
+    group: "{{ x509_cert_group }}"
+    mode: "0640"
+  when: not ansible_check_mode
+
+- name: Current certificate ({{ x509_cert_name }})
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd "$DIR" 2>/dev/null && [ -f cert.pem ] && [ -f key.pem ] || { echo state=none; exit 0; }
+    echo state=present
+    root=$(mktemp); trap 'rm -f "$root"' EXIT
+    printf '%s\n' "$ROOT_PEM" > "$root"
+    if openssl verify -CAfile "$root" -untrusted cert.pem cert.pem >/dev/null 2>&1; then echo ca=ok; else echo ca=other; fi
+    if openssl x509 -in cert.pem -noout -checkend "$RENEW" >/dev/null; then echo fresh=yes; else echo fresh=no; fi
+    a=$(openssl x509 -in cert.pem -noout -pubkey | openssl sha256)
+    b=$(openssl pkey -in key.pem -pubout | openssl sha256)
+    if [ "$a" = "$b" ]; then echo key=ok; else echo key=other; fi
+    openssl x509 -in cert.pem -noout -fingerprint -sha256 | sed 's/^.*=/fp=/'
+    openssl x509 -in cert.pem -noout -ext subjectAltName | tail -n +2 | tr ',' '\n' | sed 's/^ *//; /^$/d; s/^/san=/'
+  environment:
+    DIR: "{{ x509_cert_dir }}"
+    RENEW: "{{ (x509_cert_renew_days | int) * 86400 }}"
+    ROOT_PEM: "{{ lookup('ansible.builtin.file', ssh_ca_root_pem) }}"
+  args:
+    executable: /bin/bash
+  register: x509_cert_info
+  changed_when: false
+  check_mode: false
+
+- name: Does it need a new certificate? ({{ x509_cert_name }})
+  vars:
+    x509_kv: "{{ x509_cert_info.stdout_lines | map('split', '=', 1) | list }}"
+    x509_one: "{{ x509_kv | rejectattr(0, 'equalto', 'san') | items2dict(key_name=0, value_name=1) }}"
+    x509_have: "{{ x509_kv | selectattr(0, 'equalto', 'san') | map(attribute=1) | sort }}"
+    x509_want: >-
+      {{ ((x509_cert_dns | map('regex_replace', '^', 'DNS:') | list)
+          + (x509_cert_ips | map('string') | map('regex_replace', '^', 'IP Address:') | list)) | sort }}
+  ansible.builtin.set_fact:
+    x509_cert_reasons: >-
+      {{ (['no certificate'] if x509_one.state == 'none' else [])
+         + (['expires within ' ~ x509_cert_renew_days ~ ' days'] if x509_one.fresh | default('yes') == 'no' else [])
+         + (['not from ca01'] if x509_one.ca | default('ok') == 'other' else [])
+         + (['other key'] if x509_one.key | default('ok') == 'other' else [])
+         + (['other names'] if x509_one.state == 'present' and x509_have != x509_want else []) }}
+    x509_cert_fingerprint: "{{ x509_one.fp | default('') }}"
+
+- name: Sign a new certificate on the controller ({{ x509_cert_reasons | join(', ') }})
+  when:
+    - x509_cert_reasons | length > 0
+    - not ansible_check_mode
+  block:
+    - name: Certificate request (on the host)
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -new
+          - -key
+          - key.pem
+          - -subj
+          - "/CN={{ x509_cert_cn }}"
+          - -addext
+          - "subjectAltName={{ ((x509_cert_dns | map('regex_replace', '^', 'DNS:') | list)
+                                + (x509_cert_ips | map('string') | map('regex_replace', '^', 'IP:') | list)) | join(',') }}"
+          - -out
+          - csr.pem
+        chdir: "{{ x509_cert_dir }}"
+      changed_when: true
+
+    - name: Request to the controller
+      ansible.builtin.slurp:
+        src: "{{ x509_cert_dir }}/csr.pem"
+      register: x509_cert_csr
+
+    - name: Hosts provisioner password (sops, once per play)
+      ansible.builtin.set_fact:
+        x509_cert_hosts_password: "{{ lookup('community.sops.sops', x509_cert_secrets_file, extract='[\"provisioners\"][\"hosts\"][\"password\"]') }}"
+      when: x509_cert_hosts_password is not defined
+      no_log: true
+
+    - name: Work directory (controller)
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: x509-
+      delegate_to: localhost
+      become: false
+      register: x509_cert_tmp
+
+    - name: Sign and fetch
+      delegate_to: localhost
+      become: false
+      block:
+        - name: Inputs (0600)
+          ansible.builtin.copy:
+            dest: "{{ x509_cert_tmp.path }}/{{ item.name }}"
+            content: "{{ item.content }}"
+            mode: "0600"
+          loop:
+            - { name: csr.pem, content: "{{ x509_cert_csr.content | b64decode }}" }
+            - { name: pw, content: "{{ x509_cert_hosts_password }}" }
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: Sign with ca01 (hosts provisioner, {{ x509_cert_duration }})
+          ansible.builtin.command:
+            argv:
+              - step
+              - ca
+              - sign
+              - "{{ x509_cert_tmp.path }}/csr.pem"
+              - "{{ x509_cert_tmp.path }}/cert.pem"
+              - --provisioner
+              - hosts
+              - --provisioner-password-file
+              - "{{ x509_cert_tmp.path }}/pw"
+              - --not-after
+              - "{{ x509_cert_duration }}"
+              - --ca-url
+              - "{{ ssh_ca_url }}"
+              - --root
+              - "{{ ssh_ca_root_pem }}"
+              - --force
+          environment:
+            STEPPATH: "{{ x509_cert_tmp.path }}/step"
+            NO_COLOR: "1"
+          changed_when: true
+
+        - name: Signed certificate (leaf and intermediate)
+          ansible.builtin.slurp:
+            src: "{{ x509_cert_tmp.path }}/cert.pem"
+          register: x509_cert_new
+      always:
+        - name: Remove the work directory
+          ansible.builtin.file:
+            path: "{{ x509_cert_tmp.path }}"
+            state: absent
+          delegate_to: localhost
+          become: false
+
+    - name: Certificate onto the host
+      ansible.builtin.copy:
+        dest: "{{ x509_cert_dir }}/cert.pem"
+        content: "{{ x509_cert_new.content | b64decode }}"
+        owner: root
+        group: "{{ x509_cert_group }}"
+        mode: "0644"
+
+    - name: Fingerprint of the new certificate
+      ansible.builtin.shell: set -o pipefail && openssl x509 -in cert.pem -noout -fingerprint -sha256 | sed 's/^.*=//'
+      args:
+        chdir: "{{ x509_cert_dir }}"
+        executable: /bin/bash
+      register: x509_cert_new_fp
+      changed_when: false
+
+- name: Result ({{ x509_cert_name }})
+  ansible.builtin.set_fact:
+    x509_cert_changed: "{{ x509_cert_reasons | length > 0 }}"
+    x509_cert_path: "{{ x509_cert_dir }}/cert.pem"
+    x509_cert_key_path: "{{ x509_cert_dir }}/key.pem"
+    x509_cert_fingerprint: "{{ x509_cert_new_fp.stdout | default(x509_cert_fingerprint) }}"

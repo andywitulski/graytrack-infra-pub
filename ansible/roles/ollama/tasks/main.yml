@@ -1,0 +1,179 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that: ollama_version is not match('^(<|$)')
+    fail_msg: "Set ollama_version in group_vars/ollama.yml"
+    quiet: true
+
+- name: Archive tooling
+  ansible.builtin.apt:
+    name: zstd
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ollama account
+  ansible.builtin.user:
+    name: ollama
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/ollama
+    create_home: true
+
+- name: Models disk (separate, left out of backups)
+  when: ollama_models_disk_serial | length > 0
+  block:
+    - name: Disks and their serials
+      ansible.builtin.command: lsblk --json --nodeps --output PATH,SERIAL
+      register: ollama_lsblk
+      changed_when: false
+      check_mode: false
+
+    - name: Exactly one disk has the models serial
+      ansible.builtin.assert:
+        that: >-
+          (ollama_lsblk.stdout | from_json).blockdevices
+          | selectattr('serial', 'equalto', ollama_models_disk_serial) | list | length == 1
+        fail_msg: "No disk with serial {{ ollama_models_disk_serial }}: bin/tf {{ lab_env }} apply adds it."
+        quiet: true
+
+    - name: Models disk device
+      ansible.builtin.set_fact:
+        ollama_models_dev: >-
+          {{ (ollama_lsblk.stdout | from_json).blockdevices
+             | selectattr('serial', 'equalto', ollama_models_disk_serial) | map(attribute='path') | first }}
+
+    - name: Is the models directory already a mount?
+      ansible.builtin.command: mountpoint -q {{ ollama_models_dir }}
+      register: ollama_models_mounted
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: What the mount would hide (files; ollama serve leaves empty directories)
+      ansible.builtin.find:
+        paths: "{{ ollama_models_dir }}"
+        file_type: file
+        recurse: true
+      register: ollama_models_existing
+      when: ollama_models_mounted.rc != 0
+
+    - name: Nothing on the system disk would be hidden
+      ansible.builtin.assert:
+        that: ollama_models_mounted.rc == 0 or (ollama_models_existing.matched | default(0)) == 0
+        fail_msg: >-
+          {{ ollama_models_dir }} already holds models on the system disk. systemctl stop ollama,
+          mv {{ ollama_models_dir }} {{ ollama_models_dir }}.old, run again, then move them onto the new disk.
+        quiet: true
+
+    - name: Filesystem on the models disk (only when it has none; never reformats)
+      community.general.filesystem:
+        dev: "{{ ollama_models_dev }}"
+        fstype: ext4
+        opts: -L ollama-models -m 0
+
+    - name: Mounted at the models directory
+      ansible.posix.mount:
+        path: "{{ ollama_models_dir }}"
+        src: LABEL=ollama-models
+        fstype: ext4
+        opts: defaults,noatime,nodev,nosuid,noexec
+        state: mounted
+      notify: Restart ollama
+
+- name: Models directory
+  ansible.builtin.file:
+    path: "{{ ollama_models_dir }}"
+    state: directory
+    owner: ollama
+    group: ollama
+    mode: "0750"
+
+- name: Ollama release directory
+  ansible.builtin.file:
+    path: "/opt/ollama/{{ ollama_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ollama release
+  ansible.builtin.unarchive:
+    src: "https://github.com/ollama/ollama/releases/download/v{{ ollama_version }}/{{ ollama_archive }}"
+    dest: "/opt/ollama/{{ ollama_version }}"
+    remote_src: true
+    creates: "/opt/ollama/{{ ollama_version }}/bin/ollama"
+    owner: root
+    group: root
+  notify: Restart ollama
+
+- name: Current Ollama version
+  ansible.builtin.file:
+    src: "/opt/ollama/{{ ollama_version }}/bin/ollama"
+    dest: /usr/local/bin/ollama
+    state: link
+  notify: Restart ollama
+
+- name: Ollama service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ollama.service
+    content: |
+      [Unit]
+      Description=Ollama
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=ollama
+      Group=ollama
+      Environment=OLLAMA_HOST={{ ollama_listen }}
+      Environment=OLLAMA_MODELS={{ ollama_models_dir }}
+      ExecStart=/usr/local/bin/ollama serve
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart ollama
+
+- name: Ollama running
+  ansible.builtin.systemd_service:
+    name: ollama
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ---------------------------------------------------------------- models
+- name: Ollama answers
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ ollama_listen.split(':')[-1] }}/api/version"
+  register: ollama_up
+  until: ollama_up.status == 200
+  retries: 12
+  delay: 5
+  when: ollama_models | length > 0 and not ansible_check_mode
+
+- name: Models present
+  ansible.builtin.command: ollama list
+  environment:
+    OLLAMA_HOST: "127.0.0.1:{{ ollama_listen.split(':')[-1] }}"
+  register: ollama_list
+  changed_when: false
+  failed_when: ollama_list.rc != 0 and not ansible_check_mode
+  check_mode: false
+  when: ollama_models | length > 0
+
+- name: Pull the missing models (one at a time; never removes any)
+  vars:
+    ollama_have: "{{ (ollama_list.stdout_lines | default([]))[1:] | map('split') | map('first') | list }}"
+    ollama_wanted: "{{ ollama_models | map('regex_replace', '^([^:]+)$', '\\1:latest') | list }}"
+  ansible.builtin.command: ollama pull {{ item }}
+  environment:
+    OLLAMA_HOST: "127.0.0.1:{{ ollama_listen.split(':')[-1] }}"
+  loop: "{{ ollama_wanted | reject('in', ollama_have) | list }}"
+  async: "{{ ollama_pull_timeout }}"
+  poll: 30
+  changed_when: true
+  when: ollama_models | length > 0

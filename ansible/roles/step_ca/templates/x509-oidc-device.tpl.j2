@@ -1,0 +1,9 @@
+{#- Devices (ADR-0006): a client certificate for a registered device of this Authentik user. The key stays on the
+    device; Authentik decides by the public key's hash (tofu device_trust.tf), not by these names. -#}
+{% raw %}{{- if not .Token.preferred_username }}{{ fail "identity token has no preferred_username (Authentik profile scope)" }}{{ end -}}
+{
+  "subject": {"commonName": {{ toJson .Token.preferred_username }}, "organizationalUnit": "labstack-device"},
+  "sans": [{"type": "email", "value": {{ toJson .Token.email }}}],
+  "keyUsage": ["digitalSignature"],
+  "extKeyUsage": ["clientAuth"]
+}{% endraw %}

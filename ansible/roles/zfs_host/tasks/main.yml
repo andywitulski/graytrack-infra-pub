@@ -1,0 +1,104 @@
+---
+# Pool creation is destructive, so it only runs where zfs_host_pool is set (dev builds its pool
+# from blank disks). Prod's pool was created by hand and is never touched here.
+- name: Pool exists?
+  ansible.builtin.command: "zpool list -H -o name {{ zfs_host_pool.name }}"
+  register: zfs_host_pool_list
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: zfs_host_pool is defined
+
+- name: Create the pool from blank disks
+  ansible.builtin.command: >-
+    zpool create -o ashift=12 -O compression=lz4 -O atime=off -O xattr=sa -O acltype=posixacl
+    {{ zfs_host_pool.name }} {{ zfs_host_pool.vdevs }}
+  when:
+    - zfs_host_pool is defined
+    - zfs_host_pool_list.rc != 0
+  changed_when: true
+
+- name: Data identities (no login, no home)
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    gid: "{{ item.id }}"
+    system: false
+  loop: "{{ zfs_data_identities }}"
+
+- name: Data identity users
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    uid: "{{ item.id }}"
+    group: "{{ item.name }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+  loop: "{{ zfs_data_identities }}"
+
+- name: Datasets and properties
+  community.general.zfs:
+    name: "{{ item.name }}"
+    state: present
+    extra_zfs_properties: "{{ item.props }}"
+  loop: "{{ zfs_datasets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Dataset mountpoint ownership (top level only, not recursive)
+  ansible.builtin.file:
+    path: "/{{ item.name }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ zfs_datasets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Cap ZFS ARC (persistent)
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/zfs.conf
+    content: "options zfs zfs_arc_max={{ zfs_arc_max_bytes }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update initramfs
+
+- name: Cap ZFS ARC (live)
+  ansible.builtin.shell: "echo {{ zfs_arc_max_bytes }} > /sys/module/zfs/parameters/zfs_arc_max"
+  changed_when: false
+
+# ---------------------------------------------------------------- snapshots (sanoid)
+- name: Sanoid snapshots
+  when: zfs_host_sanoid | default([]) | length > 0
+  block:
+    - name: Datasets to snapshot exist
+      ansible.builtin.command: "zfs list -H -o name {{ zfs_host_sanoid | map(attribute='dataset') | join(' ') }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Sanoid
+      ansible.builtin.apt:
+        name: sanoid
+        state: present
+
+    - name: Sanoid configuration directory
+      ansible.builtin.file:
+        path: /etc/sanoid
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Sanoid configuration
+      ansible.builtin.template:
+        src: sanoid.conf.j2
+        dest: /etc/sanoid/sanoid.conf
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Sanoid timer (snapshots every 15 minutes, as due; prunes by policy)
+      ansible.builtin.systemd_service:
+        name: sanoid.timer
+        enabled: true
+        state: started

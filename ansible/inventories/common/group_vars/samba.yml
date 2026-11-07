@@ -1,0 +1,14 @@
+---
+samba_users:  # Unix accounts only; passwords set by hand with smbpasswd
+  - alice
+  - bob
+samba_shares:
+  - { name: archive, path: /srv/shares/archive }
+  - { name: alice_priv, path: /srv/shares/private/alice, valid_users: [alice] }
+  - { name: bob_priv, path: /srv/shares/private/bob, valid_users: [bob] }
+  # Drop folders for the media apps (docs/howto/media-drop.md). Written as labdata, the account the apps
+  # use, group-writable with setgid, so nothing ends up owned by a person. macOS and Windows junk is kept out.
+  - { name: audiobooks, path: /srv/library/audiobooks, comment: "Audiobookshelf: Author/Title/files", library: true }
+  - { name: ebooks, path: /srv/library/ebooks, comment: "Audiobookshelf ebooks: Author/Title/book.epub", library: true }
+  - { name: music, path: /srv/library/music, comment: "Navidrome: Artist/Album/tracks", library: true }
+  - { name: media, path: /srv/library/media, comment: "Jellyfin: Movies/ and Shows/", library: true }

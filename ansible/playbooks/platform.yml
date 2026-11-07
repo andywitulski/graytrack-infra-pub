@@ -1,0 +1,47 @@
+---
+# Platform tier (tofu/platform/<env>): pg01, then bao01 and ca01, which store their data on pg01.
+# LXCs start with root keys only; the first run creates the ansible account:
+#   bin/ap prod playbooks/platform.yml --limit platform_guests -e ansible_user=root
+# Then a normal run. Each run writes the host CAs to ansible/files/<env>/{pg01,bao01}-ca.pem: commit them,
+# the clients (bin/lib/platform.sh) pin them. Build order and recovery: docs/howto/platform-tier.md
+# ca01 and the SSH certificates start only after bin/ca-init: docs/howto/certificate-authority.md
+
+- name: Baseline the platform guests
+  hosts: platform_guests
+  become: true
+  roles:
+    - guest_base
+    - cis_baseline
+
+- name: State backend and OpenBao storage
+  hosts: postgres
+  become: true
+  roles:
+    - postgres
+
+- name: Secrets manager
+  hosts: openbao
+  become: true
+  roles:
+    - openbao
+
+- name: Certificate authority (skipped until bin/ca-init)
+  hosts: step_ca
+  become: true
+  tasks:
+    - name: Run the step_ca role
+      ansible.builtin.include_role:
+        name: step_ca
+      when: ssh_ca_enabled | bool
+
+- name: SSH certificates on the platform guests (after ca01 is up)
+  hosts: platform_guests
+  become: true
+  roles:
+    - ssh_ca
+
+- name: SIEM agents on the platform guests
+  hosts: platform_guests:&wazuh_agents
+  become: true
+  roles:
+    - wazuh_agent

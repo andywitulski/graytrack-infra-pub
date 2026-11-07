@@ -1,0 +1,54 @@
+---
+# Mail, stage 1 (docs/howto/mail.md): Stalwart (mailboxes, IMAP, submission, account portal), mbsync
+# (two-way sync with Gmail and Proton), Proton Bridge (Proton's IMAP/SMTP on 127.0.0.1). Native binaries,
+# no containers. Stalwart's settings are code: templates/plan.ndjson.j2, applied with stalwart-cli.
+mail_stalwart_version: ""
+mail_stalwart_sha256: ""
+mail_stalwart_url: >-
+  https://github.com/stalwartlabs/stalwart/releases/download/v{{ mail_stalwart_version }}/stalwart-x86_64-unknown-linux-gnu.tar.gz
+mail_cli_version: ""
+mail_cli_sha256: ""
+mail_cli_url: >-
+  https://github.com/stalwartlabs/cli/releases/download/v{{ mail_cli_version }}/stalwart-cli-x86_64-unknown-linux-gnu.tar.xz
+mail_bridge_version: ""
+mail_bridge_sha256: ""
+mail_bridge_url: >-
+  https://github.com/ProtonMail/proton-bridge/releases/download/v{{ mail_bridge_version }}/protonmail-bridge_{{ mail_bridge_version }}-1_amd64.deb
+
+mail_domain: ""
+mail_hostname: ""
+mail_users: []
+
+mail_config_dir: /etc/stalwart
+mail_data_dir: /var/lib/stalwart
+# Management API: loopback only. Ansible and stalwart-cli use it with the break-glass admin.
+mail_api_url: http://127.0.0.1:8080
+mail_admin_user: admin
+mail_cli_env:
+  STALWART_URL: "{{ mail_api_url }}"
+  STALWART_USER: "{{ mail_admin_user }}"
+  STALWART_PASSWORD: "{{ mail_fallback_admin_secret | default('') }}"
+
+# mbsync: one run per person, this long after the previous run ended
+mail_sync_interval: 3min
+mail_sync_dir: /etc/mailsync
+mail_sync_state_dir: /var/lib/mailsync
+# Standard folders merged across accounts into the mailbox's own top-level ones (one Inbox, Sent, Deleted,
+# Junk in the mail app). Keys: the sync's names for each account's folder; values: the mailbox's folders
+# (Stalwart's special-use folders, which mail apps treat as theirs; Archive is created on first sync).
+# A key left out keeps that folder under the account's tree (<folder>/Sent ...); {} merges nothing.
+mail_merged_folders:
+  INBOX: INBOX
+  Sent: Sent Items
+  Trash: Deleted Items
+  Spam: Junk Mail
+  Archive: Archive
+
+# Proton Bridge (only installed when a proton account is listed)
+mail_bridge_home: /var/lib/protonbridge
+mail_bridge_imap_port: 1143
+mail_bridge_smtp_port: 1025
+
+# Gmail's servers
+mail_gmail_imap_host: imap.gmail.com
+mail_gmail_smtp_host: smtp.gmail.com

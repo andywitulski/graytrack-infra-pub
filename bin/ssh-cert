@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Short-lived certificates from ca01 (step-ca) for this controller and for you.
+#
+#   bin/ssh-cert <env> ansible|tofu [--quiet]   SSH user certificate for an automation account (8 h). New key
+#                                               pair each time; reused while more than 30 min are left.
+#   bin/ssh-cert <env> x509 ansible|tofu [--quiet]
+#                                               X.509 client certificate (8 h), e.g. for OpenBao cert auth
+#   bin/ssh-cert <env> login [<you@example.com>]
+#                                               your own SSH certificate through Authentik (16 h), loaded into
+#                                               your ssh-agent; principal = your Authentik username
+#   bin/ssh-cert <env> ensure [<you@example.com>] [--min <minutes>]
+#                                               login only when the agent holds no certificate from this CA
+#                                               with more than --min minutes left (default 240)
+#   bin/ssh-cert <env> autorenew install|remove [<you@example.com>]
+#                                               run ensure at login and every 2 h (launchd on macOS, a
+#                                               systemd user timer on a Linux desktop). With a live Authentik
+#                                               session the browser round trip completes by itself.
+#   bin/ssh-cert <env> status                   what is issued, what is in your agent, until when
+#   bin/ssh-cert <env> breakglass <account> [hours]
+#                                               ca01 or Authentik down: signs a 1 h certificate on this machine
+#                                               with the SSH user CA key from sops. Logged, alerted in Wazuh.
+#
+# Files: ~/.ssh/labstack/<env>/ (0700). bin/ap and bin/tf call the automation commands themselves.
+# Provisioner passwords come from secrets/ca-<env>.enc.yaml through a 0600 temporary file, never argv.
+set -euo pipefail
+
+env=${1:?usage: bin/ssh-cert <dev|prod> ansible|tofu|x509|login|status|breakglass ...}
+cmd=${2:?usage: bin/ssh-cert <dev|prod> ansible|tofu|x509|login|status|breakglass ...}
+shift 2
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root"
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+platform_env "$env" "$root"
+
+ca_secrets="secrets/ca-$env.enc.yaml"
+dir=$LABSTACK_SSH_DIR
+export STEPPATH="$HOME/.local/share/labstack/step-$env" NO_COLOR=1
+mkdir -p "$STEPPATH" "$dir"
+chmod 700 "$HOME/.ssh/labstack" "$dir"
+reuse_min_s=1800
+lifetime=8h
+host=$(hostname -s)
+
+ssh_ca_ready "$env" "$root" || {
+  echo "SSH CA for $env is not set up here: needs ansible/files/$env/ca01-*.pem/.pub (bin/ca-init) and the step CLI" >&2
+  exit 1
+}
+
+# Certificates in the ssh-agent: key ID, validity, first principal. awk, not sed alternation (\|), which
+# macOS sed does not support. Fails when the agent holds none.
+agent_certs() {
+  local certs line
+  certs=$(ssh-add -L 2> /dev/null | grep -- '-cert-v01@openssh.com') || return 1
+  while read -r line; do
+    printf '%s\n' "$line" | ssh-keygen -L -f /dev/stdin 2> /dev/null | awk '
+      p { sub(/^ */, "  Principal: "); print; p = 0 }
+      /^ *(Key ID|Valid):/ { sub(/^ */, "  "); print }
+      /^ *Principals:/ { p = 1 }'
+  done <<< "$certs"
+}
+
+# Seconds left on the longest-lived certificate in the ssh-agent that this env's user CA signed (0 if none)
+agent_cert_left() {
+  local ca_pub="$root/ansible/files/$env/ca01-ssh-user-ca.pub" fps line info to t now best=0
+  fps=$(ssh-keygen -lf "$ca_pub" 2> /dev/null | awk '{print $2}') || { echo 0; return; }
+  now=$(date +%s)
+  while read -r line; do
+    [[ $line == *-cert-v01@openssh.com* ]] || continue
+    info=$(printf '%s\n' "$line" | ssh-keygen -L -f /dev/stdin 2> /dev/null) || continue
+    grep -qF -f <(printf '%s\n' "$fps") <<< "$info" || continue
+    to=$(sed -n 's/^ *Valid: from .* to \(.*\)$/\1/p' <<< "$info")
+    t=$(gt_epoch "$to") || continue
+    ((t - now > best)) && best=$((t - now))
+  done < <(ssh-add -L 2> /dev/null)
+  echo "$best"
+}
+
+# Seconds an SSH certificate has left (0 when missing or unreadable)
+ssh_left() {
+  local to t
+  [[ -f $1 ]] || { echo 0; return; }
+  to=$(ssh-keygen -L -f "$1" 2> /dev/null | sed -n 's/^ *Valid: from .* to \(.*\)$/\1/p')
+  t=$(gt_epoch "$to") || { echo 0; return; }
+  echo $((t - $(date +%s)))
+}
+
+# Seconds an X.509 certificate has left, to within a minute (bisection over openssl -checkend: no date
+# parsing, so it behaves the same on Linux and macOS). 0 when missing, unreadable or expired.
+x509_left() {
+  local lo=0 hi=$((86400 * 2)) mid
+  [[ -f $1 ]] || { echo 0; return; }
+  openssl x509 -in "$1" -noout -checkend 0 > /dev/null 2>&1 || { echo 0; return; }
+  while ((hi - lo > 60)); do
+    mid=$(((lo + hi) / 2))
+    if openssl x509 -in "$1" -noout -checkend "$mid" > /dev/null 2>&1; then lo=$mid; else hi=$mid; fi
+  done
+  echo $lo
+}
+
+# Runs step quietly (--quiet) or not, always showing its output when it fails
+quiet=false
+run_step() {
+  local log
+  if $quiet; then
+    log=$(gt_tmpfile)
+    if ! step "$@" > "$log" 2>&1; then cat "$log" >&2; rm -f "$log"; return 1; fi
+    rm -f "$log"
+  else
+    step "$@"
+  fi
+}
+
+with_password() { # <provisioner> <command...>: runs the command with PWFILE pointing at the password
+  local prov=$1 pwf rc=0
+  shift
+  pwf=$(gt_tmpfile)
+  if ! sops decrypt --extract "[\"provisioners\"][\"$prov\"][\"password\"]" "$ca_secrets" > "$pwf"; then
+    rm -f "$pwf"
+    return 1
+  fi
+  PWFILE=$pwf "$@" || rc=$?
+  gt_shred "$pwf"
+  return $rc
+}
+
+automation_ssh() {
+  local role=$1 key="$dir/$1" left
+  left=$(ssh_left "$key-cert.pub")
+  if ((left > reuse_min_s)); then
+    $quiet || echo "$role: certificate valid for another $((left / 60)) min ($key-cert.pub)"
+    return 0
+  fi
+  issue() {
+    run_step ssh certificate "$role@$host" "$key.new" --provisioner "$role" --provisioner-password-file "$PWFILE" \
+      --principal "$role" --kty OKP --crv Ed25519 --no-password --insecure --no-agent --not-after "$lifetime" \
+      --ca-url "$PLATFORM_CA_URL" --root "$PLATFORM_CA_ROOT" --force
+  }
+  with_password "$role" issue
+  mv -f "$key.new" "$key"
+  mv -f "$key.new.pub" "$key.pub"
+  mv -f "$key.new-cert.pub" "$key-cert.pub"
+  $quiet || ssh-keygen -L -f "$key-cert.pub" | awk '/^ *(Key ID|Valid|Serial):/ { sub(/^ */, "  "); print }'
+}
+
+automation_x509() {
+  local role=$1 crt="$dir/$1-x509.crt" left
+  left=$(x509_left "$crt")
+  if ((left > reuse_min_s)); then
+    $quiet || echo "$role: X.509 certificate valid for another $((left / 60)) min ($crt)"
+    return 0
+  fi
+  issue() {
+    run_step ca certificate "$role" "$crt.new" "$dir/$role-x509.key.new" --provisioner "$role" \
+      --provisioner-password-file "$PWFILE" --kty EC --crv P-256 --not-after "$lifetime" \
+      --ca-url "$PLATFORM_CA_URL" --root "$PLATFORM_CA_ROOT" --force
+  }
+  with_password "$role" issue
+  chmod 600 "$dir/$role-x509.key.new"
+  mv -f "$dir/$role-x509.key.new" "$dir/$role-x509.key"
+  mv -f "$crt.new" "$crt"
+  $quiet || openssl x509 -in "$crt" -noout -subject -enddate
+}
+
+case "$cmd" in
+  ansible | tofu)
+    [[ ${1:-} == --quiet ]] && quiet=true
+    automation_ssh "$cmd"
+    ;;
+
+  x509)
+    role=${1:?usage: bin/ssh-cert <env> x509 ansible|tofu}
+    [[ $role =~ ^(ansible|tofu)$ ]] || { echo "x509: ansible or tofu" >&2; exit 2; }
+    [[ ${2:-} == --quiet ]] && quiet=true
+    automation_x509 "$role"
+    ;;
+
+  login)
+    identity=${1:-$(git config user.email || true)}
+    [[ -n $identity ]] || { echo "usage: bin/ssh-cert $env login <you@example.com>" >&2; exit 2; }
+    if [[ -n ${SSH_CONNECTION:-} ]]; then
+      echo "Remote session: open the printed URL in your local browser, with this forward in place:"
+      echo "  ssh -L 10000:127.0.0.1:10000 $host   (the Authentik callback goes to 127.0.0.1:10000)"
+      export STEP_OPEN_BROWSER=0
+    fi
+    step ssh login "$identity" --provisioner authentik --ca-url "$PLATFORM_CA_LOGIN_URL" --root "$PLATFORM_CA_ROOT"
+    agent_certs || true
+    ;;
+
+  ensure)
+    identity='' min=240
+    while (($#)); do
+      case $1 in
+        --min) min=${2:?--min needs minutes}; shift 2 ;;
+        *) identity=$1; shift ;;
+      esac
+    done
+    left=$(agent_cert_left)
+    if ((left > min * 60)); then
+      echo "certificate in the agent: $((left / 60)) min left"
+      exit 0
+    fi
+    exec "$0" "$env" login ${identity:+"$identity"}
+    ;;
+
+  autorenew)
+    action=${1:?usage: bin/ssh-cert $env autorenew install|remove [<you@example.com>]}
+    identity=${2:-$(git config user.email || true)}
+    label="net.labstack.ssh-cert-$env"
+    state="$HOME/.local/state/labstack"
+    mkdir -p "$state"
+    if [[ $(uname -s) == Darwin ]]; then
+      plist="$HOME/Library/LaunchAgents/$label.plist"
+      launchctl bootout "gui/$(id -u)/$label" 2> /dev/null || true
+      if [[ $action == remove ]]; then rm -f "$plist"; echo "removed $plist"; exit 0; fi
+      [[ $action == install ]] || { echo "autorenew: install or remove" >&2; exit 2; }
+      mkdir -p "$(dirname "$plist")"
+      # launchd starts jobs with a bare PATH: Homebrew (step) and mise's shims (sops) are added here.
+      # SSH_AUTH_SOCK comes from the login session (launchd's own ssh-agent), shared with every terminal.
+      cat > "$plist" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$root/bin/ssh-cert</string><string>$env</string><string>ensure</string><string>$identity</string>
+  </array>
+  <key>WorkingDirectory</key><string>$root</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>SOPS_AGE_KEY_FILE</key><string>$HOME/.config/sops/age/keys.txt</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>7200</integer>
+  <key>StandardOutPath</key><string>$state/ssh-cert-$env.log</string>
+  <key>StandardErrorPath</key><string>$state/ssh-cert-$env.log</string>
+</dict>
+</plist>
+PLIST
+      launchctl bootstrap "gui/$(id -u)" "$plist"
+      echo "installed $plist (log: $state/ssh-cert-$env.log)"
+    else
+      unit="$HOME/.config/systemd/user/labstack-ssh-cert-$env"
+      if [[ $action == remove ]]; then
+        systemctl --user disable --now "labstack-ssh-cert-$env.timer" 2> /dev/null || true
+        rm -f "$unit.service" "$unit.timer"; systemctl --user daemon-reload; echo "removed"; exit 0
+      fi
+      [[ $action == install ]] || { echo "autorenew: install or remove" >&2; exit 2; }
+      [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] || {
+        echo "No graphical session: the Authentik login needs a browser here. Use bin/ssh-cert $env login." >&2
+        exit 1
+      }
+      mkdir -p "$(dirname "$unit")"
+      printf '%s\n' "[Unit]" "Description=labstack SSH certificate for $identity ($env)" "" "[Service]" "Type=oneshot" \
+        "WorkingDirectory=$root" "ExecStart=$root/bin/ssh-cert $env ensure $identity" \
+        "Environment=PATH=$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" > "$unit.service"
+      printf '%s\n' "[Unit]" "Description=Renew the labstack SSH certificate ($env)" "" "[Timer]" "OnStartupSec=1min" \
+        "OnUnitActiveSec=2h" "" "[Install]" "WantedBy=timers.target" > "$unit.timer"
+      systemctl --user daemon-reload
+      systemctl --user enable --now "labstack-ssh-cert-$env.timer"
+      echo "installed $unit.timer (journalctl --user -u labstack-ssh-cert-$env)"
+    fi
+    ;;
+
+  status)
+    echo "== automation ($dir)"
+    for role in ansible tofu; do
+      f="$dir/$role-cert.pub"
+      if [[ -f $f ]]; then
+        left=$(ssh_left "$f")
+        if ((left > 0)); then echo "  $role ssh:  $((left / 60)) min left"; else echo "  $role ssh:  expired"; fi
+      fi
+      f="$dir/$role-x509.crt"
+      if [[ -f $f ]]; then
+        left=$(x509_left "$f")
+        if ((left > 0)); then echo "  $role x509: $((left / 60)) min left"; else echo "  $role x509: expired"; fi
+      fi
+    done
+    echo "== your ssh-agent"
+    agent_certs || echo "  (no certificates)"
+    ;;
+
+  breakglass)
+    account=${1:?usage: bin/ssh-cert <env> breakglass <account> [hours]}
+    hours=${2:-1}
+    [[ $account =~ ^[a-z_][a-z0-9_-]*$ && $hours =~ ^[1-8]$ ]] || { echo "account name, and 1 to 8 hours" >&2; exit 2; }
+    echo "BREAK-GLASS: signing a $hours h certificate for '$account' on this machine with the $env SSH user CA key."
+    echo "Use it only while ca01 or Authentik cannot issue one. Every login with it raises a Wazuh alert."
+    [[ $env == prod ]] && platform_prod_confirm "break-glass certificate for $account"
+    work=$(gt_tmpdir)
+    trap 'gt_shred_dir "$work"' EXIT
+    umask 077
+    sops decrypt --extract '["ssh_user_ca_key"]' "$ca_secrets" > "$work/ca.enc"
+    sops decrypt --extract '["ca_password"]' "$ca_secrets" > "$work/ca.pw"
+    step crypto change-pass "$work/ca.enc" --password-file "$work/ca.pw" --no-password --insecure \
+      --out "$work/ca" --force > /dev/null 2>&1
+    key="$dir/breakglass-$account"
+    rm -f "$key" "$key.pub" "$key-cert.pub"
+    ssh-keygen -q -t ed25519 -N '' -C "breakglass-$account@$host" -f "$key"
+    id="breakglass:$account@$host:$(date -u +%Y%m%dT%H%M%SZ)"
+    ssh-keygen -q -s "$work/ca" -I "$id" -z "$(date +%s)" -n "$account" -V "-5m:+${hours}h" -O clear -O permit-pty "$key.pub"
+    mkdir -p "$HOME/.local/state/labstack"
+    printf '%s %s %s %s\n' "$(date -u +%FT%TZ)" "$env" "$account" "$id" >> "$HOME/.local/state/labstack/breakglass.log"
+    echo "Issued: $key-cert.pub (key ID $id)"
+    echo "Use:    ssh -o IdentitiesOnly=yes -i $key $account@<host>"
+    echo "        LABSTACK_SSH=breakglass bin/ap $env <playbook>   (account ansible)"
+    ;;
+
+  *)
+    echo "unknown command: $cmd" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,19 @@
+---
+nextcloud_version: ""
+nextcloud_domain: ""
+# The edge proxy, derived from the inventory
+nextcloud_trusted_proxies: "{{ hostvars[groups['caddy'][0]]['ansible_host'] }}"
+nextcloud_data_path: /mnt/nextcloud-data
+nextcloud_http_port: 8080
+nextcloud_idp_domain: "auth.{{ base_domain }}"
+nextcloud_dir: /opt/nextcloud
+# App store apps to install and keep enabled
+nextcloud_apps: []
+# Collabora Online for Nextcloud Office; off while collabora_version is empty
+collabora_version: ""
+collabora_domain: ""
+collabora_http_port: 9980
+collabora_dictionaries: "en_US"
+# Who may call Nextcloud's WOPI endpoints: Collabora's own calls arrive from cloud01 (through Caddy, which
+# forwards the client address), the Docker range covers a call made straight from the container
+collabora_wopi_allowlist: "{{ ansible_host }},172.16.0.0/12"

@@ -1,0 +1,8 @@
+{#- Host certificates: the principals asked for, limited by the authority policy in ca.json -#}
+{% raw %}{
+  "type": "host",
+  "keyId": {{ toJson .KeyID }},
+  "principals": {{ toJson .Principals }},
+  "extensions": {{ toJson .Extensions }},
+  "criticalOptions": {{ toJson .CriticalOptions }}
+}{% endraw %}

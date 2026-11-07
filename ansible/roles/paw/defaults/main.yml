@@ -1,0 +1,89 @@
+---
+# paw01: the admin workstation. Automation installs the tools and the account; it never handles the
+# admin credentials themselves (sops age key, SSH keys, GitHub access): those are restored by hand
+# (docs/howto/lab-node.md), so no automation path can read or replace them.
+paw_user: labadmin
+paw_user_pubkey_file: "{{ playbook_dir }}/../files/pubkeys/{{ paw_user }}.pub"   # the workstation's key
+paw_repo_dir: "/home/{{ paw_user }}/src/labstack-infra"
+paw_iso_dir: /srv/iso
+paw_packages:
+  - git
+  - zsh
+  - tmux
+  - curl
+  - rsync
+  - unzip
+  - jq
+  - dnsutils
+  - tcpdump
+  - pipx
+  - podman          # builds the dev cluster's install ISOs (tools/pve-ais)
+  - openssh-client
+  # Dotfiles and shell (GNU Stow layout in ~/dotfiles; zsh is the login shell)
+  - stow
+  - zsh-autosuggestions
+  - zsh-syntax-highlighting
+  - fzf
+  - ripgrep
+  - fd-find         # binary is fdfind; linked to ~/.local/bin/fd below
+  - bat             # binary is batcat; linked to ~/.local/bin/bat below
+  - tree
+  - htop
+  # Toolchains the editors and language servers build against
+  - build-essential # gcc and make: tree-sitter parsers, cgo, Python wheels without binaries
+  - clang
+  - clangd          # C++ language server (Zed, Neovim)
+  - gdb
+  - cmake
+  - pkg-config
+  - python3-dev
+  - libssl-dev
+  - shellcheck      # Bash: also what Zed's and Neovim's bash language server call
+  - tpm2-tools      # the vTPM (ADR-0006): bin/device-cert keeps the device key there
+# Python tools in the admin user's pipx (the rest come from mise.toml in the repo)
+paw_pipx_packages: [ansible-core, ansible-lint, yamllint, pre-commit]
+
+# The admin user's own toolchain, through mise (~/.config/mise/config.toml, global): the same tools and
+# versions on the admin workstation and paw01, newer than Debian's, no sudo needed to update (mise upgrade).
+# "latest" resolves when the role runs; pin a version here to hold one. Project pins stay in each
+# repo's mise.toml (labstack-infra: age, sops, opentofu, tflint).
+paw_user_tools:
+  go: latest
+  neovim: latest
+  uv: latest            # Python: uv manages interpreters and venvs (uv python install, uv tool install)
+  node: lts             # many language servers (Neovim's Mason, pyright) run on node
+  ruff: latest
+  shfmt: latest
+  golangci-lint: latest
+  "go:golang.org/x/tools/gopls": latest
+  "go:github.com/go-delve/delve/cmd/dlv": latest
+  tree-sitter: latest
+  starship: latest
+  zoxide: latest
+  eza: latest
+  delta: latest
+  gh: latest
+
+# PowerShell 7 (LTS) for the admin user's scripts: Microsoft's universal .deb from the GitHub release, its
+# SHA-256 pinned here (no extra apt repository). Supported on Debian 13 until 2030-06-30
+# (learn.microsoft.com/powershell/scripting/install/install-debian). The release's hashes.sha256 is UTF-16,
+# which get_url cannot read; to upgrade, take the new hash from it:
+#   curl -fsSL <release>/hashes.sha256 | iconv -f UTF-16 -t UTF-8 | command grep deb_amd64
+# renovate: datasource=github-releases depName=PowerShell/PowerShell
+paw_powershell_version: "7.6.6"
+paw_powershell_sha256: "9585f38ab5a026c3fc0995486e26e12050777960fef47a22dca98b577c5d27a7"
+paw_powershell_release: "https://github.com/PowerShell/PowerShell/releases/download/v{{ paw_powershell_version }}"
+paw_powershell_deb: "powershell_{{ paw_powershell_version }}-1.deb_amd64.deb"
+
+# bin/renew-certs from this workstation, weekly, as the admin account (repo, age key and SSH keys are
+# here). Off with paw_renew_certs: false, e.g. while the admin workstation is the controller that does it.
+paw_renew_certs: true
+paw_renew_certs_on_calendar: "Mon *-*-* 04:30:00"
+
+# step-kms-plugin: the device certificate's key is created in and used from the vTPM (tpmkms), never on disk
+# (bin/device-cert, ADR-0006). Release .deb, SHA-256 from the release's checksums.txt.
+# renovate: datasource=github-releases depName=smallstep/step-kms-plugin
+paw_step_kms_plugin_version: "0.17.0"
+paw_step_kms_plugin_sha256: "897bf57c09763784bf7ae54eac63430e6c6bc2a492175cb60fc25e5dacd41f05"
+paw_step_kms_plugin_release: "https://github.com/smallstep/step-kms-plugin/releases/download/v{{ paw_step_kms_plugin_version }}"
+paw_step_kms_plugin_url: "{{ paw_step_kms_plugin_release }}/step-kms-plugin_{{ paw_step_kms_plugin_version }}-1_amd64.deb"

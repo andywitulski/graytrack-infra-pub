@@ -1,0 +1,9 @@
+---
+# Fleet: open-source device management (docs/howto/mdm.md). Apple MDM for iPhones and iPads (and Macs,
+# Windows, Linux, Android later), configuration as code in fleet/ (bin/fleet-gitops).
+fleet_version: ""
+fleet_domain: ""
+fleet_dir: /opt/fleet
+fleet_http_port: 8280
+# Caddy on edge01 is the only client; Fleet takes the client address from its X-Forwarded-For (rate limits)
+fleet_trusted_proxies: "{{ lab_edge_addr }}"

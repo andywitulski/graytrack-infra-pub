@@ -1,0 +1,23 @@
+---
+# The nested dev cluster's hardware: three Proxmox VMs shaped like prod's three nodes.
+#   pvedev1 ~ pve01 (edge, identity, git, SIEM)
+#   pvedev2 ~ pve02   (Nextcloud, PBS)
+#   pvedev3 ~ pve03  (ZFS "tank" on four data disks, NFS, the data containers)
+# Single source: playbooks/labnode-dev-isos.yml builds the install ISOs from it and tofu/envs/labnode
+# reads this file (yamldecode) to create the VMs. MACs must match inventories/dev/host_vars/pvedevN.yml.
+# Memory/disk changes only reach existing VMs through a rebuild.
+pve_iso: proxmox-ve_9.2-1.iso
+pvedev_iso_dir: /srv/iso   # on paw01: source ISO here, built ISOs in pvedev/
+pvedev_vcpus: 4
+pvedev_data_disk_gib: 32
+pvedev_vm_id_base: 5100     # pvedev1 = 5101
+pvedev_nodes:
+  - { name: pvedev1, mac: "00:00:5e:00:53:01", storage_mac: "00:00:5e:00:53:02", ip: __DEV_NET__.11, memory_gib: 14, disk_gib: 160, data_disks: [] }
+  - { name: pvedev2, mac: "00:00:5e:00:53:03", storage_mac: "00:00:5e:00:53:04", ip: __DEV_NET__.12, memory_gib: 8, disk_gib: 96, data_disks: [] }
+  - name: pvedev3
+    mac: "00:00:5e:00:53:05"
+    storage_mac: "00:00:5e:00:53:06"
+    ip: __DEV_NET__.13
+    memory_gib: 8
+    disk_gib: 64
+    data_disks: [tank0, tank1, tank2, tank3]

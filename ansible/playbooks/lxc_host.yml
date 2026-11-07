@@ -1,0 +1,8 @@
+---
+# Root-only container settings (bind mounts, ID maps, devices), from each node's host_vars.
+# Run after OpenTofu creates the containers; changed containers are restarted.
+- name: Container host settings
+  hosts: pve_nodes
+  become: true
+  roles:
+    - pve_lxc_host

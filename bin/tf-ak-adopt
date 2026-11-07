@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# Usage: bin/tf-ak-adopt <dev|prod>            one adoption round
+#        bin/tf-ak-adopt <dev|prod> --dedupe   remove unmanaged copies of managed policy bindings
+# Adopts a running Authentik into tofu/authentik/<env> after its state was lost. Each round plans from the
+# current state, looks every planned "create" up in Authentik by its natural key (name, slug, username,
+# domain; bindings by target and order plus their references), writes one import block per object that
+# already exists to tofu/authentik/<env>/imports.tf, and plans the round into adopt.plan.
+#
+# A binding can only be matched once the object it hangs on (flow, application) is in state, so the first
+# round imports the objects and plans only those (-target), the next one the bindings. Repeat
+#   bin/tf-ak-adopt <env>
+#   bin/tf-ak <env> apply adopt.plan && rm tofu/authentik/<env>/imports.tf
+# until it reports nothing left to import; then review the final plan it names. Read
+# docs/howto/platform-tier.md (Authentik) before the first round: the bind password is imported from sops first.
+#
+# --dedupe: Authentik allows identical group and user policy bindings (only policy bindings are unique).
+# An apply that created bindings which already existed leaves two of each; access is unchanged, but the
+# unmanaged copy is clutter. Lists every binding identical to one in state and deletes it after a "yes".
+#
+# Never imported: authentik_rbac_permission_role (its read needs the role, which an import cannot
+# set; creating it assigns the permission, which is idempotent), random_password and tls_* (handled in
+# the runbook). The API token comes from secrets/authentik-<env>.enc.yaml and is never printed.
+set -euo pipefail
+
+# Internal: dump the objects that already exist, run under sops exec-env (AUTHENTIK_URL, AUTHENTIK_TOKEN)
+# Internal: delete policy bindings by pk, run under sops exec-env
+if [[ ${1:-} == --delete-bindings ]]; then
+  shift
+  for pk in "$@"; do
+    curl -fsS -X DELETE -H "Authorization: Bearer $AUTHENTIK_TOKEN" "${AUTHENTIK_URL%/}/api/v3/policies/bindings/$pk/" ||
+      { echo "delete $pk failed" >&2; exit 1; }
+    echo "deleted $pk"
+  done
+  exit 0
+fi
+
+if [[ ${1:-} == --inventory ]]; then
+  base="${AUTHENTIK_URL%/}/api/v3"
+  get() {
+    local sep='?' r
+    [[ $1 == *\?* ]] && sep='&'
+    r=$(curl -fsS -H "Authorization: Bearer $AUTHENTIK_TOKEN" "$base/$1${sep}page_size=1000") ||
+      { echo "Authentik API: GET $1 failed" >&2; exit 1; }
+    printf '%s' "$r" | jq -e '.pagination.next == 0' > /dev/null ||
+      { echo "Authentik API: more than 1000 objects at $1, paging not implemented" >&2; exit 1; }
+    printf '%s' "$r" | jq -c '.results'
+  }
+  jq -n \
+    --argjson groups "$(get core/groups/?include_users=false | jq -c 'map({pk, name})')" \
+    --argjson users "$(get core/users/ | jq -c 'map({pk, username})')" \
+    --argjson brands "$(get core/brands/ | jq -c 'map({pk: .brand_uuid, domain})')" \
+    --argjson apps "$(get core/applications/?superuser_full_list=true | jq -c 'map({pk: .slug, slug})')" \
+    --argjson flows "$(get flows/instances/ | jq -c 'map({pk: .slug, slug})')" \
+    --argjson keypairs "$(get crypto/certificatekeypairs/ | jq -c 'map({pk, name})')" \
+    --argjson roles "$(get rbac/roles/ | jq -c 'map({pk, name})')" \
+    --argjson stages "$(get stages/all/ | jq -c 'map({pk, name})')" \
+    --argjson policies "$(get policies/all/ | jq -c 'map({pk, name})')" \
+    --argjson mappings "$(get propertymappings/all/ | jq -c 'map({pk, name})')" \
+    --argjson providers "$(get providers/all/ | jq -c 'map({pk: (.pk | tostring), name})')" \
+    --argjson outposts "$(get outposts/instances/ | jq -c 'map({pk, name})')" \
+    --argjson flow_bindings "$(get flows/bindings/ | jq -c 'map({pk, target, order, stage})')" \
+    --argjson policy_bindings "$(get policies/bindings/ | jq -c 'map({pk, target, order, group, user, policy})')" \
+    '$ARGS.named'
+  exit 0
+fi
+
+env=${1:?usage: bin/tf-ak-adopt <dev|prod> [plan file]}
+mode=${2:-round}
+plan=adopt.plan
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+dir="$root/tofu/authentik/$env"
+out="$dir/imports.tf"
+secrets="$root/secrets/authentik-$env.enc.yaml"
+
+case "$mode" in round | --dedupe) ;; *) echo "unknown option: $mode" >&2; exit 2 ;; esac
+[[ -e $out ]] && { echo "$out exists: apply adopt.plan and delete it first" >&2; exit 1; }
+for t in jq curl sops; do command -v "$t" > /dev/null || { echo "missing $t" >&2; exit 1; }; done
+
+# Test hooks: AK_ADOPT_PLAN_JSON, AK_ADOPT_STATE_JSON and AK_ADOPT_INVENTORY replace tofu and the API with files.
+inventory() {
+  if [[ -n ${AK_ADOPT_INVENTORY:-} ]]; then cat "$AK_ADOPT_INVENTORY"
+  else sops exec-env "$secrets" "$(printf '%q' "$0") --inventory"; fi
+}
+
+if [[ $mode == --dedupe ]]; then
+  if [[ -n ${AK_ADOPT_STATE_JSON:-} ]]; then state=$(cat "$AK_ADOPT_STATE_JSON")
+  else state=$("$root/bin/tf-ak" "$env" show -json); fi
+  inv=$(inventory)
+  dups=$(printf '%s' "$state" | jq -c --argjson inv "$inv" '
+    [.. | objects | select(.type? == "authentik_policy_binding" and .mode? == "managed") | .values.id] as $managed
+    | [$inv.policy_bindings[] | select(.pk as $p | $managed | index($p))] as $m
+    | [$inv.policy_bindings[]
+       | select(.pk as $p | ($managed | index($p)) | not)
+       | . as $b
+       | select(any($m[]; .target == $b.target and .order == $b.order and .group == $b.group
+                          and .user == $b.user and .policy == $b.policy))]')
+  n=$(printf '%s' "$dups" | jq length)
+  if ((n == 0)); then echo "No unmanaged copies of managed policy bindings."; exit 0; fi
+  echo "$n unmanaged bindings identical to one in state (target, order, group, user, policy):"
+  printf '%s' "$dups" | jq -r '.[] | "  \(.pk)  target \(.target) order \(.order) group \(.group // "-") user \(.user // "-")"'
+  [[ $env == prod ]] && { read -r -p "Delete these $n from Authentik? Type 'yes': " ok; [[ $ok == yes ]] || { echo aborted; exit 1; }; }
+  # shellcheck disable=SC2046
+  sops exec-env "$secrets" "$(printf '%q ' "$0" --delete-bindings $(printf '%s' "$dups" | jq -r '.[].pk'))"
+  exit 0
+fi
+
+# Always a fresh plan from the current state: a plan file left by an earlier round is stale (and a
+# targeted one holds none of the bindings).
+if [[ -n ${AK_ADOPT_PLAN_JSON:-} ]]; then json=$(cat "$AK_ADOPT_PLAN_JSON")
+else
+  echo "Planning from the current state ..."
+  "$root/bin/tf-ak" "$env" plan -out="$plan" > /dev/null
+  json=$("$root/bin/tf-ak" "$env" show -json "$plan")
+fi
+inv=$(inventory)
+
+# One line per planned create: {address, verdict: import|new|defer|skip, id, note}
+verdicts=$(printf '%s' "$json" | jq -c --argjson inv "$inv" '
+  def one($c; $what):
+    if ($c | length) == 1 then {verdict: "import", id: $c[0].pk}
+    elif ($c | length) == 0 then {verdict: "new"}
+    else error("\($what): \($c | length) matches in Authentik, cannot pick one") end;
+  def by($list; $key; $val): [$inv[$list][] | select(.[$key] == $val)];
+  # A binding matches on target and order, plus every reference it sets (stage; group, user or policy).
+  # Unknown values (the referenced object is created or imported in this same plan) defer it.
+  def binding($list; $fields):
+    . as $rc | .change.after as $a | (.change.after_unknown // {}) as $u
+    | if ($u.target // false) or $a.target == null then {verdict: "defer", note: "target not in state yet"}
+      elif any($fields[]; $u[.] // false) then {verdict: "defer", note: "a referenced object is not in state yet"}
+      else one([$inv[$list][] | select(.target == $a.target and .order == $a.order)
+                | . as $b | select(all($fields[]; ($a[.] == null) or (($a[.] | tostring) == ($b[.] | tostring))))];
+               $rc.address)
+      end;
+  .resource_changes[]
+  | select(.mode == "managed" and .change.actions == ["create"])
+  | . as $rc | .type as $t | .change.after as $a
+  | {address}
+    + if $t == "authentik_group" then one(by("groups"; "name"; $a.name); .address)
+      elif $t == "authentik_user" then one(by("users"; "username"; $a.username); .address)
+      elif $t == "authentik_brand" then one(by("brands"; "domain"; $a.domain); .address)
+      elif $t == "authentik_application" then one(by("apps"; "slug"; $a.slug); .address)
+      elif $t == "authentik_flow" then one(by("flows"; "slug"; $a.slug); .address)
+      elif $t == "authentik_certificate_key_pair" then one(by("keypairs"; "name"; $a.name); .address)
+      elif $t == "authentik_rbac_role" then one(by("roles"; "name"; $a.name); .address)
+      elif ($t | startswith("authentik_stage_")) then one(by("stages"; "name"; $a.name); .address)
+      elif ($t | startswith("authentik_policy_")) and $t != "authentik_policy_binding" then one(by("policies"; "name"; $a.name); .address)
+      elif ($t | startswith("authentik_property_mapping_")) then one(by("mappings"; "name"; $a.name); .address)
+      elif ($t | startswith("authentik_provider_")) then one(by("providers"; "name"; $a.name); .address)
+      elif $t == "authentik_outpost" then one(by("outposts"; "name"; $a.name); .address)
+      elif $t == "authentik_flow_stage_binding" then $rc | binding("flow_bindings"; ["stage"])
+      elif $t == "authentik_policy_binding" then $rc | binding("policy_bindings"; ["group", "user", "policy"])
+      elif $t == "authentik_rbac_permission_role" then {verdict: "new", note: "never imported; creating it assigns the permission again (idempotent)"}
+      elif $t == "random_password" or ($t | startswith("tls_")) then {verdict: "skip", note: "not imported; see the runbook"}
+      else error("no lookup rule for \($t) (\(.address)): add one to bin/tf-ak-adopt") end')
+
+# Import blocks for everything that exists
+{
+  echo "# Written by bin/tf-ak-adopt $env from $plan on $(date -u +%Y-%m-%dT%H:%MZ). Delete once applied (gitignored)."
+  printf '%s\n' "$verdicts" | jq -r 'select(.verdict == "import") | "\nimport {\n  to = \(.address)\n  id = \(.id | tostring | tojson)\n}"'
+} > "$out"
+
+count() { printf '%s\n' "$verdicts" | jq -s --arg v "$1" '[.[] | select(.verdict == $v)] | length'; }
+list() { printf '%s\n' "$verdicts" | jq -r --arg v "$1" 'select(.verdict == $v) | "  \(.address)\(if .note then "  (\(.note))" else "" end)"'; }
+n_import=$(count import)
+n_defer=$(count defer)
+
+echo "import ($n_import), in ${out#"$root"/}:"
+list import
+echo "new: not in Authentik, the final apply creates them ($(count new)):"
+list new
+echo "later round ($n_defer):"
+list defer
+echo "not handled here:"
+list skip
+
+if ((n_import == 0)); then
+  rm -f "$out"
+  echo
+  # Every existing object is in state now, so a binding still deferred points at something only the final
+  # apply creates: it cannot exist yet either.
+  ((n_defer > 0)) && echo "Nothing left to import. The \"later round\" bindings point at new objects, so they are new too."
+  ((n_defer == 0)) && echo "Nothing left to import."
+  echo "Final plan, in $plan: only the \"new\" objects above may be created, nothing replaced or destroyed."
+  echo "  bin/tf-ak $env show $plan | grep -E '^  # |^Plan:'     then: bin/tf-ak $env apply $plan"
+  exit 0
+fi
+
+# Plan this round. While bindings are deferred, plan only what is imported (-target), so nothing whose
+# match could not be checked yet gets created.
+args=(plan -out="$plan")
+if ((n_defer > 0)); then
+  while IFS= read -r a; do args+=("-target=$a"); done < <(printf '%s\n' "$verdicts" | jq -r 'select(.verdict == "import") | .address')
+fi
+echo
+echo "Planning this round into $plan ..."
+"$root/bin/tf-ak" "$env" "${args[@]}"
+echo
+echo "Review: \"will be imported\", in-place updates only, nothing replaced or destroyed. Then:"
+echo "  bin/tf-ak $env apply $plan && rm ${out#"$root"/}"
+((n_defer > 0)) && echo "and run bin/tf-ak-adopt $env again for the next round."
+exit 0

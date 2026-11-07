@@ -1,0 +1,24 @@
+---
+# A private CA per host, and a server certificate it signs, for services reached by IP on the lab networks
+# (pg01, bao01). Clients pin the CA, which is fetched into the repo (ansible/files/<env>/<host>-ca.pem) and
+# committed: it is public. The CA key never leaves the host.
+#
+# Callers need a handler with `listen: host_tls certificate changed` (reload the service on a new cert).
+#
+# Why per host and not Caddy's public certificates: these services are not behind edge01 and must keep
+# working when it, the DNS provider or the internet is down.
+host_tls_dir: /etc/labstack/tls
+# Group that may read the server key (the service's own group: postgres, openbao)
+host_tls_group: root
+host_tls_cn: "{{ inventory_hostname }}"
+host_tls_sans:
+  - "DNS:{{ inventory_hostname }}"
+  - "DNS:{{ inventory_hostname }}.{{ base_domain }}"
+  - "IP:{{ ansible_host }}"
+  - "DNS:localhost"
+  - "IP:127.0.0.1"
+host_tls_ca_days: 3650
+host_tls_cert_days: 825
+# The server certificate is renewed by the next run inside this window (or when the SANs change)
+host_tls_renew_days: 60
+host_tls_ca_fetch_dest: "{{ playbook_dir }}/../files/{{ lab_env }}/{{ inventory_hostname }}-ca.pem"

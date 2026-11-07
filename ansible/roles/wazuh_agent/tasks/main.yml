@@ -1,0 +1,185 @@
+---
+# Wazuh agent: repository, pinned and held package, manager address, password-protected enrollment.
+- name: Not on the manager itself (its container monitors the host)
+  ansible.builtin.meta: end_host
+  when: inventory_hostname in groups['wazuh_manager'] | default([]) # labnode has no manager of its own
+
+- name: Enrollment password is present
+  ansible.builtin.assert:
+    that: wazuh_enrollment_password | default('') | length >= 12
+    fail_msg: "No wazuh_enrollment_password: bin/gen-service-secrets {{ lab_env }}"
+    quiet: true
+  no_log: true
+
+- name: Repository tooling
+  ansible.builtin.apt:
+    name: [python3-debian, ca-certificates]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 600
+
+# A hand-added one-line source for the same repository would conflict (different Signed-By)
+- name: Remove a manually added Wazuh source and key
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/wazuh.list
+    - /usr/share/keyrings/wazuh.asc
+    - /usr/share/keyrings/wazuh.gpg
+
+- name: Wazuh repository (key fetched as-is; Debian 13 apt verifies armored keys without gpg)
+  ansible.builtin.deb822_repository:
+    name: wazuh
+    types: deb
+    uris: https://packages.wazuh.com/4.x/apt/
+    suites: stable
+    components: main
+    signed_by: "{{ wazuh_agent_repo_key_url }}"
+
+- name: Agent, pinned to the manager's version
+  ansible.builtin.apt:
+    name: "wazuh-agent={{ wazuh_agent_version }}"
+    state: present
+    update_cache: true
+    lock_timeout: 600
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Hold the agent (never newer than the manager)
+  ansible.builtin.dpkg_selections:
+    name: wazuh-agent
+    selection: hold
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Manager address
+  ansible.builtin.replace:
+    path: /var/ossec/etc/ossec.conf
+    regexp: '(<server>\s*<address>)[^<]*(</address>)'
+    replace: '\g<1>{{ wazuh_agent_manager }}\g<2>'
+  notify: Restart wazuh agent
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Enrollment password
+  ansible.builtin.copy:
+    dest: /var/ossec/etc/authd.pass
+    content: "{{ wazuh_enrollment_password }}\n"
+    owner: root
+    group: wazuh
+    mode: "0640"
+  no_log: true
+  notify: Restart wazuh agent
+  ignore_errors: "{{ ansible_check_mode }}"
+
+# Debian 13 logs only to the journal (no /var/log/syslog). One UNFILTERED journald input collects all
+# of it, including the containers on Docker's journald log driver (Caddy, Authentik). Never add a
+# filtered journald input: once any journald input has a filter, Wazuh ignores the unfiltered ones,
+# which would silently drop sshd, sudo and everything else.
+- name: Read the agent's journald inputs
+  check_mode: false
+  ansible.builtin.slurp:
+    src: /var/ossec/etc/ossec.conf
+  register: wazuh_agent_conf
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Classic syslog file present?
+  ansible.builtin.stat:
+    path: /var/log/syslog
+  register: wazuh_agent_syslog_file
+
+- name: No filtered journald input (it would switch off the unfiltered one)
+  ansible.builtin.assert:
+    that: wazuh_agent_conf.content | default('') | b64decode is not search('<filter\\s+field=')
+    fail_msg: >-
+      /var/ossec/etc/ossec.conf on {{ inventory_hostname }} has a filtered journald input. With any filter
+      present, Wazuh drops every unfiltered journald input. Remove the filter or collect the rest explicitly.
+    quiet: true
+  when: wazuh_agent_conf.content is defined
+
+- name: Journald input (the whole journal, including journald-logged containers)
+  ansible.builtin.blockinfile:
+    path: /var/ossec/etc/ossec.conf
+    marker: "<!-- {mark} labstack journald input (managed by Ansible) -->"
+    block: |
+      <ossec_config>
+        <localfile>
+          <log_format>journald</log_format>
+          <location>journald</location>
+        </localfile>
+      </ossec_config>
+  when:
+    - wazuh_agent_conf.content is defined
+    - wazuh_agent_conf.content | b64decode is not search('<location>journald</location>')
+    - not wazuh_agent_syslog_file.stat.exists
+  notify: Restart wazuh agent
+
+- name: Extra log files present on this host
+  ansible.builtin.stat:
+    path: "{{ item.location }}"
+  loop: "{{ wazuh_agent_extra_logfiles }}"
+  loop_control:
+    label: "{{ item.location }}"
+  register: wazuh_agent_extra_stat
+
+- name: Agent reads them (once; a second input for the same file would double every event)
+  ansible.builtin.blockinfile:
+    path: /var/ossec/etc/ossec.conf
+    marker: "<!-- {mark} labstack input {{ item.item.location }} (managed by Ansible) -->"
+    block: |
+      <ossec_config>
+        <localfile>
+          <log_format>{{ item.item.format }}</log_format>
+          <location>{{ item.item.location }}</location>
+        </localfile>
+      </ossec_config>
+  loop: "{{ wazuh_agent_extra_stat.results }}"
+  loop_control:
+    label: "{{ item.item.location }}"
+  when:
+    - item.stat.exists
+    - wazuh_agent_conf.content is defined
+    - >-
+      (wazuh_agent_conf.content | b64decode is not search('<location>' ~ item.item.location ~ '</location>'))
+      or (wazuh_agent_conf.content | b64decode is search('labstack input ' ~ item.item.location))
+  notify: Restart wazuh agent
+
+- name: Proxmox cluster filesystem present
+  ansible.builtin.stat:
+    path: /etc/pve/.version
+  register: wazuh_agent_pve
+
+- name: File integrity skips pmxcfs churn (Proxmox nodes)
+  ansible.builtin.blockinfile:
+    path: /var/ossec/etc/ossec.conf
+    marker: "<!-- {mark} labstack syscheck pve (managed by Ansible) -->"
+    block: |
+      <ossec_config>
+        <syscheck>
+          {{ wazuh_agent_pve_syscheck_ignore | map('regex_replace', '^', '<ignore>') | map('regex_replace', '$', '</ignore>') | join(' ') }}
+          <ignore type="sregex">{{ wazuh_agent_pve_syscheck_ignore_sregex }}</ignore>
+        </syscheck>
+      </ossec_config>
+  when:
+    - wazuh_agent_pve.stat.exists
+    - wazuh_agent_conf.content is defined
+  notify: Restart wazuh agent
+
+- name: Agent running
+  ansible.builtin.systemd_service:
+    name: wazuh-agent
+    enabled: true
+    state: started
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Apply agent changes now (verification below needs them)
+  ansible.builtin.meta: flush_handlers
+
+- name: Agent connected to the manager
+  check_mode: false  # read-only; --check needs the real answer
+  ansible.builtin.command: grep -q "^status='connected'" /var/ossec/var/run/wazuh-agentd.state
+  register: wazuh_agent_state
+  until: wazuh_agent_state.rc == 0
+  retries: 12
+  delay: 10
+  changed_when: false
+  when: not ansible_check_mode

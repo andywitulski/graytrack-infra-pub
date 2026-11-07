@@ -1,0 +1,20 @@
+---
+# TPM 2.0 on VMs (Proxmox vTPM, tofu vtpm / tpm_state) and on nodes that have one (ADR-0006).
+#   - tpm2-tools, talking to the kernel's resource manager (/dev/tpmrm0) only
+#   - the endorsement key recorded in the repo and pinned (files/<env>/tpm/<host>.yml): a different EK on a
+#     later run means a different TPM (a clone or restore over the original, a vTPM recreated) and stops here
+#   - VMs: the EK certificate checked against the swtpm local CA of the lab's nodes (recorded the same way)
+#   - tasks/seal.yml: seal a secret to this host's TPM (systemd-creds), for LoadCredentialEncrypted=
+tpm_packages: [tpm2-tools]
+tpm_device: /dev/tpmrm0
+# A VM in vtpm_guests must have its TPM; a node without one is only reported
+tpm_required: "{{ inventory_hostname in groups.get('vtpm_guests', []) }}"
+# Pinned EK records and the nodes' swtpm local CAs (public data, committed)
+tpm_ek_dir: "{{ playbook_dir }}/../files/{{ lab_env }}/tpm"
+# A new TPM on purpose (vTPM recreated, host rebuilt): -e tpm_ek_accept_change=true pins the new EK
+tpm_ek_accept_change: false
+# Where Proxmox's swtpm_setup keeps the local CA that signs vTPM EK certificates (one per node)
+tpm_swtpm_localca_dir: /var/lib/swtpm-localca
+# Sealed credentials (tasks/seal.yml)
+tpm_credstore: /etc/credstore.encrypted
+tpm_libexec: /usr/local/libexec/labstack

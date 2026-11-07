@@ -1,0 +1,241 @@
+---
+- name: Stalwart system user
+  ansible.builtin.user:
+    name: stalwart
+    system: true
+    home: "{{ mail_data_dir }}"
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Stalwart directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: stalwart
+    mode: "0750"
+  loop:
+    - { path: "{{ mail_config_dir }}", owner: root }
+    - { path: "{{ mail_config_dir }}/relay", owner: root }
+    - { path: "{{ mail_data_dir }}", owner: stalwart }
+    - { path: /etc/systemd/system/stalwart.service.d, owner: root }
+  loop_control:
+    label: "{{ item.path }}"
+
+# Programs only, nothing secret: readable and executable by everyone, like /usr/local/bin itself
+- name: Program directory
+  ansible.builtin.file:
+    path: /usr/local/lib/stalwart
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Archive tools
+  ansible.builtin.apt:
+    name: [xz-utils, tar]
+    state: present
+
+- name: Stalwart and stalwart-cli releases (pinned by checksum)
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "/usr/local/lib/stalwart/{{ item.file }}"
+    checksum: "sha256:{{ item.sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { url: "{{ mail_stalwart_url }}", file: "stalwart-{{ mail_stalwart_version }}.tar.gz", sha256: "{{ mail_stalwart_sha256 }}" }
+    - { url: "{{ mail_cli_url }}", file: "stalwart-cli-{{ mail_cli_version }}.tar.xz", sha256: "{{ mail_cli_sha256 }}" }
+  loop_control:
+    label: "{{ item.file }}"
+
+- name: Version directories
+  ansible.builtin.file:
+    path: "/usr/local/lib/stalwart/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: ["stalwart-{{ mail_stalwart_version }}", "stalwart-cli-{{ mail_cli_version }}"]
+
+- name: Unpacked by version
+  ansible.builtin.unarchive:
+    src: "/usr/local/lib/stalwart/{{ item.file }}"
+    dest: "/usr/local/lib/stalwart/{{ item.dir }}"
+    remote_src: true
+    extra_opts: "{{ item.opts }}"
+    creates: "/usr/local/lib/stalwart/{{ item.dir }}/{{ item.bin }}"
+  loop:
+    - { file: "stalwart-{{ mail_stalwart_version }}.tar.gz", dir: "stalwart-{{ mail_stalwart_version }}", bin: stalwart, opts: [] }
+    - { file: "stalwart-cli-{{ mail_cli_version }}.tar.xz", dir: "stalwart-cli-{{ mail_cli_version }}", bin: stalwart-cli,
+        opts: [--strip-components=1] }
+  loop_control:
+    label: "{{ item.dir }}"
+
+# tar keeps the owner and mode from the release build; stalwart runs as its own user and must execute it
+- name: Programs owned by root and executable by the service
+  ansible.builtin.file:
+    path: "/usr/local/lib/stalwart/{{ item.dir }}/{{ item.bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - { dir: "stalwart-{{ mail_stalwart_version }}", bin: stalwart }
+    - { dir: "stalwart-cli-{{ mail_cli_version }}", bin: stalwart-cli }
+  loop_control:
+    label: "{{ item.bin }}"
+  notify: Restart stalwart
+
+- name: The pinned versions are the ones in use
+  ansible.builtin.file:
+    src: "/usr/local/lib/stalwart/{{ item.dir }}/{{ item.bin }}"
+    dest: "/usr/local/bin/{{ item.bin }}"
+    state: link
+  loop:
+    - { dir: "stalwart-{{ mail_stalwart_version }}", bin: stalwart }
+    - { dir: "stalwart-cli-{{ mail_cli_version }}", bin: stalwart-cli }
+  loop_control:
+    label: "{{ item.bin }}"
+  notify: Restart stalwart
+
+# Only the data store connection is a file; everything else is in the store, applied from plan.ndjson
+- name: Data store connection
+  ansible.builtin.copy:
+    dest: "{{ mail_config_dir }}/config.json"
+    content: "{{ {'@type': 'RocksDb', 'path': mail_data_dir ~ '/data/'} | to_json }}\n"
+    owner: root
+    group: stalwart
+    mode: "0640"
+  notify: Restart stalwart
+
+# Break-glass admin: also what Ansible and stalwart-cli use, on the loopback management listener only
+- name: Break-glass admin (environment file, read by systemd)
+  ansible.builtin.copy:
+    dest: "{{ mail_config_dir }}/env"
+    content: "STALWART_RECOVERY_ADMIN={{ mail_admin_user }}:{{ mail_fallback_admin_secret }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart stalwart
+
+- name: Service unit
+  ansible.builtin.template:
+    src: stalwart.service.j2
+    dest: /etc/systemd/system/stalwart.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart stalwart
+
+# Outbound relays authenticate with these (Gmail app password, Bridge password); the plan names the files
+- name: Relay credentials
+  ansible.builtin.copy:
+    dest: "{{ mail_config_dir }}/relay/{{ item.id }}"
+    content: "{{ lookup('ansible.builtin.vars', 'mail_' ~ item.id ~ '_password') }}"
+    owner: root
+    group: stalwart
+    mode: "0640"
+  loop: "{{ mail_accounts | selectattr('ready') | list }}"
+  loop_control:
+    label: "{{ item.id }}"
+  no_log: true
+  # Stalwart keeps file secrets it has read (a settings reload does not re-read them): restart
+  notify: Restart stalwart
+
+- name: Configuration plan
+  ansible.builtin.template:
+    src: plan.ndjson.j2
+    dest: "{{ mail_config_dir }}/plan.ndjson"
+    owner: root
+    group: root
+    mode: "0600"
+  register: mail_plan
+
+- name: Bootstrapped before?
+  ansible.builtin.stat:
+    path: "{{ mail_data_dir }}/.labstack-bootstrapped"
+  register: mail_bootstrapped
+
+# First start: recovery mode (management API on 8080, no mail service), apply the plan, then normal start.
+# The plan defines every listener, so Stalwart never creates its default ones.
+- name: First start
+  when: not mail_bootstrapped.stat.exists
+  block:
+    - name: Recovery mode for the first start
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/stalwart.service.d/recovery.conf
+        content: |
+          [Service]
+          Environment=STALWART_RECOVERY_MODE=1
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Started in recovery mode
+      ansible.builtin.systemd_service:
+        name: stalwart
+        state: restarted
+        daemon_reload: true
+
+    - name: Management API answers
+      ansible.builtin.uri:
+        url: "{{ mail_api_url }}/healthz/live"
+      register: mail_live
+      until: mail_live.status == 200
+      retries: 30
+      delay: 2
+
+    - name: Plan applied
+      ansible.builtin.command:
+        argv: [stalwart-cli, apply, --file, "{{ mail_config_dir }}/plan.ndjson"]
+      environment: "{{ mail_cli_env }}"
+      changed_when: true
+
+    - name: Out of recovery mode
+      ansible.builtin.file:
+        path: /etc/systemd/system/stalwart.service.d/recovery.conf
+        state: absent
+
+    - name: Bootstrapped
+      ansible.builtin.file:
+        path: "{{ mail_data_dir }}/.labstack-bootstrapped"
+        state: touch
+        owner: stalwart
+        group: stalwart
+        mode: "0640"
+
+    - name: Normal start
+      ansible.builtin.systemd_service:
+        name: stalwart
+        state: restarted
+        daemon_reload: true
+
+- name: Pending restarts
+  ansible.builtin.meta: flush_handlers
+
+- name: Stalwart running
+  ansible.builtin.systemd_service:
+    name: stalwart
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Management API answers
+  ansible.builtin.uri:
+    url: "{{ mail_api_url }}/healthz/live"
+  register: mail_live
+  until: mail_live.status == 200
+  retries: 30
+  delay: 2
+  check_mode: false
+
+# Idempotent (upserts and singleton updates). Listener changes take a restart: systemctl restart stalwart.
+- name: Plan applied (changed plan)
+  ansible.builtin.command:
+    argv: [stalwart-cli, apply, --file, "{{ mail_config_dir }}/plan.ndjson"]
+  environment: "{{ mail_cli_env }}"
+  when: mail_plan is changed and mail_bootstrapped.stat.exists
+  changed_when: true
+  notify: Reload stalwart settings

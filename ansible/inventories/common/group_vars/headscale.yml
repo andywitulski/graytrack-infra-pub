@@ -1,0 +1,50 @@
+---
+# Headscale (docs/howto/vpn.md). Upgrades go one minor version at a time (0.29 to 0.30, never skip):
+# change version and sha256 together (checksums.txt of the release), read the release notes first.
+# renovate: datasource=github-releases depName=juanfont/headscale extractVersion=^v(?<version>.*)$
+headscale_version: "0.29.7"
+headscale_deb_sha256: d230c5fc8db06cf1868f4ec0077b89e5e2ccf3b22a3259efa6d080db2d5f921c
+headscale_domain: "hs.{{ base_domain }}"
+# MagicDNS names of the devices themselves (laptop.ts.example.com); answered by the clients, never public
+headscale_magic_domain: "ts.{{ base_domain }}"
+
+# Who may join (Authentik group headscale-users) and who counts as an admin in the policy below.
+# Headscale names OIDC users after their Authentik username (preferred_username).
+headscale_users: [alice, bob]
+headscale_admins: [alice]
+
+# What the subnet router (ts01) publishes into the tailnet. Every web name of the lab is Caddy on edge01,
+# so edge01:443 is the whole service surface; the gateway is the DNS server for the lab's names.
+# A new destination: add it here, to headscale_acls, and to the zone policy rule "VPN router to edge web"
+# (or a new rule for ts01, like "VPN router to mail").
+headscale_routes:
+  - __DMZ_NET__.10/32   # edge01: every *.example.com web service
+  - __SVC_NET__.1/32    # UniFi gateway: DNS for example.com
+  - __SVC_NET__.26/32   # mail01: IMAP, submission, account portal (docs/howto/mail.md)
+# Device trust (docs/howto/vpn.md, Trusting a device): signing in only gets a device onto the tailnet.
+# It reaches the lab only once its tailnet address is listed here, which you do after checking it is yours
+# and in your hands. Everything else is rejected. Addresses are bound to each device's WireGuard key, so they
+# cannot be spoofed, and stay the same across sign-ins (also after key expiry). Before deleting a node in
+# Headscale, remove its line here first. Names: lowercase letters, digits, hyphens.
+headscale_trusted_devices:
+  alice-phone: __TAILNET_IP_PHONE__
+  alice-laptop: __TAILNET_IP_LAPTOP__
+headscale_acls:
+  - { src: "{{ headscale_trusted_devices | list }}", dst: ["__DMZ_NET__.10:443", "__SVC_NET__.1:53"] }
+  - { src: "{{ headscale_trusted_devices | list }}", dst: ["__SVC_NET__.26:993,465,443"] }
+# Exit nodes (docs/howto/vpn.md, Exit nodes): a device in an exit's list may send its internet traffic
+# through it, picked in the Tailscale app; lab traffic still goes through ts01. Names from
+# headscale_trusted_devices.
+headscale_exits:
+  home:      # ts02: out from the site address (roaming device; phone and laptop on public Wi-Fi)
+    tag: "tag:exit"
+    devices: [alice-phone, alice-laptop] # e.g. [alice-phone, alice-laptop]
+# Admin extras (Proxmox UI, SSH to the nodes) are off on purpose: the zone policy only lets the controllers
+# into mgmt. To open one: add the route above, an ACL here with src group:admins, and the zone policy rule.
+
+# Which names go to the lab's DNS through the tunnel: every Caddy site except Headscale itself (the clients
+# must reach it outside the tunnel, from the public DNS). Anything else stays with the device's own DNS.
+headscale_split_domains: >-
+  {{ hostvars[groups['caddy'][0]]['caddy_sites'] | map(attribute='host') | reject('equalto', headscale_domain) | list
+     + ['mail.' ~ base_domain] }}
+headscale_dns_server: __SVC_NET__.1

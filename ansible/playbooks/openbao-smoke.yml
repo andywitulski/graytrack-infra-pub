@@ -1,0 +1,66 @@
+---
+# Proves the Ansible-to-OpenBao path (docs/howto/secrets-openbao.md). Run through bin/ap, for each env:
+#   bin/ap prod playbooks/openbao-smoke.yml
+#   bin/ap labnode playbooks/openbao-smoke.yml
+# Before the cutover (sops still holds the service secrets): every key that is to leave sops reads back from
+# OpenBao, through the vars plugin, with the value sops holds.
+# After the cutover (secrets_file_version 2): sops holds nothing but sops_only keys, OpenBao holds the rest,
+# and the PENDING ones are listed. Nothing is printed but key names and paths.
+- name: OpenBao serves this environment's secrets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    smoke_policy: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../secrets/policy.yml') | from_yaml }}"
+    smoke_secrets_file: "{{ playbook_dir }}/../inventories/{{ lab_env }}/group_vars/all/secrets.sops.yml"
+  tasks:
+    - name: The vars plugin read OpenBao in this run
+      ansible.builtin.assert:
+        that: openbao_secret_paths is defined and openbao_secret_paths | length > 0
+        fail_msg: >-
+          No secrets from OpenBao (plugins/vars/labstack_openbao.py). Run this through bin/ap, with
+          LABSTACK_OPENBAO unset, after bin/bao-import-sops {{ lab_env }}.
+        success_msg: "{{ openbao_secret_paths | length }} secrets from kv/services/{{ lab_env }}/"
+
+    - name: Read sops directly (the reference)
+      ansible.builtin.set_fact:
+        smoke_sops: "{{ lookup('community.sops.sops', smoke_secrets_file) | from_yaml }}"
+      no_log: true
+
+    - name: Keys that leave (or have left) sops
+      ansible.builtin.set_fact:
+        smoke_leaving: "{{ smoke_sops | dict2items | rejectattr('key', 'match', smoke_policy.sops_only) | map(attribute='key') | sort }}"
+        smoke_cut_over: "{{ smoke_sops.secrets_file_version | default(1) | int == 2 }}"
+
+    - name: Before the cutover, each one matches sops
+      ansible.builtin.assert:
+        that:
+          - openbao_secret_paths[item] is defined
+          - lookup('ansible.builtin.vars', item) == smoke_sops[item]
+        fail_msg: >-
+          {{ item }}: {{ 'missing from' if openbao_secret_paths[item] is not defined else 'different in' }} OpenBao.
+          {{ ('bin/tf-ak ' ~ ('prod' if lab_env == 'labnode' else lab_env) ~ ' apply writes it')
+             if item is match(smoke_policy.tofu_owned) else 'bin/bao-import-sops ' ~ lab_env }}
+        success_msg: "{{ item }}: kv/{{ openbao_secret_paths[item] }}"
+        quiet: true
+      loop: "{{ smoke_leaving }}"
+      when: not smoke_cut_over
+      no_log: false
+      loop_control:
+        label: "{{ item }}"
+
+    - name: After the cutover, sops holds only sops_only keys
+      ansible.builtin.assert:
+        that: smoke_leaving | length == 0
+        fail_msg: "Still in sops after the cutover: {{ smoke_leaving | join(', ') }}. bin/bao-import-sops {{ lab_env }} --cutover moves them."
+        success_msg: "sops: {{ smoke_sops.keys() | sort | join(', ') }}"
+      when: smoke_cut_over
+
+    - name: Not set yet (PENDING)
+      ansible.builtin.debug:
+        msg: "{{ smoke_pending if smoke_pending else 'none' }}"
+      vars:
+        smoke_keys: "{{ openbao_secret_paths.keys() | sort }}"
+        smoke_pending: >-
+          {{ smoke_keys | zip(lookup('ansible.builtin.vars', *smoke_keys, wantlist=true))
+             | selectattr(1, 'equalto', 'PENDING') | map(attribute=0) | list }}

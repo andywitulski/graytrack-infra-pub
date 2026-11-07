@@ -1,0 +1,91 @@
+---
+- name: TLS directory
+  ansible.builtin.file:
+    path: "{{ host_tls_dir }}"
+    state: directory
+    owner: root
+    group: "{{ host_tls_group }}"
+    mode: "0750"
+
+- name: Host CA (once; ECDSA P-256, signs this host's server certificate only)
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -new
+      - -newkey
+      - ec
+      - -pkeyopt
+      - ec_paramgen_curve:P-256
+      - -nodes
+      - -keyout
+      - "{{ host_tls_dir }}/ca.key"
+      - -out
+      - "{{ host_tls_dir }}/ca.crt"
+      - -days
+      - "{{ host_tls_ca_days }}"
+      - -subj
+      - "/O=labstack {{ lab_env }}/CN=labstack {{ inventory_hostname }} CA"
+      - -addext
+      - basicConstraints=critical,CA:TRUE,pathlen:0
+      - -addext
+      - keyUsage=critical,keyCertSign,cRLSign
+    creates: "{{ host_tls_dir }}/ca.crt"
+
+# Renewed when missing, expiring within host_tls_renew_days, or issued for other names than host_tls_sans.
+# The CA stays, so clients that pin it never notice. Notifies "host_tls certificate changed": the calling
+# role must have a handler that listens to it (postgres, openbao: reload).
+- name: Server certificate
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd "$DIR"
+    if [[ -f server.crt && -f server.key && -f server.san ]] \
+      && [[ "$(cat server.san)" == "$SANS" ]] \
+      && openssl x509 -in server.crt -noout -checkend "$RENEW_S" > /dev/null; then
+      echo unchanged; exit 0
+    fi
+    umask 077
+    openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+      -keyout server.key.new -out server.crt.new -CA ca.crt -CAkey ca.key -days "$DAYS" \
+      -subj "/O=labstack $ENV/CN=$CN" -addext "subjectAltName=$SANS" \
+      -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" \
+      -addext "extendedKeyUsage=serverAuth" 2> /dev/null
+    openssl verify -CAfile ca.crt server.crt.new > /dev/null
+    mv server.key.new server.key
+    mv server.crt.new server.crt
+    printf '%s' "$SANS" > server.san
+    echo changed
+  args:
+    executable: /bin/bash
+  environment:
+    DIR: "{{ host_tls_dir }}"
+    SANS: "{{ host_tls_sans | join(',') }}"
+    CN: "{{ host_tls_cn }}"
+    ENV: "{{ lab_env }}"
+    DAYS: "{{ host_tls_cert_days }}"
+    RENEW_S: "{{ host_tls_renew_days * 86400 }}"
+  register: host_tls_server
+  changed_when: host_tls_server.stdout == 'changed'
+  notify: host_tls certificate changed
+
+- name: Key and certificate permissions
+  ansible.builtin.file:
+    path: "{{ host_tls_dir }}/{{ item.name }}"
+    owner: root
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: ca.key, group: root, mode: "0600" }
+    - { name: ca.crt, group: root, mode: "0644" }
+    - { name: server.key, group: "{{ host_tls_group }}", mode: "0640" }
+    - { name: server.crt, group: "{{ host_tls_group }}", mode: "0644" }
+    - { name: server.san, group: root, mode: "0644" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: CA certificate into the repo, for the clients that pin it (commit it)
+  ansible.builtin.fetch:
+    src: "{{ host_tls_dir }}/ca.crt"
+    dest: "{{ host_tls_ca_fetch_dest }}"
+    flat: true

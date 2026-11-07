@@ -1,0 +1,19 @@
+---
+# OpenBao's listener certificate from ca01. Included by main.yml and, for unattended renewal, by
+# playbooks/admin-tls.yml (bin/renew-certs). A renewed certificate is picked up with SIGHUP: no restart,
+# no reseal. The first switch from the per-host CA happens in main.yml (it points openbao.hcl here).
+- name: Certificate
+  ansible.builtin.include_role:
+    name: x509_cert
+  vars:
+    x509_cert_name: openbao
+    x509_cert_dns: ["{{ inventory_hostname }}", "{{ inventory_hostname }}.{{ base_domain }}"]
+    x509_cert_ips: ["{{ ansible_host }}"]   # no 127.0.0.1: ca01 signs inventory addresses only
+    x509_cert_group: openbao
+
+- name: A renewed certificate is reloaded
+  ansible.builtin.debug:
+    msg: "Listener certificate renewed"
+  changed_when: true
+  notify: Reload openbao
+  when: x509_cert_changed | bool

@@ -1,0 +1,12 @@
+---
+# Tailscale on the tailnet's infrastructure nodes (docs/howto/vpn.md). Each joins Headscale with a
+# single-use, tagged pre-auth key from hs01.
+#   subnet (ts01): publishes headscale_routes (group_vars/headscale.yml), the way into the lab
+#   exit   (ts02): offers itself as an exit node, the full tunnel for devices granted in headscale_exits
+tailscale_router_role: subnet
+# UDP port tailscaled listens on; each node gets its own, so the WAN can forward one to each
+tailscale_router_port: 41641
+# An exit node's tag; must be one of headscale_exits' tags (group_vars/headscale.yml)
+tailscale_router_exit_tag: "tag:exit"
+tailscale_router_repo: https://pkgs.tailscale.com/stable/debian
+tailscale_router_key_url: "https://pkgs.tailscale.com/stable/debian/{{ ansible_facts['distribution_release'] }}.noarmor.gpg"

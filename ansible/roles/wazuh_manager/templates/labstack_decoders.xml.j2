@@ -1,0 +1,182 @@
+<!--
+  labstack custom decoders. Managed by Ansible (roles/wazuh_manager, rendered from a template); edits on the manager are overwritten.
+
+  caddy, authentik: container logs. Both containers use Docker's journald log driver with a fixed tag,
+  so the agent forwards them as syslog-style lines whose program name is the tag and whose message is
+  one JSON object.
+
+  unifi-cef / unifi-cef-bare: the UniFi Network SIEM export (CEF over syslog, UDP 514), with or without
+  a syslog header. Extension values may contain
+  spaces, so each value runs until the next " key=" or the end of the line.
+-->
+
+<decoder name="caddy">
+  <program_name>^caddy$</program_name>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+
+<decoder name="authentik">
+  <program_name>^authentik$</program_name>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+
+{#
+  UniFi sends CEF either behind a syslog header or bare. With a header, the pre-decoder takes "CEF"
+  as the program name and Wazuh only tries decoders that declare one; bare lines have no program
+  name and only reach decoders that declare none. One parent per case, same child decoders.
+#}
+{% set parents = [
+  {'name': 'unifi-cef', 'program_name': '^CEF$', 'prematch': '\\d+\\|Ubiquiti\\|'},
+  {'name': 'unifi-cef-bare', 'program_name': none, 'prematch': '^CEF:\\d+\\|Ubiquiti\\|'},
+] %}
+{% for p in parents %}
+<decoder name="{{ p.name }}">
+{% if p.program_name %}
+  <program_name>{{ p.program_name }}</program_name>
+{% endif %}
+  <prematch type="pcre2">{{ p.prematch }}</prematch>
+</decoder>
+
+<!-- Sibling decoders for {{ p.name }}: same name and parent, each adds the fields it finds.
+     Field names follow UniFi Network 10.x (firewall events carry UNIFIsrcClientIp/UNIFIdst*Ip, not src/dst). -->
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">\d+\|Ubiquiti\|[^|]*\|([^|]*)\|([^|]*)\|([^|]*)\|(\d+)\|</regex>
+  <order>unifi.version, unifi.event_id, unifi.name, unifi.severity</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIcategory=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.category</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIsubCategory=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.subcategory</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIpolicyType=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.policy_type</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIfirewallPolicy=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.policy</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIsrcZone=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.src_zone</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIdstZone=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.dst_zone</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIrisk=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.risk</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIdirection=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.direction</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIaccessMethod=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.access_method</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIadmin=(.+?)(?= \w+=|$)</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])msg=(.+?)(?= \w+=|$)</regex>
+  <order>unifi.msg</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])(?:src|UNIFIsrcClientIp|UNIFIsrcDeviceIp)=(\S+)</regex>
+  <order>srcip</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])(?:dst|UNIFIdstClientIp|UNIFIdstDeviceIp)=(\S+)</regex>
+  <order>dstip</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])spt=(\d+)</regex>
+  <order>srcport</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])dpt=(\d+)</regex>
+  <order>dstport</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])proto=(\S+)</regex>
+  <order>protocol</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])act=(\S+)</regex>
+  <order>unifi.act</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])app=(\S+)</regex>
+  <order>unifi.app</order>
+</decoder>
+
+<decoder name="{{ p.name }}-fields">
+  <parent>{{ p.name }}</parent>
+  <regex type="pcre2">(?:^|[ |])UNIFIsrcClientMac=(\S+)</regex>
+  <order>unifi.src_mac</order>
+</decoder>
+
+{% endfor %}
+
+<!--
+  pve-firewall: /var/log/pve-firewall.log on the Proxmox nodes (no syslog header, so no program name).
+  "<vmid> <level> <chain> <date> <tz> [policy ]ACTION: IN=... SRC=... DST=... PROTO=... [SPT= DPT=]"
+-->
+<decoder name="pve-firewall">
+  <prematch type="pcre2">^\d+ \d+ \S+-(?:IN|OUT) \d+/\w+/\d+:\d+:\d+:\d+ [+-]\d+ </prematch>
+</decoder>
+
+<decoder name="pve-firewall-fields">
+  <parent>pve-firewall</parent>
+  <regex type="pcre2">^(\d+) \d+ (\S+) .*?(ACCEPT|DROP|REJECT): .* SRC=(\S+) DST=(\S+) .* PROTO=(\S+)</regex>
+  <order>vmid, chain, action, srcip, dstip, protocol</order>
+</decoder>
+
+<decoder name="pve-firewall-fields">
+  <parent>pve-firewall</parent>
+  <regex type="pcre2"> DPT=(\d+)</regex>
+  <order>dstport</order>
+</decoder>

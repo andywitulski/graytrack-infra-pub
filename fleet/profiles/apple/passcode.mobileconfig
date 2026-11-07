@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by labstack-infra (fleet/, docs/howto/mdm.md). Passcode floor for enrolled iPhones and iPads.
+     No erase-after-failed-attempts: on a personal phone that costs more than it protects. -->
+<plist version="1.0">
+<dict>
+	<key>PayloadDisplayName</key>
+	<string>labstack: passcode</string>
+	<key>PayloadIdentifier</key>
+	<string>net.labstack.mdm.passcode</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>F1351449-D0A2-43EC-AD0C-8E0CBE85ED67</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>Passcode</string>
+			<key>PayloadIdentifier</key>
+			<string>net.labstack.mdm.passcode.policy</string>
+			<key>PayloadType</key>
+			<string>com.apple.mobiledevice.passwordpolicy</string>
+			<key>PayloadUUID</key>
+			<string>302F4663-B3E9-4E3A-8C62-0C790B855802</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<!-- A passcode is required, at least 6 characters, no 123456 or 111111 -->
+			<key>forcePIN</key>
+			<true/>
+			<key>allowSimple</key>
+			<false/>
+			<key>minLength</key>
+			<integer>6</integer>
+			<!-- Auto-lock after at most 5 minutes; the passcode (or Face ID) is asked for at once -->
+			<key>maxInactivity</key>
+			<integer>5</integer>
+			<key>maxGracePeriod</key>
+			<integer>0</integer>
+		</dict>
+	</array>
+</dict>
+</plist>

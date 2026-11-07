@@ -1,0 +1,9 @@
+---
+# Standalone Proxmox node on the repurposed workstation (inventories/labnode).
+lab_node_lab_vg: lab
+lab_node_lab_thinpool: data
+lab_node_lab_storage: lab            # Proxmox storage ID used by tofu/envs/labnode (local.datastore)
+lab_node_gpu_vendor: "10de"          # NVIDIA: every function of the card goes to vfio-pci
+lab_node_gpu_mapping: gpu0          # PCI resource mapping name used by tofu/envs/labnode (gpu.tf)
+lab_node_dev_vnet: pvedev            # SDN vnet whose gateway answers dev DNS (tofu/envs/labnode/network.tf)
+lab_node_upstream_dns: __MGMT_NET__.1   # Management gateway ("Mgmt DNS")

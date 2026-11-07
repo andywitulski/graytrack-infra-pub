@@ -1,0 +1,75 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - mail_stalwart_version | length > 0 and mail_stalwart_sha256 | length == 64
+      - mail_cli_version | length > 0 and mail_cli_sha256 | length == 64
+      - mail_domain | length > 0 and mail_hostname | length > 0
+      - mail_users | length > 0
+      - mail_fallback_admin_secret | default('PENDING') not in ['', 'PENDING']
+    fail_msg: >-
+      Set the mail_* settings (inventories/common/group_vars/mail.yml) and mail_fallback_admin_secret
+      (bin/gen-service-secrets {{ lab_env }})
+    quiet: true
+
+- name: Each person and account is well formed
+  ansible.builtin.assert:
+    that:
+      - item.0.name is match('^[a-z][a-z0-9]*$')
+      - item.1.id is match('^[a-z0-9_]+$')
+      - item.1.type in ['gmail', 'proton']
+      - item.1.folder is match('^[A-Za-z0-9][A-Za-z0-9 _-]*$')
+      - (lookup('ansible.builtin.vars', 'mail_' ~ item.1.id ~ '_send_as', default='') | string).split(',') | map('trim')
+        | reject('equalto', '') | reject('match', '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$') | list | length == 0
+      - lookup('ansible.builtin.vars', 'mail_user_' ~ item.0.name ~ '_password', default='') not in ['', 'PENDING']
+    fail_msg: >-
+      mail_users: {{ item.0.name }}/{{ item.1.id }}: name lowercase, id [a-z0-9_], type gmail or proton,
+      folder letters/digits/spaces, mail_{{ item.1.id }}_send_as comma-separated addresses; and mail_user_{{ item.0.name }}_password must exist
+      (bin/gen-service-secrets {{ lab_env }})
+    quiet: true
+  loop: "{{ mail_users | subelements('accounts', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }}/{{ item.1.id }}"
+
+- name: Proton Bridge (when a Proton account is listed)
+  ansible.builtin.include_tasks: bridge.yml
+  when: mail_users | map(attribute='accounts') | flatten | selectattr('type', 'equalto', 'proton') | list | length > 0
+
+# An account takes part once its address and password are in OpenBao (and, for Proton, Bridge has exported
+# its certificate); the rest wait, listed at the end of the run.
+- name: Accounts ready to sync and send
+  vars:
+    mail_bridge_ok: "{{ mail_bridge_cert_present | default(false) | bool }}"
+  ansible.builtin.set_fact:
+    mail_accounts: >-
+      {%- set out = [] -%}
+      {%- for u in mail_users -%}{%- for a in u.accounts | default([]) -%}
+      {%- set addr = lookup('ansible.builtin.vars', 'mail_' ~ a.id ~ '_address', default='') | string -%}
+      {%- set pw = lookup('ansible.builtin.vars', 'mail_' ~ a.id ~ '_password', default='') | string -%}
+      {%- set _ = out.append({'user': u.name, 'id': a.id, 'type': a.type, 'folder': a.folder, 'address': addr,
+            'senders': ([addr] + (lookup('ansible.builtin.vars', 'mail_' ~ a.id ~ '_send_as', default='') | string).split(',')
+                        | map('trim') | reject('equalto', '') | list) | map('lower') | unique | list,
+            'ready': addr is match('^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$') and pw not in ['', 'PENDING']
+                     and (a.type != 'proton' or mail_bridge_ok)}) -%}
+      {%- endfor -%}{%- endfor -%}{{ out }}
+
+- name: Stalwart
+  ansible.builtin.include_tasks: stalwart.yml
+
+- name: TLS certificate
+  ansible.builtin.include_tasks: tls.yml
+
+- name: Mailboxes
+  ansible.builtin.include_tasks: accounts.yml
+
+- name: Gmail and Proton sync
+  ansible.builtin.include_tasks: sync.yml
+
+- name: What is running, and what still waits
+  ansible.builtin.debug:
+    msg:
+      - "Mailboxes: {{ mail_users | map(attribute='name') | map('regex_replace', '$', '@' ~ mail_domain) | join(', ') }}"
+      - "Syncing and sending: {{ mail_accounts | selectattr('ready') | map(attribute='id') | join(', ') or 'none yet' }}"
+      - >-
+        Waiting: {{ (mail_accounts | rejectattr('ready') | map(attribute='id') | join(', ')) or 'none' }}
+        (docs/howto/mail.md, Add an account)

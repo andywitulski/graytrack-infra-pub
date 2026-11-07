@@ -1,0 +1,145 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - headscale_version | length > 0
+      - headscale_deb_sha256 | length == 64
+      - headscale_domain | length > 0
+      - headscale_magic_domain | length > 0
+      - headscale_routes | length > 0
+      - headscale_split_domains | length > 0
+    fail_msg: "Set the headscale_* settings in inventories/common/group_vars/headscale.yml"
+    quiet: true
+
+- name: Trusted devices are a name and a tailnet address each
+  ansible.builtin.assert:
+    that:
+      - item.key is match('^[a-z0-9][a-z0-9-]*$')
+      - item.value | string is match('^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]{1,3}\\.[0-9]{1,3}$')
+    fail_msg: "headscale_trusted_devices: '{{ item.key }}: {{ item.value }}' (want name: 100.64.x.y)"
+    quiet: true
+  loop: "{{ headscale_trusted_devices | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Exit node users are trusted devices, and every exit has a tag
+  ansible.builtin.assert:
+    that:
+      - item.value.tag is match('^tag:[a-z0-9-]+$')
+      - item.value.devices | default([]) | difference(headscale_trusted_devices | list) | length == 0
+    fail_msg: >-
+      headscale_exits.{{ item.key }}: needs tag: tag:<name>, and devices from headscale_trusted_devices only
+      (not trusted: {{ item.value.devices | default([]) | difference(headscale_trusted_devices | list) }})
+    quiet: true
+  loop: "{{ headscale_exits | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# Authentik's client secret comes from OpenBao (written by bin/tf-ak). Until it exists, devices can only be
+# registered by hand (headscale nodes register), and the router with its pre-auth key.
+- name: Sign-in through Authentik once its client secret exists
+  ansible.builtin.set_fact:
+    headscale_oidc_ready: "{{ headscale_oidc_client_secret | default('PENDING') not in ['', 'PENDING'] }}"
+
+- name: Installed version
+  ansible.builtin.command: dpkg-query -W -f=${Version} headscale
+  register: headscale_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Install headscale (release .deb, checksum pinned)
+  when: headscale_installed.stdout != headscale_version
+  block:
+    - name: Download the package
+      ansible.builtin.get_url:
+        url: "{{ headscale_deb_url }}"
+        dest: "/var/cache/headscale_{{ headscale_version }}_amd64.deb"
+        checksum: "sha256:{{ headscale_deb_sha256 }}"
+        mode: "0644"
+
+    - name: Install the package
+      ansible.builtin.apt:
+        deb: "/var/cache/headscale_{{ headscale_version }}_amd64.deb"
+      notify: Restart headscale
+
+- name: Configuration
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: /etc/headscale/config.yaml
+    owner: root
+    group: headscale
+    mode: "0640"
+  notify: Restart headscale
+
+- name: Authentik client secret (read by headscale, never in the config)
+  ansible.builtin.copy:
+    dest: /etc/headscale/oidc_client_secret
+    content: "{{ headscale_oidc_client_secret }}"
+    owner: root
+    group: headscale
+    mode: "0640"
+  when: headscale_oidc_ready | bool
+  no_log: true
+  notify: Restart headscale
+
+- name: Access policy
+  ansible.builtin.template:
+    src: policy.hujson.j2
+    dest: /etc/headscale/policy.hujson
+    owner: root
+    group: headscale
+    mode: "0640"
+  register: headscale_policy
+  notify: Reload headscale
+
+- name: Headscale running
+  ansible.builtin.systemd_service:
+    name: headscale
+    enabled: true
+    state: started
+
+- name: Apply restarts and reloads now (the checks below need the new configuration)
+  ansible.builtin.meta: flush_handlers
+
+- name: Headscale answers
+  check_mode: false  # read-only; --check needs the real answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ headscale_listen_port }}/health"
+  register: headscale_health
+  until: headscale_health.status == 200
+  retries: 20
+  delay: 3
+
+- name: The policy it runs is the one written here
+  ansible.builtin.command: headscale policy check --file /etc/headscale/policy.hujson
+  changed_when: false
+  check_mode: false
+
+- name: Sign-in through Authentik
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Authentik sign-in is on: devices join with https://' ~ headscale_domain ~ ' (docs/howto/vpn.md).'
+         if headscale_oidc_ready | bool else
+         'Authentik sign-in is off until bin/tf-ak ' ~ lab_env ~ ' apply has written headscale_oidc_client_secret;'
+         ~ ' then run this play again.' }}
+
+- name: Devices on the tailnet
+  ansible.builtin.command: headscale nodes list --output json
+  register: headscale_nodes
+  changed_when: false
+  check_mode: false
+
+# Signed in but not in headscale_trusted_devices: reaches nothing. Vet it, then add it (or delete it).
+- name: Rejected devices (signed in, not trusted)
+  ansible.builtin.debug:
+    msg: >-
+      {%- set out = [] -%}
+      {%- for n in headscale_nodes.stdout | from_json | default([], true) -%}
+        {%- if (n.tags | default([])) | length == 0
+              and (n.ip_addresses | default([])) | intersect(headscale_trusted_devices.values() | map('string') | list) | length == 0 -%}
+          {%- set addr = n.ip_addresses | default([]) | first | default('') -%}
+          {%- set _ = out.append(n.given_name ~ ' ' ~ addr ~ ' (id ' ~ n.id ~ ', ' ~ n.user.name | default('') ~ ')') -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out if out else 'none' }}

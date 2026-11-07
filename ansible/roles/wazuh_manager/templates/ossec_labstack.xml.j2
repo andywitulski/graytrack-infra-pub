@@ -1,0 +1,11 @@
+<ossec_config>
+  <!-- Syslog from network devices (UniFi SIEM export, CEF). Only these senders are accepted. -->
+  <remote>
+    <connection>syslog</connection>
+    <port>{{ wazuh_manager_syslog_port }}</port>
+    <protocol>udp</protocol>
+{% for ip in wazuh_manager_syslog_allowed_ips %}
+    <allowed-ips>{{ ip }}</allowed-ips>
+{% endfor %}
+  </remote>
+</ossec_config>

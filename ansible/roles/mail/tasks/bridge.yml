@@ -1,0 +1,85 @@
+---
+# Proton Bridge: Proton's encrypted mail as IMAP and SMTP on 127.0.0.1, for mbsync and Stalwart. Needs a
+# paid Proton plan. Signing in to Proton is a one-time interactive step (docs/howto/mail.md, Proton);
+# its keychain is pass with a passphrase-less GPG key that never leaves mail01.
+- name: Bridge release (pinned by checksum)
+  ansible.builtin.get_url:
+    url: "{{ mail_bridge_url }}"
+    dest: "/var/cache/apt/archives/protonmail-bridge_{{ mail_bridge_version }}-1_amd64.deb"
+    checksum: "sha256:{{ mail_bridge_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Bridge and its keychain (pass)
+  ansible.builtin.apt:
+    deb: "/var/cache/apt/archives/protonmail-bridge_{{ mail_bridge_version }}-1_amd64.deb"
+    state: present
+  notify: Restart protonbridge
+
+- name: Keychain tools
+  ansible.builtin.apt:
+    name: [pass, gnupg]
+    state: present
+
+- name: Bridge user
+  ansible.builtin.user:
+    name: protonbridge
+    system: true
+    home: "{{ mail_bridge_home }}"
+    create_home: true
+    shell: /bin/bash
+
+- name: Bridge home is private
+  ansible.builtin.file:
+    path: "{{ mail_bridge_home }}"
+    state: directory
+    owner: protonbridge
+    group: protonbridge
+    mode: "0700"
+
+- name: Keychain exists?
+  ansible.builtin.stat:
+    path: "{{ mail_bridge_home }}/.password-store/.gpg-id"
+  register: mail_pass_store
+
+- name: Keychain (GPG key without a passphrase, pass initialized with it)
+  become: true
+  become_user: protonbridge
+  ansible.builtin.shell: |
+    set -euo pipefail
+    gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key 'Proton Bridge on {{ inventory_hostname }}' default default never
+    fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+    pass init "$fpr"
+  args:
+    executable: /bin/bash
+  environment:
+    HOME: "{{ mail_bridge_home }}"
+  when: not mail_pass_store.stat.exists
+  changed_when: true
+
+- name: Bridge service
+  ansible.builtin.template:
+    src: protonbridge.service.j2
+    dest: /etc/systemd/system/protonbridge.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart protonbridge
+
+- name: Bridge running
+  ansible.builtin.systemd_service:
+    name: protonbridge
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Exported once during sign-in (runbook: cert export to {{ mail_bridge_home }}/tls); mbsync trusts it
+- name: Bridge certificate exported?
+  ansible.builtin.stat:
+    path: "{{ mail_bridge_home }}/tls/cert.pem"
+  register: mail_bridge_cert
+
+- name: Proton accounts can sync
+  ansible.builtin.set_fact:
+    mail_bridge_cert_present: "{{ mail_bridge_cert.stat.exists }}"

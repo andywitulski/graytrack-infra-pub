@@ -1,0 +1,63 @@
+# Managed by Ansible (labstack-infra).
+services:
+  db:
+    image: docker.io/library/postgres:16.15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vaultwarden
+      POSTGRES_USER: vaultwarden
+      POSTGRES_PASSWORD: ${DB_PASS}
+    volumes:
+      - ./database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d vaultwarden -U vaultwarden"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  vaultwarden:
+    image: docker.io/vaultwarden/server:{{ vaultwarden_version }}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DOMAIN: https://{{ vaultwarden_domain }}
+      ROCKET_PORT: "80"
+      SIGNUPS_ALLOWED: "false"
+      INVITATIONS_ALLOWED: "true"
+      SHOW_PASSWORD_HINT: "false"
+      PASSWORD_HINTS_ALLOWED: "false"
+      # Caddy is the only client and sets X-Forwarded-For, so the log and the login throttling see the real address
+      IP_HEADER: X-Forwarded-For
+      LOGIN_RATELIMIT_SECONDS: "60"
+      LOGIN_RATELIMIT_MAX_BURST: "10"
+      # Site icons are fetched by the server, not by every client
+      ICON_SERVICE: internal
+      LOG_LEVEL: warn
+      EXTENDED_LOGGING: "true"
+{% if vaultwarden_sso_ready | bool %}
+      SSO_ENABLED: "true"
+      SSO_ONLY: "false"
+      SSO_AUTHORITY: https://{{ vaultwarden_idp_domain }}/application/o/{{ vaultwarden_sso_slug }}/
+      SSO_CLIENT_ID: {{ vaultwarden_sso_slug }}
+      SSO_SCOPES: "email profile offline_access"
+      SSO_PKCE: "true"
+      SSO_SIGNUPS_ALLOWED: "{{ vaultwarden_sso_signups | bool | lower }}"
+      SSO_SIGNUPS_MATCH_EMAIL: "true"
+      SSO_ALLOW_UNKNOWN_EMAIL_VERIFICATION: "false"
+{% endif %}
+{% if vaultwarden_admin_enabled %}
+      ADMIN_TOKEN_FILE: /run/secrets/admin_token
+{% endif %}
+{% for key, value in vaultwarden_extra_env.items() %}
+      {{ key }}: "{{ value }}"
+{% endfor %}
+    ports:
+      - "{{ vaultwarden_http_port }}:80"
+    volumes:
+      - ./data:/data
+{% if vaultwarden_admin_enabled %}
+      - ./admin_token:/run/secrets/admin_token:ro
+{% endif %}
+    depends_on:
+      db:
+        condition: service_healthy

@@ -1,0 +1,65 @@
+---
+caddy_email: "admin@example.com"
+caddy_dns_module: "github.com/Forever-Young/zoneedit@7c8620e"
+caddy_dns_provider: "zoneedit {env.ZONEEDIT_USER} {env.ZONEEDIT_TOKEN}"
+caddy_env:
+  ZONEEDIT_USER: "{{ caddy_dns_user }}"
+  ZONEEDIT_TOKEN: "{{ caddy_dns_api_token }}"
+caddy_forward_auth_upstream: "http://{{ lab_idp_addr }}:9010"
+# Internet exposure (once unifi_public_exposure is on): only sites with public: true answer outside
+# addresses; lan_paths keep admin surfaces LAN-only even on a public site, public_path_regexp turns that
+# around (only the matching paths answer outside addresses). Everything else is LAN-only.
+caddy_sites:
+  # Sign-in for everything public: password plus TOTP/WebAuthn, reputation lockout (tofu mfa.tf)
+  - host: "auth.{{ base_domain }}"
+    upstream: "{{ lab_idp_addr }}:9000"
+    public: true
+    lan_paths: [/if/admin/*, /api/v3/admin/*]
+    device_trust: true # client certificate request and key hash header, while device_trust_mode is not off
+  # Anonymous browsing and cloning of public repos; sign-in through Authentik
+  - host: "git.{{ base_domain }}"
+    upstream: "{{ lab_git_addr }}:3000"
+    public: true
+    lan_paths: [/user/sign_up*, /-/admin*, /admin*, /api/v1/admin/*]
+  # Sync clients use app passwords; Nextcloud's brute-force protection sees real client IPs (trusted proxy)
+  - host: "cloud.{{ base_domain }}"
+    upstream: "{{ lab_cloud_addr }}:8080"
+    public: true
+    lan_paths: [/settings/admin*, /index.php/settings/admin*]
+  # Nextcloud Office (Collabora). Public: the browser loads the editor from here whenever a document opens,
+  # at home or away. Collabora only works for documents from cloud.<base_domain> (aliasgroup1); its admin
+  # console and metrics stay LAN-only.
+  - host: "office.{{ base_domain }}"
+    upstream: "{{ lab_cloud_addr }}:9980"
+    public: true
+    lan_paths: [/browser/dist/admin/*, /cool/adminws*, /cool/getMetrics*]
+  # Jellyfin from outside: sign-in only through the SSO plugin (Authentik OIDC, MFA) and Quick Connect codes
+  # approved from that session. Password login, the setup wizard and the plugin's unused SAML endpoints are
+  # LAN-only, so the internet cannot guess passwords (LDAP binds would test real Authentik passwords without
+  # MFA). Jellyfin routes are case-insensitive and also answer under /emby, hence a regexp
+  # (docs/howto/jellyfin-sso.md lists the bypass cases it was tested against).
+  - host: "media.{{ base_domain }}"
+    upstream: "{{ lab_media_addr }}:8096"
+    public: true
+    lan_path_regexp: '"(?i)^(/+emby)?/+(startup(/|$)|sso/+saml(/|$)|users/+(authenticatebyname|forgotpassword(/+pin)?|[^/]+/+authenticate)/*$)"'
+  # Web UI behind Authentik forward auth; Subsonic apps send Basic auth with an Authentik app password
+  - { host: "music.{{ base_domain }}", upstream: "{{ lab_media_addr }}:4533", navidrome: true, public: true }
+  # Audiobookshelf does its own OIDC with Authentik (web and mobile apps); no forward auth in front
+  - { host: "books.{{ base_domain }}", upstream: "{{ lab_media_addr }}:13378", public: true }
+  - { host: "sync.{{ base_domain }}", upstream: "{{ lab_sync_addr }}:8384", forward_auth: true }
+  # VPN coordination server (Headscale, docs/howto/vpn.md). Public: devices away from home must reach it
+  # to join and to get their keys and routes. Sign-in goes through Authentik; nothing else is served.
+  - { host: "hs.{{ base_domain }}", upstream: "{{ lab_hs_addr }}:8080", public: true }
+  # Password manager (Vaultwarden). Public for the apps away from home; the admin page is LAN-only.
+  # Sign-in: Authentik (SSO) or the master password; the vault itself only ever opens with the master password.
+  - host: "vault.{{ base_domain }}"
+    upstream: "{{ lab_vault_addr }}:8180"
+    public: true
+    lan_paths: [/admin, /admin/*]
+  # Device management (Fleet, docs/howto/mdm.md). Phones talk to it from anywhere: Apple's MDM check-in and
+  # command channel, SCEP for the device identity, the enrollment page and profile. The console and the admin
+  # API stay LAN-only (and VPN, which arrives as a LAN address). Paths from Fleet's own list of what to expose.
+  - host: "mdm.{{ base_domain }}"
+    upstream: "{{ lab_mdm_addr }}:8280"
+    public: true
+    public_path_regexp: '"^/(mdm/apple/(mdm|scep)$|api/mdm/acme/|enroll$|api/[^/]+/fleet/(enrollment_profiles/ota|ota_enrollment)$|assets/)"'

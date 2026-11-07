@@ -1,0 +1,35 @@
+---
+# Seal one secret to this host's TPM (ADR-0006). The unit then loads it with
+#   LoadCredentialEncrypted=<name>:/etc/credstore.encrypted/<name>
+# and reads $CREDENTIALS_DIRECTORY/<name>. Only this TPM can open the file: a copy of the disk, a PBS backup
+# restored elsewhere, or a cloned VM with a new vTPM gets ciphertext. No PCR binding (--tpm2-pcrs= empty, the
+# systemd default): VMs here do not measure boot, and a firmware update must not lock services out.
+#
+#   - ansible.builtin.include_role:
+#       name: tpm
+#       tasks_from: seal
+#     vars:
+#       tpm_seal_name: example-app-enroll-token
+#       tpm_seal_value: "{{ some_secret }}"
+- name: "Sealed to this host's TPM: {{ tpm_seal_name }}"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      umask 077
+      dst='{{ tpm_credstore }}/{{ tpm_seal_name }}'
+      new=$(mktemp /run/tpm-seal.XXXXXX); trap 'rm -f "$new" "$dst.tmp"' EXIT
+      cat > "$new"
+      if [ -f "$dst" ] && systemd-creds decrypt --name='{{ tpm_seal_name }}' "$dst" - 2> /dev/null | cmp -s - "$new"; then
+        echo unchanged
+        exit 0
+      fi
+      install -d -m 0700 -o root -g root '{{ tpm_credstore }}'
+      systemd-creds encrypt --with-key=tpm2 --tpm2-device='{{ tpm_device }}' --name='{{ tpm_seal_name }}' "$new" "$dst.tmp"
+      mv -f "$dst.tmp" "$dst"
+      echo sealed
+    executable: /bin/bash
+    stdin: "{{ tpm_seal_value }}"
+    stdin_add_newline: false
+  register: tpm_seal
+  changed_when: tpm_seal.stdout == 'sealed'
+  no_log: true

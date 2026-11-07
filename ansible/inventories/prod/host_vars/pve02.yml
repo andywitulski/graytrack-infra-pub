@@ -1,0 +1,12 @@
+pve_nic_pins:
+    - { name: nic0, mac: 00:00:5e:00:53:0a}
+    - { name: nic1, mac: 00:00:5e:00:53:0b}
+pve_net_bridge_port: nic0
+pve_net_address: __MGMT_NET__.3/24
+pve_net_gateway: __MGMT_NET__.1
+pve_net_storage:
+    iface: nic1
+    bridge: vmbr1
+    address: __STOR_NET__.3/24
+pve_net_eee_off: []
+pve_blacklist_modules: [iwlmvm, iwlwifi]

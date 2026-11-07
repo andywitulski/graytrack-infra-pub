@@ -1,0 +1,94 @@
+---
+- name: Create the cluster on the first node (if not already clustered)
+  hosts: pve_nodes[0]
+  become: true
+  tasks:
+    - name: Cluster status
+      check_mode: false  # read-only; --check needs the real answer
+      ansible.builtin.command: pvecm status
+      register: pvecm_first
+      changed_when: false
+      failed_when: false
+
+    - name: Create cluster
+      ansible.builtin.command: "pvecm create {{ cluster_name }}"
+      when: pvecm_first.rc != 0
+      changed_when: true
+
+    - name: Read the API certificate fingerprint
+      check_mode: false  # read-only; --check needs the real answer
+      ansible.builtin.shell: >-
+        set -o pipefail &&
+        openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256 | cut -d= -f2
+      args:
+        executable: /bin/bash
+      register: pve_fp
+      changed_when: false
+
+- name: Join remaining nodes, one at a time
+  hosts: pve_nodes[1:]
+  become: true
+  serial: 1
+  vars:
+    first: "{{ groups['pve_nodes'][0] }}"
+  tasks:
+    - name: Cluster status
+      check_mode: false  # read-only; --check needs the real answer
+      ansible.builtin.command: pvecm status
+      register: pvecm_node
+      changed_when: false
+      failed_when: false
+
+    - name: List guests on the joining node
+      check_mode: false  # read-only; --check needs the real answer
+      ansible.builtin.shell: >-
+        set -o pipefail &&
+        { qm list | tail -n +2; pct list | tail -n +2; }
+      args:
+        executable: /bin/bash
+      register: guests
+      changed_when: false
+      when: pvecm_node.rc != 0
+
+    - name: Refuse to join a node that has guests
+      ansible.builtin.assert:
+        that: guests.stdout | trim | length == 0
+        fail_msg: "{{ inventory_hostname }} has guests; a node must be empty to join a cluster."
+      when: pvecm_node.rc != 0
+
+    - name: Join through the API (non-interactive)
+      ansible.builtin.command: >-
+        pvesh create /cluster/config/join
+        --hostname {{ hostvars[first].ansible_host }}
+        --fingerprint {{ hostvars[first].pve_fp.stdout | trim }}
+        --password {{ lookup('ansible.builtin.env', 'PVE_JOIN_PASSWORD') | quote }}
+      when: pvecm_node.rc != 0
+      changed_when: true
+      no_log: true
+
+# Guard: a bad edit once set the totem protocol version to 3 (an unanchored sed) and cost a node
+# its quorum. Corosync 3 speaks totem version 2; fail loudly before anything else touches the cluster.
+- name: Cluster configuration sanity
+  hosts: pve_nodes
+  become: true
+  tasks:
+    # The node-local copy is what corosync actually runs (an isolated node keeps its own)
+    - name: Read this node's corosync configuration
+      ansible.builtin.slurp:
+        src: /etc/corosync/corosync.conf
+      register: pve_corosync
+
+    - name: Totem protocol version is 2
+      vars:
+        pve_totem_versions: "{{ pve_corosync.content | b64decode | regex_findall('(?m)^\\s+version:\\s*(\\d+)\\s*$') }}"
+      ansible.builtin.assert:
+        that: pve_totem_versions == ['2']
+        fail_msg: "corosync.conf totem 'version' must be 2, found {{ pve_totem_versions }}. Fix it on a quorate node and bump config_version."
+        quiet: true
+
+    - name: Every node holds the same cluster configuration
+      ansible.builtin.assert:
+        that: (pve_corosync.content | b64decode | regex_search('config_version:\\s*(\\d+)', '\\1') | first)
+          == (hostvars[groups['pve_nodes'][0]].pve_corosync.content | b64decode | regex_search('config_version:\\s*(\\d+)', '\\1') | first)
+        fail_msg: "{{ inventory_hostname }} has a different corosync config_version than {{ groups['pve_nodes'][0] }} (isolated node?)."
+        quiet: true

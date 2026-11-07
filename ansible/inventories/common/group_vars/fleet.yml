@@ -1,0 +1,6 @@
+---
+# Fleet (device management, docs/howto/mdm.md). Read the release notes before a bump; Fleet migrates its
+# database on start (the fleet-migrate service), so the night's PBS backup is the rollback.
+# renovate: datasource=docker depName=fleetdm/fleet
+fleet_version: "v4.93.2"
+fleet_domain: "mdm.{{ base_domain }}"

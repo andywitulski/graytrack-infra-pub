@@ -1,0 +1,48 @@
+---
+- name: NFS server
+  ansible.builtin.apt:
+    name: nfs-kernel-server
+    state: present
+
+- name: NFSv4.2 only
+  ansible.builtin.copy:
+    dest: /etc/nfs.conf.d/labstack.conf
+    content: |
+      # Managed by Ansible (labstack-infra).
+      [nfsd]
+      vers3=n
+      vers4.0=n
+      vers4.1=n
+      vers4.2=y
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart nfs-server
+
+- name: Exports drop-in directory
+  ansible.builtin.file:
+    path: /etc/exports.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Exports (one line per path, restricted to named clients)
+  ansible.builtin.copy:
+    dest: /etc/exports.d/labstack.exports
+    content: |
+      # Managed by Ansible (labstack-infra). Manual edits will be reverted.
+      {% for e in nfs_server_exports %}
+      {{ e.path }} {% for c in e.clients %}{{ c }}({{ e.options }}) {% endfor %}
+
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload exports
+
+- name: NFS server running
+  ansible.builtin.systemd_service:
+    name: nfs-server
+    enabled: true
+    state: started

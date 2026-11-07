@@ -1,0 +1,11 @@
+---
+# Registered devices as a sign-in factor (ADR-0006, docs/howto/device-trust.md). The Ansible half of one
+# switch; tofu/authentik/<env>/main.tf (device_trust) is the Authentik half. Keep both at the same value.
+#   "off"      nothing changes
+#   "enroll"   step-ca-login issues device certificates (provisioner authentik-device); Caddy asks for a
+#              client certificate on auth.<domain> and passes the verified key's hash to Authentik
+#   "enforce"  the same here; Authentik then acts on the hash (tiered sign-in)
+# Quoted: a bare off is YAML false.
+device_trust_mode: "enroll"
+# Header Caddy sets and Authentik's policy reads (tofu/modules/authentik_config/device_trust.tf)
+device_trust_header: X-Labstack-Device-Key

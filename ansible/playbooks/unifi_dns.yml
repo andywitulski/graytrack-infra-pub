@@ -1,0 +1,189 @@
+---
+# Local DNS records on the UniFi gateway from the inventories, Caddy's sites and network/dns.yml.
+#   bin/ap prod playbooks/unifi_dns.yml --check      the records it would add, change and report
+#   bin/ap prod playbooks/unifi_dns.yml
+# Uses the Network application's v2 API (static-dns, the "DNS Records" page) with the same API key as
+# unifi_firewall.yml. Records it does not produce are left alone unless unifi_dns_prune is true.
+# A name can also live on a client device (fixed IP plus "Local DNS Record" in its settings); UniFi then
+# refuses a DNS record for it. Those count as present: right address, nothing to do; wrong address,
+# reported (change it on the client, this play does not edit client devices).
+- name: UniFi local DNS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../network/zone_policy.yml
+    - ../network/dns.yml
+  vars:
+    unifi_dns_api: "https://{{ unifi_host }}/proxy/network/v2/api/site/default/static-dns"
+    unifi_dns_clients_api: "https://{{ unifi_host }}/proxy/network/api/s/default/rest/user"
+    unifi_dns_headers:
+      X-API-KEY: "{{ unifi_api_key }}"
+      Accept: application/json
+    unifi_dns_domain: "{{ hostvars[(groups['pve_nodes'] + groups['service_guests'])[0]]['base_domain'] }}"
+  tasks:
+    - name: Credentials are filled in
+      ansible.builtin.assert:
+        that:
+          - unifi_host | default('') | length > 0
+          - unifi_api_key | default('') | length > 0
+        fail_msg: "Set unifi_host and unifi_api_key in sops"
+        quiet: true
+
+    - name: Hosts of this inventory
+      ansible.builtin.set_fact:
+        unifi_dns_hosts: >-
+          {{ dict((groups['pve_nodes'] + groups['service_guests']) | unique
+                  | zip((groups['pve_nodes'] + groups['service_guests']) | unique | map('extract', hostvars, 'ansible_host'))) }}
+
+    - name: Hosts of the peer inventories (network/dns.yml)
+      vars:
+        unifi_dns_inv: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../inventories/' ~ item ~ '/hosts.yml') | from_yaml }}"
+        unifi_dns_inv_hosts: >-
+          {{ (unifi_dns_inv.all.children.pve_nodes.hosts | default({}, true))
+             | combine(unifi_dns_inv.all.children.service_guests.hosts | default({}, true)) }}
+      ansible.builtin.set_fact:
+        unifi_dns_hosts: >-
+          {{ unifi_dns_hosts | combine(dict(unifi_dns_inv_hosts.keys()
+                                             | zip(unifi_dns_inv_hosts.values() | map(attribute='ansible_host')))) }}
+      loop: "{{ unifi_dns_peer_inventories }}"
+
+    - name: Wanted records
+      vars:
+        unifi_dns_edge: "{{ hostvars[groups['caddy'][0]]['ansible_host'] }}"
+        unifi_dns_sites: "{{ hostvars[groups['caddy'][0]]['caddy_sites'] | map(attribute='host') | list }}"
+      ansible.builtin.set_fact:
+        unifi_dns_wanted: >-
+          {{ dict(unifi_dns_hosts.keys() | map('regex_replace', '$', '.' ~ unifi_dns_domain)
+                  | zip(unifi_dns_hosts.values() | map('string')))
+             | combine(dict(unifi_dns_sites | zip([unifi_dns_edge] * (unifi_dns_sites | length))))
+             | combine(dict(unifi_dns_extra | map(attribute='name') | map('regex_replace', '$', '.' ~ unifi_dns_domain)
+                            | zip(unifi_dns_extra | map(attribute='ip') | map('string')))) }}
+
+    - name: Records on the gateway
+      ansible.builtin.uri:
+        url: "{{ unifi_dns_api }}"
+        headers: "{{ unifi_dns_headers }}"
+        validate_certs: false
+      register: unifi_dns_now
+      check_mode: false
+
+    - name: Client devices with their own local DNS record
+      ansible.builtin.uri:
+        url: "{{ unifi_dns_clients_api }}"
+        headers: "{{ unifi_dns_headers }}"
+        validate_certs: false
+      register: unifi_dns_clients
+      check_mode: false
+
+    - name: Names held by client devices
+      vars:
+        unifi_dns_c: >-
+          {{ unifi_dns_clients.json.data | selectattr('local_dns_record_enabled', 'defined')
+             | selectattr('local_dns_record_enabled') | selectattr('local_dns_record', 'defined')
+             | rejectattr('local_dns_record', 'equalto', '') | list }}
+      ansible.builtin.set_fact:
+        unifi_dns_device: >-
+          {{ dict(unifi_dns_c | map(attribute='local_dns_record')
+                  | zip(unifi_dns_c | map(attribute='fixed_ip', default='(no fixed IP)'))) }}
+
+    - name: Plan
+      vars:
+        unifi_dns_a: "{{ unifi_dns_now.json | selectattr('record_type', 'equalto', 'A') | list }}"
+        unifi_dns_have: "{{ dict(unifi_dns_a | map(attribute='key') | zip(unifi_dns_a)) }}"
+      ansible.builtin.set_fact:
+        unifi_dns_create: >-
+          {% set out = [] %}{% for k, v in unifi_dns_wanted.items() if k not in unifi_dns_have
+             and k not in unifi_dns_device %}{% set _ = out.append({'key': k, 'value': v}) %}{% endfor %}{{ out }}
+        unifi_dns_device_wrong: >-
+          {% set out = [] %}{% for k, v in unifi_dns_wanted.items() if k in unifi_dns_device
+             and unifi_dns_device[k] != v %}{% set _ = out.append(k ~ ': client says ' ~ unifi_dns_device[k] ~ ', inventory ' ~ v) %}{%
+             endfor %}{{ out }}
+        unifi_dns_update: >-
+          {% set out = [] %}{% for k, v in unifi_dns_wanted.items() if k in unifi_dns_have
+             and (unifi_dns_have[k].value != v or not unifi_dns_have[k].enabled | default(true)) %}{%
+             set _ = out.append({'key': k, 'value': v, 'old': unifi_dns_have[k].value, 'record': unifi_dns_have[k]}) %}{%
+             endfor %}{{ out }}
+        unifi_dns_unmanaged: >-
+          {{ unifi_dns_a | selectattr('key', 'match', '.*\.' ~ (unifi_dns_domain | regex_escape) ~ '$')
+             | rejectattr('key', 'in', unifi_dns_wanted) | list }}
+
+    - name: What changes
+      ansible.builtin.debug:
+        msg:
+          - "add:    {{ unifi_dns_create | map(attribute='key') | zip(unifi_dns_create | map(attribute='value')) | map('join', ' -> ') | list }}"
+          - "on client devices (left there): {{ unifi_dns_device.keys() | select('in', unifi_dns_wanted) | list }}"
+          - "change: {{ unifi_dns_update | map(attribute='key') | zip(unifi_dns_update | map(attribute='old'), unifi_dns_update | map(attribute='value'))
+                        | map('join', ' ') | list }}"
+          - "{{ 'delete' if unifi_dns_prune | bool else 'not managed here (left alone)' }}: {{
+                unifi_dns_unmanaged | map(attribute='key') | zip(unifi_dns_unmanaged | map(attribute='value')) | map('join', ' -> ') | list }}"
+
+    - name: Client devices whose local DNS record disagrees with the inventory
+      ansible.builtin.debug:
+        msg:
+          - "Fix these on the client (UniFi, Client Devices, the device, Settings, Fixed IP / Local DNS Record)"
+          - "or remove the client's record so this play can manage the name: {{ unifi_dns_device_wrong }}"
+      when: unifi_dns_device_wrong | length > 0
+
+    - name: Add records
+      ansible.builtin.uri:
+        url: "{{ unifi_dns_api }}"
+        method: POST
+        headers: "{{ unifi_dns_headers }}"
+        body_format: json
+        body: { key: "{{ item.key }}", record_type: A, value: "{{ item.value }}", enabled: true }
+        validate_certs: false
+      loop: "{{ unifi_dns_create }}"
+      loop_control:
+        label: "{{ item.key }} -> {{ item.value }}"
+      when: not ansible_check_mode
+      changed_when: true
+
+    - name: Change records
+      ansible.builtin.uri:
+        url: "{{ unifi_dns_api }}/{{ item.record._id }}"
+        method: PUT
+        headers: "{{ unifi_dns_headers }}"
+        body_format: json
+        body: "{{ item.record | combine({'value': item.value, 'enabled': true}) }}"
+        validate_certs: false
+      loop: "{{ unifi_dns_update }}"
+      loop_control:
+        label: "{{ item.key }}: {{ item.old }} -> {{ item.value }}"
+      when: not ansible_check_mode
+      changed_when: true
+
+    - name: Delete records nothing here produces (unifi_dns_prune)
+      ansible.builtin.uri:
+        url: "{{ unifi_dns_api }}/{{ item._id }}"
+        method: DELETE
+        headers: "{{ unifi_dns_headers }}"
+        validate_certs: false
+      loop: "{{ unifi_dns_unmanaged }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - unifi_dns_prune | bool
+        - not ansible_check_mode
+      changed_when: true
+
+    - name: Records on the gateway afterwards
+      ansible.builtin.uri:
+        url: "{{ unifi_dns_api }}"
+        headers: "{{ unifi_dns_headers }}"
+        validate_certs: false
+      register: unifi_dns_after
+      when: not ansible_check_mode
+
+    - name: Every wanted record is there with its address
+      vars:
+        unifi_dns_a_after: "{{ unifi_dns_after.json | selectattr('record_type', 'equalto', 'A') | list }}"
+        unifi_dns_got: "{{ dict(unifi_dns_a_after | map(attribute='key') | zip(unifi_dns_a_after | map(attribute='value'))) }}"
+        unifi_dns_wrong: >-
+          {% set out = [] %}{% for k, v in unifi_dns_wanted.items() if k not in unifi_dns_device and unifi_dns_got.get(k) != v %}{%
+             set _ = out.append(k ~ ' (' ~ (unifi_dns_got.get(k) or 'missing') ~ ')') %}{% endfor %}{{ out }}
+      ansible.builtin.assert:
+        that: unifi_dns_wrong | length == 0
+        fail_msg: "Not as wanted on the gateway: {{ unifi_dns_wrong }}"
+        quiet: true
+      when: not ansible_check_mode

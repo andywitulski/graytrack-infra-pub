@@ -1,0 +1,7 @@
+---
+# v16 left security support on 2026-10-29. v17 is not LTS (to 2027-01-28); the LTS line is v15 (to
+# 2027-07-15), which cannot be reached from v16 (no downgrades). Stay on the stable line and move each release.
+# renovate: datasource=docker depName=codeberg.org/forgejo/forgejo
+forgejo_version: "17.0.1"
+forgejo_domain: "git.{{ base_domain }}"
+forgejo_push_create: false # true only while pushing the mirrored repos back in

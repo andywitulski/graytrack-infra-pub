@@ -1,0 +1,15 @@
+# Managed by Ansible (labstack-infra). DNS for the nested dev cluster, on its gateway only.
+interface={{ lab_node_dev_vnet }}
+bind-dynamic
+except-interface=lo
+no-resolv
+no-hosts
+server={{ lab_node_upstream_dns }}
+domain-needed
+bogus-priv
+{% for name, ip in labnode_dev_hosts.items() %}
+host-record={{ name }}.{{ labnode_dev_domain }},{{ name }},{{ ip }}
+{% endfor %}
+{% for s in labnode_dev_service_names %}
+host-record={{ s }}.{{ labnode_dev_domain }},{{ labnode_dev_edge_ip }}
+{% endfor %}

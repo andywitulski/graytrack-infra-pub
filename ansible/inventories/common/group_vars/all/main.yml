@@ -1,0 +1,17 @@
+---
+# Addresses derived from the inventory (first host of each role group)
+lab_edge_addr: "{{ hostvars[groups['caddy'][0]]['ansible_host'] }}"
+lab_idp_addr: "{{ hostvars[groups['authentik'][0]]['ansible_host'] }}"
+lab_git_addr: "{{ hostvars[groups['forgejo'][0]]['ansible_host'] }}"
+lab_cloud_addr: "{{ hostvars[groups['nextcloud'][0]]['ansible_host'] }}"
+# Only prod runs the password manager and the VPN; elsewhere their Caddy sites point nowhere (502)
+lab_hs_addr: "{{ hostvars[groups['headscale'][0]]['ansible_host'] if groups['headscale'] | default([]) else '127.0.0.1' }}"
+lab_vault_addr: "{{ hostvars[groups['vaultwarden'][0]]['ansible_host'] if groups['vaultwarden'] | default([]) else '127.0.0.1' }}"
+lab_mdm_addr: "{{ hostvars[groups['fleet'][0]]['ansible_host'] if groups['fleet'] | default([]) else '127.0.0.1' }}"
+lab_media_addr: "{{ hostvars[groups['media'][0]]['ansible_host'] }}"
+lab_sync_addr: "{{ hostvars[groups['syncthing'][0]]['ansible_host'] }}"
+lab_pg_addr: "{{ hostvars[groups['postgres'][0]]['ansible_host'] }}"
+lab_bao_addr: "{{ hostvars[groups['openbao'][0]]['ansible_host'] }}"
+lab_ca_addr: "{{ hostvars[groups['step_ca'][0]]['ansible_host'] }}"
+# The storage node's address on the storage network (NFS server)
+lab_nfs_server: "{{ hostvars[groups['storage_nodes'][0]]['pve_net_storage']['address'] | split('/') | first }}"

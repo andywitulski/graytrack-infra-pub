@@ -1,0 +1,623 @@
+---
+# Gateway access: each zone pair's built-in default ("Allow All Traffic") cannot be changed. Access is
+# narrowed with custom policies evaluated BEFORE it: the ALLOWs, then the explicit BLOCK matrix (gateway
+# blocks only while unifi_gateway_lockdown is true). The `index` values below are sent but UniFi assigns
+# its own and renumbers a pair when policies are added; playbooks/unifi_firewall.yml sets the real order
+# per zone pair afterwards (allows first, the pair's block last) and checks it.
+# Gateway destinations use ANY (the gateway's own addresses); the controller ignored IP-targeted ones.
+#
+# Zone policy for the UniFi gateway: the single source of truth for inter-zone traffic.
+# Addresses are the static addresses from tofu/ and the inventory. Default between zones is Block;
+# every policy below is an ALLOW with automatic return traffic. Traffic within one VLAN never
+# reaches the firewall and needs no policy.
+#
+# The module takes ONE port or ONE range per policy, so each entry expands to one policy per port.
+# Policies are matched by name plus zones: keep names stable, or reruns create duplicates.
+#
+# Zone names must match UniFi exactly. One-time UI setup (the module cannot assign networks):
+#   Services zone holds VLAN 120; Dmz (the API name of the DMZ zone) holds VLAN 125 (edge). Zone names are case-sensitive.
+
+unifi_lan: __LAN_NET__.0/24
+# Controllers: where bin/ap and bin/tf run, and the only admin workstations. labnode is gone (becoming a
+# Proxmox node); paw01 is the privileged access workstation VM it will host. Until paw01 exists the
+# admin workstation does the work; both stay allowed, so there is no cutover day.
+#   admin workstation: Internal zone, policies in "from Internal" below. Give it a DHCP reservation first.
+#   paw01:   Management zone (VLAN 100), policies in "from Management (paw01)". Its traffic to the nodes,
+#            pg01, bao01 and ca01 never reaches the gateway (same VLAN): only the guest firewalls apply.
+# Literal addresses on purpose: tofu/envs/prod/firewall.tf and tofu/openbao/prod read these two keys
+# with yamldecode, and inventories/prod/group_vars/all/main.yml lab_controllers must list the same two
+# (roles/postgres checks).
+unifi_workstation: __LAN_NET__.6
+unifi_paw: __MGMT_NET__.30
+unifi_controllers: ["{{ unifi_workstation }}", "{{ unifi_paw }}"]
+unifi_admins: "{{ unifi_controllers }}"
+
+# pve01, pve02, pve03 (the prod cluster) and labnode (standalone, docs/howto/lab-node.md)
+unifi_nodes: [__MGMT_NET__.2, __MGMT_NET__.3, __MGMT_NET__.5, __MGMT_NET__.4]
+unifi_pbs: __MGMT_NET__.21
+unifi_pg: __MGMT_NET__.22    # tofu/platform/prod: OpenTofu state, OpenBao storage
+unifi_bao: __MGMT_NET__.23   # tofu/platform/prod: OpenBao
+unifi_ca: __MGMT_NET__.24    # tofu/platform/prod: step-ca (443 automation and hosts, 8443 people)
+unifi_siem: __SEC_NET__.10
+unifi_edge: __DMZ_NET__.10
+unifi_idp: __SVC_NET__.11
+unifi_git: __SVC_NET__.12
+unifi_cloud: __SVC_NET__.13
+unifi_ai: __SVC_NET__.14
+unifi_pw: __SVC_NET__.16   # pw01: Vaultwarden
+unifi_mdm: __SVC_NET__.17  # mdm01: Fleet (device management)
+unifi_hs: __SVC_NET__.23   # hs01: Headscale (VPN coordination)
+unifi_ts: __SVC_NET__.24   # ts01: Tailscale subnet router (where VPN traffic enters the lab)
+unifi_ts2: __SVC_NET__.25  # ts02: Tailscale exit node (full tunnel for the roaming device)
+unifi_mail: __SVC_NET__.26 # mail01: Stalwart (IMAP, submission), Gmail/Proton sync
+unifi_gpu: __SVC_NET__.15  # tofu/envs/labnode: gpu01, ollama on the discrete GPU and the rag database (labnode)
+unifi_media: __SVC_NET__.20
+unifi_sync: __SVC_NET__.21
+unifi_files: __SVC_NET__.22
+unifi_hdhomerun: __LAN_NET__.160
+unifi_guests:
+  - "{{ unifi_idp }}"
+  - "{{ unifi_git }}"
+  - "{{ unifi_cloud }}"
+  - "{{ unifi_ai }}"
+  - "{{ unifi_pw }}"
+  - "{{ unifi_mdm }}"
+  - "{{ unifi_hs }}"
+  - "{{ unifi_ts }}"
+  - "{{ unifi_ts2 }}"
+  - "{{ unifi_mail }}"
+  - "{{ unifi_gpu }}"
+  - "{{ unifi_media }}"
+  - "{{ unifi_sync }}"
+  - "{{ unifi_files }}"
+
+# ports: list of single ports or ranges ("1514-1515"); [""] for protocols without ports (icmp)
+unifi_zone_policies:
+  # ---------------------------------------------------------------- from Internal (LAN)
+  - name: "LAN to edge web"
+    src_zone: Internal
+    src_ips: ["{{ unifi_lan }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["443"]
+  - name: "LAN to SMB"
+    src_zone: Internal
+    src_ips: ["{{ unifi_lan }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_files }}"]
+    protocol: tcp
+    ports: ["445"]
+  - name: "LAN to mail"
+    src_zone: Internal
+    src_ips: ["{{ unifi_lan }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_mail }}"]
+    protocol: tcp
+    ports: ["993", "465", "443"]
+  - name: "LAN to Syncthing peers"
+    src_zone: Internal
+    src_ips: ["{{ unifi_lan }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_sync }}"]
+    protocol: tcp_udp
+    ports: ["22000"]
+  - name: "Admin to Git SSH"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_git }}"]
+    protocol: tcp
+    ports: ["2222"]
+  - name: "Admin to nodes"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: "{{ unifi_nodes }}"
+    protocol: tcp
+    ports: ["22", "8006"]
+  - name: "Admin to paw01"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["{{ unifi_paw }}"]
+    protocol: tcp
+    ports: ["22"]
+  - name: "Admin to PBS"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["{{ unifi_pbs }}"]
+    protocol: tcp
+    ports: ["22", "8007"]
+  - name: "Controller to tofu state"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["{{ unifi_pg }}"]
+    protocol: tcp
+    ports: ["5432"]
+  - name: "Admin to OpenBao"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["{{ unifi_bao }}"]
+    protocol: tcp
+    ports: ["8200"]
+  - name: "Ansible to platform"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["{{ unifi_pg }}", "{{ unifi_bao }}", "{{ unifi_ca }}"]
+    protocol: tcp
+    ports: ["22"]
+  - name: "Admin to step-ca"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["{{ unifi_ca }}"]
+    protocol: tcp
+    ports: ["443", "8443"]
+  - name: "Ansible to guests"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Services
+    dst_ips: "{{ unifi_guests }}"
+    protocol: tcp
+    ports: ["22"]
+  - name: "Ansible to edge"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["22"]
+  - name: "Admin to SIEM"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Security
+    dst_ips: ["{{ unifi_siem }}"]
+    protocol: tcp
+    ports: ["22", "443"]
+  - name: "Admin to Ollama"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_ai }}", "{{ unifi_gpu }}"]
+    protocol: tcp
+    ports: ["11434"]
+  - name: "Admin to rag DB"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_gpu }}"]
+    protocol: tcp
+    ports: ["5432"]
+  - name: "Admin ping mgmt"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Management
+    dst_ips: ["__MGMT_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+  - name: "Admin ping security"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Security
+    dst_ips: ["__SEC_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+  - name: "Admin ping services"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Services
+    dst_ips: ["__SVC_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+  - name: "Admin ping edge"
+    src_zone: Internal
+    src_ips: ["{{ unifi_workstation }}"]
+    dst_zone: Dmz
+    dst_ips: ["__DMZ_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+
+  # ---------------------------------------------------------------- from Management (paw01)
+  # paw01's paths out of VLAN 100. The same jobs the admin workstation's policies above allow from the LAN.
+  - name: "PAW to edge web"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["443"]
+  - name: "PAW to Git SSH"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_git }}"]
+    protocol: tcp
+    ports: ["2222"]
+  - name: "PAW Ansible to guests"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Services
+    dst_ips: "{{ unifi_guests }}"
+    protocol: tcp
+    ports: ["22"]
+  - name: "PAW Ansible to edge"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["22"]
+  - name: "PAW to SIEM"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Security
+    dst_ips: ["{{ unifi_siem }}"]
+    protocol: tcp
+    ports: ["22", "443"]
+  - name: "PAW to Ollama"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_ai }}", "{{ unifi_gpu }}"]
+    protocol: tcp
+    ports: ["11434"]
+  - name: "PAW to rag DB"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_gpu }}"]
+    protocol: tcp
+    ports: ["5432"]
+  - name: "PAW ping security"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Security
+    dst_ips: ["__SEC_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+  - name: "PAW ping services"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Services
+    dst_ips: ["__SVC_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+  - name: "PAW ping edge"
+    src_zone: Management
+    src_ips: ["{{ unifi_paw }}"]
+    dst_zone: Dmz
+    dst_ips: ["__DMZ_NET__.0/24"]
+    protocol: icmp
+    ports: [""]
+
+  # ---------------------------------------------------------------- from DMZ (edge01 only)
+  - name: "Edge to Authentik"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_idp }}"]
+    protocol: tcp
+    ports: ["9000", "9010"]
+  - name: "Edge to Forgejo"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_git }}"]
+    protocol: tcp
+    ports: ["3000"]
+  - name: "Edge to Nextcloud"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_cloud }}"]
+    protocol: tcp
+    ports: ["8080", "9980"]  # Nextcloud, Collabora (docs/howto/nextcloud-office.md)
+  - name: "Edge to Headscale"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_hs }}"]
+    protocol: tcp
+    ports: ["8080"]
+  - name: "Edge to Vaultwarden"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_pw }}"]
+    protocol: tcp
+    ports: ["8180"]
+  # Fleet: the MDM protocol and enrollment from devices anywhere, the console from the LAN (Caddy decides
+  # which paths answer outside addresses). Outbound to Apple's push service is "Services updates" (443).
+  - name: "Edge to Fleet"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_mdm }}"]
+    protocol: tcp
+    ports: ["8280"]
+  - name: "Edge to media"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_media }}"]
+    protocol: tcp
+    ports: ["8096", "4533", "13378"]
+  - name: "Edge to Syncthing GUI"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_sync }}"]
+    protocol: tcp
+    ports: ["8384"]
+  - name: "Edge updates and ACME"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: tcp
+    ports: ["80", "443"]
+  - name: "Edge to SIEM"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Security
+    dst_ips: ["{{ unifi_siem }}"]
+    protocol: tcp
+    ports: ["1514-1515"]
+
+  # ---------------------------------------------------------------- from Services
+  # VPN traffic leaves ts01 (masqueraded) for the lab's web front and nothing else; Headscale's ACLs decide
+  # who gets this far (docs/howto/vpn.md). Add destinations here and to headscale_routes together.
+  # ts02 (exit node) needs it only to reach Headscale at hs.example.com
+  - name: "VPN router to edge web"
+    src_zone: Services
+    src_ips: ["{{ unifi_ts }}", "{{ unifi_ts2 }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["443"]
+  # WireGuard between devices and ts01 (direct, NAT traversal), STUN; DERP relays fall back to TCP 443
+  - name: "VPN router WireGuard"
+    src_zone: Services
+    src_ips: ["{{ unifi_ts }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: udp
+    ports: ["41641", "3478"]
+  # The exit node is the internet for the devices that use it (headscale_exits): any port out, and
+  # nothing toward the lab (Headscale's autogroup:internet excludes private ranges, and no allow exists)
+  # Mail clients on the VPN (docs/howto/mail.md): IMAP, submission and the account portal on mail01
+  - name: "VPN router to mail"
+    src_zone: Services
+    src_ips: ["{{ unifi_ts }}"]
+    dst_zone: Services
+    dst_ips: ["{{ unifi_mail }}"]
+    protocol: tcp
+    ports: ["993", "465", "443"]
+  # mail01 fetches from Gmail (IMAPS) and sends through it (SMTPS); Proton goes through Bridge, which only
+  # needs HTTPS ("Services updates")
+  - name: "Mail to Gmail"
+    src_zone: Services
+    src_ips: ["{{ unifi_mail }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: tcp
+    ports: ["993", "465"]
+  - name: "VPN exit node to internet"
+    src_zone: Services
+    src_ips: ["{{ unifi_ts2 }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: tcp_udp
+    ports: [""]
+  - name: "Services updates"
+    src_zone: Services
+    src_ips: ["__SVC_NET__.0/24"]
+    dst_zone: External
+    dst_ips: []
+    protocol: tcp
+    ports: ["80", "443"]
+  - name: "Apps to edge for OIDC"
+    src_zone: Services
+    src_ips: ["{{ unifi_git }}", "{{ unifi_cloud }}", "{{ unifi_media }}", "{{ unifi_pw }}", "{{ unifi_hs }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["443"]
+  - name: "Services to SIEM"
+    src_zone: Services
+    src_ips: ["__SVC_NET__.0/24"]
+    dst_zone: Security
+    dst_ips: ["{{ unifi_siem }}"]
+    protocol: tcp
+    ports: ["1514-1515"]
+  - name: "Jellyfin to HDHomeRun"
+    src_zone: Services
+    src_ips: ["{{ unifi_media }}"]
+    dst_zone: Internal
+    dst_ips: ["{{ unifi_hdhomerun }}"]
+    protocol: tcp
+    ports: ["80", "5004"]
+
+  # ---------------------------------------------------------------- from Management
+  - name: "Mgmt updates"
+    src_zone: Management
+    src_ips: ["__MGMT_NET__.0/24"]
+    dst_zone: External
+    dst_ips: []
+    protocol: tcp
+    ports: ["80", "443"]
+  - name: "CA to Authentik for OIDC"
+    src_zone: Management
+    src_ips: ["{{ unifi_ca }}"]
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["443"]
+  - name: "Mgmt to SIEM"
+    src_zone: Management
+    src_ips: "{{ unifi_nodes + [unifi_pbs, unifi_pg, unifi_bao, unifi_ca, unifi_paw] }}"
+    dst_zone: Security
+    dst_ips: ["{{ unifi_siem }}"]
+    protocol: tcp
+    ports: ["1514-1515"]
+
+  # ---------------------------------------------------------------- from Security
+  - name: "SIEM updates"
+    src_zone: Security
+    src_ips: ["{{ unifi_siem }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: tcp
+    ports: ["80", "443"]
+
+  # ---------------------------------------------------------------- to the gateway (DNS only)
+  - name: "Edge DNS"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: Gateway
+    dst_ips: []
+    protocol: tcp_udp
+    ports: ["53"]
+    index: 10000
+  - name: "Services DNS"
+    src_zone: Services
+    src_ips: [__SVC_NET__.0/24]
+    dst_zone: Gateway
+    dst_ips: []
+    protocol: tcp_udp
+    ports: ["53"]
+    index: 10000
+  - name: "Mgmt DNS"
+    src_zone: Management
+    src_ips: [__MGMT_NET__.0/24]
+    dst_zone: Gateway
+    dst_ips: []
+    protocol: tcp_udp
+    ports: ["53"]
+    index: 10000
+  - name: "SIEM DNS"
+    src_zone: Security
+    src_ips: ["{{ unifi_siem }}"]
+    dst_zone: Gateway
+    dst_ips: []
+    protocol: tcp_udp
+    ports: ["53"]
+    index: 10000
+
+
+  # ---------------------------------------------------------------- time sync (outbound is blocked otherwise)
+  - name: "Edge NTP"
+    src_zone: Dmz
+    src_ips: ["{{ unifi_edge }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: udp
+    ports: ["123"]
+  - name: "Services NTP"
+    src_zone: Services
+    src_ips: [__SVC_NET__.0/24]
+    dst_zone: External
+    dst_ips: []
+    protocol: udp
+    ports: ["123"]
+  - name: "Mgmt NTP"
+    src_zone: Management
+    src_ips: [__MGMT_NET__.0/24]
+    dst_zone: External
+    dst_ips: []
+    protocol: udp
+    ports: ["123"]
+  - name: "SIEM NTP"
+    src_zone: Security
+    src_ips: ["{{ unifi_siem }}"]
+    dst_zone: External
+    dst_ips: []
+    protocol: udp
+    ports: ["123"]
+
+  # ---------------------------------------------------------------- internet to edge01 (only while exposed)
+  - name: "Internet to edge web"
+    src_zone: External
+    src_ips: []
+    dst_zone: Dmz
+    dst_ips: ["{{ unifi_edge }}"]
+    protocol: tcp
+    ports: ["443"]
+    public: true
+  # WireGuard straight to the VPN nodes, so devices behind restrictive or carrier NAT connect directly instead of
+  # through Tailscale's relays (relays are fine for browsing, too slow for streaming)
+  - name: "Internet to VPN router"
+    src_zone: External
+    src_ips: []
+    dst_zone: Services
+    dst_ips: ["{{ unifi_ts }}"]
+    protocol: udp
+    ports: ["41641"]
+    public: true
+  - name: "Internet to VPN exit node"
+    src_zone: External
+    src_ips: []
+    dst_zone: Services
+    dst_ips: ["{{ unifi_ts2 }}"]
+    protocol: udp
+    ports: ["41642"]
+    public: true
+
+  # Storage: no policies. Isolated in both directions.
+
+# Explicit blocks: BLOCK, all protocols, IPv4 and IPv6, NEW and INVALID connections only (replies to
+# allowed traffic are never affected), ordered after every allow. Nothing relies on UniFi's built-in
+# zone-pair defaults. External to Gateway is deliberately absent: the WAN needs inbound IPv6 router
+# advertisements and similar control traffic.
+unifi_block_index: 20000
+# Emergency rollback: false removes every explicit block in one run (-e unifi_explicit_blocks_enabled=false).
+unifi_explicit_blocks_enabled: true
+unifi_explicit_blocks:
+  - src_zone: Dmz
+    dst_zones: [Internal, External, Gateway, Vpn, Hotspot, storage, Security, Management, Services]
+  - src_zone: Services
+    dst_zones: [Internal, External, Gateway, Vpn, Hotspot, Dmz, storage, Security, Management]
+  - src_zone: Security
+    dst_zones: [Internal, External, Gateway, Vpn, Hotspot, Dmz, storage, Management, Services]
+  - src_zone: Management
+    dst_zones: [Internal, External, Gateway, Vpn, Hotspot, Dmz, storage, Security, Services]
+  - src_zone: storage
+    dst_zones: [Internal, External, Gateway, Vpn, Hotspot, Dmz, Security, Management, Services]
+  - src_zone: Internal
+    dst_zones: [Dmz, storage, Security, Management, Services]
+  - src_zone: Vpn
+    dst_zones: [Dmz, storage, Security, Management, Services]
+  - src_zone: Hotspot
+    dst_zones: [Dmz, storage, Security, Management, Services]
+  - src_zone: External
+    dst_zones: [Internal, Vpn, Hotspot, Dmz, storage, Security, Management, Services]
+
+# Blocks toward the Gateway zone: lab zones lose the gateway's management interface, DNS stays open
+# through the allows above (verified on the controller). Set false to roll back.
+unifi_gateway_lockdown: true
+
+# Policies created earlier under other names, removed by the playbook.
+unifi_retired_policies:
+  - { name: "TEST Block services to Gateway", src_zone: Services, dst_zone: Gateway }
+  - { name: "Services to gateway (block rest)", src_zone: Services, dst_zone: Gateway }
+  - { name: "Security to gateway (block rest)", src_zone: Security, dst_zone: Gateway }
+  - { name: "Mgmt to gateway (block rest)", src_zone: Management, dst_zone: Gateway }
+
+# Public exposure: HTTPS to edge01 (every web name), plus WireGuard to the VPN nodes. Off: none of them.
+unifi_public_exposure: true
+unifi_port_forward_https:
+  name: "WAN 443 to edge01"
+  protocol: tcp
+  dst_port: "443"
+  fwd_ip: "{{ unifi_edge }}"
+  fwd_port: "443"
+  interface: wan # pfwd_interface on the controller: wan, wan2 or both
+# More forwards, same handling (matched by name, read back). WireGuard to the VPN nodes (docs/howto/vpn.md).
+unifi_port_forward_extra:
+  - { name: "WAN 41641 to ts01", protocol: udp, dst_port: "41641", fwd_ip: "{{ unifi_ts }}", fwd_port: "41641", interface: wan }
+  - { name: "WAN 41642 to ts02", protocol: udp, dst_port: "41642", fwd_ip: "{{ unifi_ts2 }}", fwd_port: "41642", interface: wan }

@@ -1,0 +1,173 @@
+---
+# Log sources on the manager: syslog listener (UniFi), custom decoders and rules.
+# Everything is written into the live manager (persistent wazuh_etc volume) only when it differs,
+# tested with the manager's own config test, and rolled back if that test fails.
+
+# ---------------------------------------------------------------- desired state
+- name: Managed ossec.conf block (empty when no syslog senders are configured)
+  vars:
+    wazuh_manager_conf_markers: ["<!-- labstack:begin -->\n", "<!-- labstack:end -->\n"]
+    wazuh_manager_conf_inner: "{{ lookup('ansible.builtin.template', 'ossec_labstack.xml.j2') }}"
+  ansible.builtin.set_fact:
+    wazuh_manager_conf_block: >-
+      {{ (wazuh_manager_conf_markers | join(wazuh_manager_conf_inner))
+         if wazuh_manager_syslog_allowed_ips | length > 0 else '' }}
+
+# The mounted file seeds new deployments; the live copy below is what the running manager reads
+- name: Mounted manager config carries the same block (new deployments)
+  ansible.builtin.blockinfile:
+    path: "{{ wazuh_manager_dir }}/config/wazuh_cluster/wazuh_manager.conf"
+    marker: "<!-- labstack:{mark} -->"
+    marker_begin: begin
+    marker_end: end
+    block: "{{ lookup('ansible.builtin.template', 'ossec_labstack.xml.j2') }}"
+    state: "{{ 'present' if wazuh_manager_syslog_allowed_ips | length > 0 else 'absent' }}"
+
+- name: Read the live ossec.conf
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, cat, /var/ossec/etc/ossec.conf]
+    chdir: "{{ wazuh_manager_dir }}"
+  register: wazuh_manager_live_conf
+  changed_when: false
+
+- name: Desired ruleset content (templates rendered, plain files read)
+  vars:
+    wazuh_manager_rendered: >-
+      {{ lookup('ansible.builtin.template', item.src) if item.src is match('.*[.]j2$')
+         else lookup('ansible.builtin.file', item.src) }}
+  ansible.builtin.set_fact:
+    wazuh_manager_ruleset_content: "{{ wazuh_manager_ruleset_content | default({}) | combine({item.dest: wazuh_manager_rendered}) }}"
+  loop: "{{ wazuh_manager_ruleset_files }}"
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Read the live ruleset files' checksums
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, bash, -c, 'sha256sum < "$1" 2>/dev/null | cut -d" " -f1', _, "{{ item.dest }}"]
+    chdir: "{{ wazuh_manager_dir }}"
+  loop: "{{ wazuh_manager_ruleset_files }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  register: wazuh_manager_live_sums
+  changed_when: false
+
+- name: Live ossec.conf, if its managed block differs
+  vars:
+    wazuh_manager_conf_pattern: '(?s)\n*<!-- labstack:begin -->.*<!-- labstack:end -->\n*'
+    wazuh_manager_conf_base: "{{ wazuh_manager_live_conf.stdout | regex_replace(wazuh_manager_conf_pattern, '\\n') | trim }}"
+    wazuh_manager_conf_new: "{{ wazuh_manager_conf_base ~ '\n' ~ (('\n' ~ wazuh_manager_conf_block) if wazuh_manager_conf_block | length > 0 else '') }}"
+  ansible.builtin.set_fact:
+    wazuh_manager_writes: >-
+      {{ [{'dest': '/var/ossec/etc/ossec.conf', 'content': wazuh_manager_conf_new}]
+         if (wazuh_manager_conf_new | trim) != (wazuh_manager_live_conf.stdout | trim) else [] }}
+
+- name: Ruleset files, where they differ from the role
+  ansible.builtin.set_fact:
+    wazuh_manager_writes: "{{ wazuh_manager_writes + [{'dest': item.item.dest, 'content': wazuh_manager_ruleset_content[item.item.dest]}] }}"
+  loop: "{{ wazuh_manager_live_sums.results }}"
+  loop_control:
+    label: "{{ item.item.dest }}"
+  when: item.stdout != ((wazuh_manager_ruleset_content[item.item.dest] ~ '\n') | hash('sha256'))
+
+# A renamed ruleset file would otherwise stay behind and load the same rule IDs twice
+- name: Retired ruleset files are gone
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, bash, -c, 'if [ -e "$1" ]; then rm -f "$1" && echo removed; fi', _, "{{ item }}"]
+    chdir: "{{ wazuh_manager_dir }}"
+  loop: "{{ wazuh_manager_retired_ruleset_files }}"
+  register: wazuh_manager_retired
+  changed_when: "'removed' in wazuh_manager_retired.stdout"
+  notify: Restart wazuh manager
+
+# ---------------------------------------------------------------- write, test, roll back on failure
+- name: Apply the changes
+  when: wazuh_manager_writes | length > 0
+  block:
+    - name: Keep the current versions
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, wazuh.manager, bash, -c,
+               'if [ -e "$1" ]; then cp -p "$1" "$1.labstack-bak"; else rm -f "$1.labstack-bak"; fi', _, "{{ item.dest }}"]
+        chdir: "{{ wazuh_manager_dir }}"
+      loop: "{{ wazuh_manager_writes }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      changed_when: false
+
+    - name: Write the new versions
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, wazuh.manager, bash, -c,
+               'cat > "$1.new" && chown root:wazuh "$1.new" && chmod 0660 "$1.new" && mv "$1.new" "$1"', _, "{{ item.dest }}"]
+        chdir: "{{ wazuh_manager_dir }}"
+        stdin: "{{ item.content }}"
+        stdin_add_newline: true
+      loop: "{{ wazuh_manager_writes }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      changed_when: true
+      notify: Restart wazuh manager
+
+    - name: Manager accepts the configuration and ruleset
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, wazuh.manager, /var/ossec/bin/wazuh-analysisd, -t]
+        chdir: "{{ wazuh_manager_dir }}"
+      changed_when: false
+
+  rescue:
+    - name: Put the previous versions back
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, wazuh.manager, bash, -c,
+               'if [ -e "$1.labstack-bak" ]; then mv "$1.labstack-bak" "$1"; else rm -f "$1"; fi', _, "{{ item.dest }}"]
+        chdir: "{{ wazuh_manager_dir }}"
+      loop: "{{ wazuh_manager_writes }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      changed_when: true
+
+    - name: Stop here (the running manager was not restarted and still has the old config)
+      ansible.builtin.fail:
+        msg: >-
+          wazuh-analysisd -t rejected the new config or ruleset; the previous files are restored.
+          Output: {{ ansible_failed_result.stdout_lines | default([]) | join(' | ') }}
+          {{ ansible_failed_result.stderr_lines | default([]) | join(' | ') }}
+
+- name: Apply manager changes before the self-test
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------- self-test
+- name: Each sample log hits its rule (wazuh-logtest)
+  check_mode: false
+  ansible.builtin.command:
+    argv: [docker, compose, exec, -T, wazuh.manager, /var/ossec/bin/wazuh-logtest]
+    chdir: "{{ wazuh_manager_dir }}"
+    stdin: "{{ item.line }}"
+  loop: "{{ wazuh_manager_logtest_samples }}"
+  loop_control:
+    label: "rule {{ item.rule }}"
+  register: wazuh_manager_logtest
+  # logtest needs analysisd up; right after a restart it can take a few seconds
+  # wazuh-logtest writes its report to stderr
+  # Match the final rule line only: a warning that mentions a rule ID must not count as a hit
+  until: >-
+    ("id: '" ~ item.rule ~ "'") in (wazuh_manager_logtest.stdout ~ wazuh_manager_logtest.stderr)
+  retries: 6
+  delay: 10
+  changed_when: false
+  ignore_errors: true
+
+- name: Self-test result
+  ansible.builtin.assert:
+    that:
+      - wazuh_manager_logtest.results | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+      # analysisd skips a rule it cannot attach (unknown if_sid) with only a warning: fail on it
+      - (wazuh_manager_logtest.results | map(attribute='stderr') | join('\n')) is not search('will be ignored')
+    fail_msg: >-
+      {{ (wazuh_manager_logtest.results | map(attribute='stderr') | join('\n'))
+         | regex_findall('WARNING: [(][0-9]+[)]: [^\n]*') | unique | join('; ') }}
+      Samples that missed their rule:
+      {% for r in wazuh_manager_logtest.results if r.failed | default(false) %}
+      expected {{ r.item.rule }}, got [{{ (r.stdout | default('') ~ r.stderr | default('')) | regex_findall("id: '([0-9]+)'") | join(', ') }}];
+      {% endfor %}
+      To see why: docker compose exec wazuh.manager /var/ossec/bin/wazuh-logtest, paste the line, read phases 2 and 3.
+    quiet: true

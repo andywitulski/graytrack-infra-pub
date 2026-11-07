@@ -1,0 +1,111 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - fleet_version | length > 0
+      - fleet_domain | length > 0
+      - fleet_mysql_password | default('PENDING') not in ['', 'PENDING']
+      - fleet_mysql_root_password | default('PENDING') not in ['', 'PENDING']
+      - fleet_server_private_key | default('') | length >= 32
+    fail_msg: >-
+      Set fleet_version and fleet_domain (inventories/common/group_vars/fleet.yml), and the fleet_* secrets
+      (bin/gen-service-secrets {{ lab_env }})
+    quiet: true
+
+- name: Compose template path (this role)
+  ansible.builtin.set_fact:
+    fleet_compose_template_path: "{{ role_path }}/templates/compose.yml.j2"
+
+- name: Fleet stack
+  ansible.builtin.include_role:
+    name: compose_app
+  vars:
+    compose_app_name: fleet
+    compose_app_dir: "{{ fleet_dir }}"
+    compose_app_compose_template: "{{ fleet_compose_template_path }}"
+    compose_app_env:
+      MYSQL_PASSWORD: "{{ fleet_mysql_password }}"
+      MYSQL_ROOT_PASSWORD: "{{ fleet_mysql_root_password }}"
+      SERVER_PRIVATE_KEY: "{{ fleet_server_private_key }}"
+
+- name: Fleet answers
+  check_mode: false  # read-only; --check needs the real answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ fleet_http_port }}/healthz"
+    status_code: 200
+  register: fleet_health
+  until: fleet_health.status == 200
+  retries: 40
+  delay: 5
+
+# Nightly dump before the 02:00 PBS backup, so each backup holds a consistent copy too
+- name: Backup directory
+  ansible.builtin.file:
+    path: "{{ fleet_dir }}/backups"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Dump script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/mysqldump-fleet
+    content: |
+      #!/bin/sh
+      # Managed by Ansible (labstack-infra). Nightly dump of Fleet's database, 14 days kept.
+      set -eu
+      cd {{ fleet_dir }}
+      out="backups/fleet-$(date +%F).sql.gz"
+      docker compose -f compose.yml exec -T db sh -c \
+        'exec mysqldump --single-transaction --routines --triggers -u root --password="$MYSQL_ROOT_PASSWORD" fleet' \
+        | gzip > "$out.tmp"
+      mv "$out.tmp" "$out"
+      find backups -name 'fleet-*.sql.gz' -mtime +14 -delete
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Dump service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mysqldump-fleet.service
+    content: |
+      [Unit]
+      Description=mysqldump for Fleet
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/mysqldump-fleet
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Dump timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mysqldump-fleet.timer
+    content: |
+      [Unit]
+      Description=Nightly mysqldump for Fleet
+
+      [Timer]
+      OnCalendar=*-*-* 01:30:00
+      RandomizedDelaySec=600
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Dump timer enabled
+  ansible.builtin.systemd_service:
+    name: mysqldump-fleet.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Next steps
+  ansible.builtin.debug:
+    msg: >-
+      Fleet is up at https://{{ fleet_domain }} (LAN and VPN only for the console). First run: fleetctl setup,
+      Apple push certificate, then bin/fleet-gitops {{ lab_env }} (docs/howto/mdm.md).

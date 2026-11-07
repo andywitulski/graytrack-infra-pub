@@ -1,0 +1,38 @@
+---
+# Also run by roles/ssh_ca (include_role tasks_from), whose playbook ssh-ca.yml does not run guest_base.
+# Debian 13 container templates start sshd through ssh.socket (systemd holds port 22 and hands it over).
+# A reload sends sshd SIGHUP; sshd then re-executes and binds port 22 itself, which the socket still holds:
+# "fatal: Cannot bind any address", and sshd exits until the next connection reactivates it. Run sshd as
+# its own daemon, as on the nodes and VMs, so every reload works. Sessions survive the restart
+# (KillMode=process); stop the socket before the restart so sshd binds the port itself.
+- name: State of ssh.socket (a unit that does not exist reads as off)
+  ansible.builtin.systemd_service:
+    name: ssh.socket
+  register: guest_base_ssh_socket
+  failed_when: false
+
+- name: The sshd runs as its own daemon, not socket-activated
+  when: >-
+    (guest_base_ssh_socket.status | default({})).UnitFileState | default('') in ['enabled', 'enabled-runtime']
+    or (guest_base_ssh_socket.status | default({})).ActiveState | default('') == 'active'
+  block:
+    - name: Socket activation off
+      ansible.builtin.systemd_service:
+        name: ssh.socket
+        enabled: false
+        state: stopped
+
+    - name: The sshd configuration is valid before the restart
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+
+    - name: The sshd binds port 22 itself
+      ansible.builtin.systemd_service:
+        name: ssh.service
+        enabled: true
+        state: restarted
+
+    - name: The sshd is listening again
+      ansible.builtin.wait_for:
+        port: 22
+        timeout: 20

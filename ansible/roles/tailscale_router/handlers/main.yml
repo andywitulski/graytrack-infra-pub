@@ -1,0 +1,12 @@
+---
+# Only this role's file: sysctl --system also replays the distribution's defaults, and an unprivileged
+# container may not set those kernel-wide keys (permission denied, exit 1). Forwarding is per network
+# namespace, so the container may set it.
+- name: Apply sysctl
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/90-tailscale-router.conf
+  changed_when: true
+
+- name: Restart tailscaled
+  ansible.builtin.systemd_service:
+    name: tailscaled
+    state: restarted

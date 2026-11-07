@@ -1,0 +1,12 @@
+---
+- name: Bootstrap identities and sshd
+  ansible.builtin.import_playbook: bootstrap.yml
+
+- name: Telemetry baseline
+  ansible.builtin.import_playbook: telemetry-baseline.yml
+
+- name: SSH certificates (skipped until bin/ca-init)
+  ansible.builtin.import_playbook: ssh-ca.yml
+
+- name: TPM inventory and EK pins (ADR-0006)
+  ansible.builtin.import_playbook: tpm.yml

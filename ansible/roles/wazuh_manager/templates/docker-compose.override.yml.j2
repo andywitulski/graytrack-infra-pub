@@ -1,0 +1,7 @@
+# Managed by Ansible (labstack-infra). Docker Compose merges this file with docker-compose.yml.
+# The directory is mounted, not the file: Ansible replaces files (new inode) and a single-file
+# bind mount would keep showing the old content.
+services:
+  wazuh.indexer:
+    volumes:
+      - ./config/wazuh_indexer/saml:{{ wazuh_manager_saml_dir_container }}:ro

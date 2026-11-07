@@ -1,0 +1,195 @@
+---
+# Audiobookshelf: native Debian package, first-run claimed by Ansible, libraries and OIDC set through
+# its API. Everything after the package is skipped in check mode (the API calls cannot be dry-run).
+
+- name: Audiobookshelf repository (flat repo, no suite)
+  ansible.builtin.deb822_repository:
+    name: audiobookshelf
+    types: deb
+    uris: "{{ media_abs_repo }}"
+    suites: ./
+    signed_by: "{{ media_abs_key_url }}"
+
+- name: Audiobookshelf
+  ansible.builtin.apt:
+    name: "audiobookshelf{{ '=' ~ media_abs_version if media_abs_version | length > 0 else '' }}"
+    state: present
+    update_cache: true
+  notify: Restart audiobookshelf
+
+- name: Audiobookshelf writes the libraries through labdata (same GID 2000 as on the storage node)
+  ansible.builtin.user:
+    name: audiobookshelf
+    groups: [labdata]
+    append: true
+  notify: Restart audiobookshelf
+
+- name: Audiobookshelf listen settings
+  ansible.builtin.lineinfile:
+    path: /etc/default/audiobookshelf
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+  loop:
+    - { key: PORT, value: "{{ media_abs_port }}" }
+    - { key: HOST, value: "0.0.0.0" } # inbound limited to edge01 by the Proxmox guest firewall
+  notify: Restart audiobookshelf
+
+- name: Audiobookshelf hardening drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/audiobookshelf.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Audiobookshelf hardening (the packaged unit has none)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/audiobookshelf.service.d/hardening.conf
+    content: |
+      # Managed by Ansible (labstack-infra).
+      [Service]
+      # Group-writable files so Samba and Jellyfin (labdata) can share the libraries
+      UMask=0002
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ProtectHome=true
+      PrivateTmp=true
+      ReadWritePaths=/usr/share/audiobookshelf /var/log/audiobookshelf {{ media_abs_libraries | map(attribute='path') | join(' ') }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart audiobookshelf
+
+- name: Audiobookshelf running
+  ansible.builtin.systemd_service:
+    name: audiobookshelf
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Apply a pending restart before talking to the API
+  ansible.builtin.meta: flush_handlers
+
+- name: Audiobookshelf API configuration
+  when: not ansible_check_mode
+  block:
+    - name: Wait for the API
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/status"
+        return_content: true
+      register: media_abs_status
+      until: media_abs_status.status == 200
+      retries: 30
+      delay: 2
+
+    # Until a root user exists, anyone who reaches /init owns the server. Claim it here, on loopback,
+    # in the same run that installs it, before the public DNS record exists (runbook step order).
+    - name: Claim the server (create the root user)
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/init"
+        method: POST
+        body_format: json
+        body:
+          newRoot:
+            username: "{{ media_abs_root_user }}"
+            password: "{{ audiobookshelf_root_password }}"
+        status_code: 200
+      when: not media_abs_status.json.isInit
+      changed_when: true
+      no_log: true
+
+    - name: Sign in as root
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/login"
+        method: POST
+        headers:
+          x-return-tokens: "true"
+        body_format: json
+        body:
+          username: "{{ media_abs_root_user }}"
+          password: "{{ audiobookshelf_root_password }}"
+        return_content: true
+      register: media_abs_login
+      no_log: true
+
+    - name: Current libraries
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/api/libraries"
+        headers:
+          Authorization: "Bearer {{ media_abs_login.json.user.accessToken }}"
+        return_content: true
+      register: media_abs_current
+      no_log: true
+
+    - name: Libraries (created once by name; later edits in the UI are left alone)
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/api/libraries"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ media_abs_login.json.user.accessToken }}"
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          mediaType: "{{ item.media_type }}"
+          provider: "{{ item.provider }}"
+          folders: [{ fullPath: "{{ item.path }}" }]
+        status_code: 200
+      loop: "{{ media_abs_libraries }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.name not in (media_abs_current.json.libraries | map(attribute='name') | list)
+      changed_when: true
+
+    # ABS needs every endpoint spelled out; take them from Authentik's discovery document so a
+    # changed Authentik URL layout cannot drift from what is configured here.
+    - name: Authentik discovery document
+      ansible.builtin.uri:
+        url: "{{ media_abs_oidc_issuer }}.well-known/openid-configuration"
+        return_content: true
+      register: media_abs_discovery
+      when: audiobookshelf_oidc_client_secret | default('PENDING') != 'PENDING'
+
+    - name: OIDC sign-in through Authentik (once the client secret exists)
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/api/auth-settings"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ media_abs_login.json.user.accessToken }}"
+        body_format: json
+        body:
+          authActiveAuthMethods: "{{ media_abs_auth_methods }}"
+          authOpenIDIssuerURL: "{{ media_abs_discovery.json.issuer }}"
+          authOpenIDAuthorizationURL: "{{ media_abs_discovery.json.authorization_endpoint }}"
+          authOpenIDTokenURL: "{{ media_abs_discovery.json.token_endpoint }}"
+          authOpenIDUserInfoURL: "{{ media_abs_discovery.json.userinfo_endpoint }}"
+          authOpenIDJwksURL: "{{ media_abs_discovery.json.jwks_uri }}"
+          # No RP-initiated logout: Authentik would need a registered post-logout URI for it
+          authOpenIDLogoutURL: null
+          authOpenIDClientID: "{{ media_abs_oidc_slug }}"
+          authOpenIDClientSecret: "{{ audiobookshelf_oidc_client_secret }}"
+          authOpenIDTokenSigningAlgorithm: RS256
+          authOpenIDButtonText: "{{ media_abs_oidc_button_text }}"
+          authOpenIDAutoLaunch: "{{ media_abs_oidc_auto_launch | bool }}"
+          authOpenIDAutoRegister: true
+          authOpenIDMatchExistingBy: null
+          authOpenIDGroupClaim: "{{ media_abs_oidc_group_claim }}"
+          authOpenIDMobileRedirectURIs: "{{ media_abs_oidc_mobile_redirect_uris }}"
+          # Prefix of the redirect_uri ABS sends. Unset, ABS sends ".../undefined/auth/openid/callback".
+          authOpenIDSubfolderForRedirectURLs: "{{ media_abs_oidc_redirect_subfolder }}"
+        return_content: true
+      register: media_abs_auth
+      when: audiobookshelf_oidc_client_secret | default('PENDING') != 'PENDING'
+      changed_when: media_abs_auth.json.updated | default(false)
+      no_log: true
+
+    - name: Sign out (drop this run's session)
+      ansible.builtin.uri:
+        url: "{{ media_abs_url }}/logout"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ media_abs_login.json.user.accessToken }}"
+          x-refresh-token: "{{ media_abs_login.json.user.refreshToken }}"
+        status_code: [200, 204, 302]
+      changed_when: false
+      failed_when: false
+      no_log: true

@@ -1,0 +1,140 @@
+---
+# Common containers (group_vars/storage_nodes.yml) plus what only one environment has (its own group_vars)
+- name: Containers this node configures
+  ansible.builtin.set_fact:
+    pve_lxc_host_all: "{{ pve_lxc_host_containers + pve_lxc_host_extra_containers }}"
+
+- name: Intel iGPU firmware (GuC/HuC) for transcoding containers (applies at next reboot)
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/i915.conf
+    content: "options i915 enable_guc={{ pve_lxc_host_i915_guc }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  when: pve_lxc_host_i915_guc is not none
+  notify: Update initramfs
+
+- name: Passthrough IDs are in range
+  ansible.builtin.assert:
+    that: >-
+      item.passthrough_ids | default([]) | map('int') | reject('ge', 1) | list | length == 0
+      and item.passthrough_ids | default([]) | map('int') | reject('le', 65535) | list | length == 0
+    quiet: true
+  loop: "{{ pve_lxc_host_all }}"
+  loop_control:
+    label: "{{ item.vmid }}"
+
+- name: Root may map the passthrough IDs
+  ansible.builtin.lineinfile:
+    path: "{{ item.0 }}"
+    line: "root:{{ item.1 }}:1"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ['/etc/subuid', '/etc/subgid'] | product(pve_lxc_host_all | map(attribute='passthrough_ids', default=[]) | flatten | unique) | list }}"
+
+- name: Every bind mount has key, src and dst
+  ansible.builtin.assert:
+    that:
+      - item.1.key is defined and item.1.key is match('^mp[0-9]+$')
+      - item.1.src is defined and item.1.src is match('^/')
+      - item.1.dst is defined and item.1.dst is match('^/')
+    fail_msg: "container {{ item.0.vmid }}: a mount needs key (mpN), src and dst (absolute paths); got {{ item.1 }}"
+    quiet: true
+  loop: "{{ pve_lxc_host_all | subelements('mounts', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.vmid }} {{ item.1.key | default('?') }}"
+
+- name: Read container configs
+  ansible.builtin.command: pct config {{ item.vmid }}
+  loop: "{{ pve_lxc_host_all }}"
+  loop_control:
+    label: "{{ item.vmid }}"
+  register: pve_lxc_host_configs
+  changed_when: false
+  check_mode: false
+
+- name: Index configs by VMID
+  vars:
+    pve_lxc_host_ids: "{{ pve_lxc_host_configs.results | map(attribute='item.vmid') | list }}"
+    pve_lxc_host_texts: "{{ pve_lxc_host_configs.results | map(attribute='stdout') | list }}"
+  ansible.builtin.set_fact:
+    pve_lxc_host_config_by_id: "{{ dict(pve_lxc_host_ids | zip(pve_lxc_host_texts)) }}"
+
+- name: Bind mounts
+  vars:
+    pve_lxc_host_mount_spec: "{{ item.1.src }},mp={{ item.1.dst }}{{ ',ro=1' if item.1.ro | default(false) else '' }}"
+  ansible.builtin.command: "pct set {{ item.0.vmid }} -{{ item.1.key }} {{ pve_lxc_host_mount_spec }}"
+  loop: "{{ pve_lxc_host_all | subelements('mounts', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.vmid }} {{ item.1.key }}"
+  when: "(item.1.key ~ ': ' ~ pve_lxc_host_mount_spec) not in pve_lxc_host_config_by_id[item.0.vmid]"
+  register: pve_lxc_host_mounts
+  changed_when: true
+
+- name: Device passthrough
+  vars:
+    pve_lxc_host_dev_spec: "{{ item.1.path }},gid={{ item.1.gid }}"
+  ansible.builtin.command: "pct set {{ item.0.vmid }} -{{ item.1.key }} {{ pve_lxc_host_dev_spec }}"
+  loop: "{{ pve_lxc_host_all | subelements('devices', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.vmid }} {{ item.1.key }}"
+  when: "(item.1.key ~ ': ' ~ pve_lxc_host_dev_spec) not in pve_lxc_host_config_by_id[item.0.vmid]"
+  register: pve_lxc_host_devices
+  changed_when: true
+
+- name: Identity map for the passthrough IDs
+  ansible.builtin.shell: |
+    set -euo pipefail
+    f=/etc/pve/lxc/{{ item.vmid }}.conf
+    mapfile -t ids < <(tr ' ' '\n' <<<"$IDS" | sort -nu)
+    want=""
+    for k in u g; do
+      prev=0
+      for id in "${ids[@]}"; do
+        if [[ ! $id =~ ^[0-9]+$ ]]; then echo "bad id: $id" >&2; exit 1; fi
+        if (( id > prev )); then
+          want+="lxc.idmap: $k $prev $((100000 + prev)) $((id - prev))"$'\n'
+        fi
+        want+="lxc.idmap: $k $id $id 1"$'\n'
+        prev=$((id + 1))
+      done
+      if (( prev < 65536 )); then
+        want+="lxc.idmap: $k $prev $((100000 + prev)) $((65536 - prev))"$'\n'
+      fi
+    done
+    want_s=$(printf '%s' "$want" | sort)
+    have_s=$(awk '/^\[/ { exit } /^lxc\.idmap:/' "$f" | sort)
+    if [[ "$want_s" == "$have_s" ]]; then echo unchanged; exit 0; fi
+    export IDMAP="${want%$'\n'}"
+    t=$(mktemp)
+    awk '
+      BEGIN { n = split(ENVIRON["IDMAP"], L, "\n") }
+      /^\[/ && !done { for (i = 1; i <= n; i++) print L[i]; done = 1 }
+      !done && /^lxc\.idmap:/ { next }
+      { print }
+      END { if (!done) for (i = 1; i <= n; i++) print L[i] }
+    ' "$f" > "$t"
+    cat "$t" > "$f"
+    rm -f "$t"
+    echo changed
+  args:
+    executable: /bin/bash
+  environment:
+    IDS: "{{ item.passthrough_ids | map('int') | join(' ') }}"
+  loop: "{{ pve_lxc_host_all | selectattr('passthrough_ids', 'defined') | selectattr('passthrough_ids') | list }}"
+  loop_control:
+    label: "{{ item.vmid }}"
+  register: pve_lxc_host_idmaps
+  changed_when: pve_lxc_host_idmaps.stdout == 'changed'
+
+- name: Restart containers whose mounts, devices or ID map changed
+  vars:
+    pve_lxc_host_changed: >-
+      {{ ((pve_lxc_host_mounts.results | default([]) | selectattr('changed') | map(attribute='item.0.vmid') | list)
+      + (pve_lxc_host_devices.results | default([]) | selectattr('changed') | map(attribute='item.0.vmid') | list)
+      + (pve_lxc_host_idmaps.results | default([]) | selectattr('changed') | map(attribute='item.vmid') | list)) | unique }}
+  ansible.builtin.command: pct reboot {{ item }}
+  loop: "{{ pve_lxc_host_changed }}"
+  changed_when: true

@@ -1,0 +1,72 @@
+# Managed by Ansible (labstack-infra).
+x-fleet-env: &fleet-env
+  FLEET_MYSQL_ADDRESS: db:3306
+  FLEET_MYSQL_DATABASE: fleet
+  FLEET_MYSQL_USERNAME: fleet
+  FLEET_MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+  FLEET_REDIS_ADDRESS: redis:6379
+  # Encrypts what Fleet stores in MySQL (APNs certificate and key, SCEP CA): never change it in place
+  FLEET_SERVER_PRIVATE_KEY: ${SERVER_PRIVATE_KEY}
+  FLEET_SERVER_ADDRESS: 0.0.0.0:8080
+  # TLS ends at Caddy on edge01; it is the only client, so its X-Forwarded-For is the device's address
+  FLEET_SERVER_TLS: "false"
+  FLEET_SERVER_TRUSTED_PROXIES: "{{ fleet_trusted_proxies }}"
+  FLEET_LOGGING_JSON: "true"
+  # osquery results and status (Macs and PCs with fleetd, later) to the container log, so journald and Wazuh
+  FLEET_OSQUERY_RESULT_LOG_PLUGIN: stdout
+  FLEET_OSQUERY_STATUS_LOG_PLUGIN: stdout
+
+services:
+  db:
+    # Fleet supports MySQL 8.0.44+, 8.4 and 9.5 (not 9.6): stay on 8.4 LTS
+    image: docker.io/library/mysql:8.4.8
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: fleet
+      MYSQL_USER: fleet
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Live query results and caches only: nothing worth keeping across a restart
+  redis:
+    image: docker.io/library/redis:8.10.3-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Database migrations, before every start (a no-op when there are none)
+  migrate:
+    image: docker.io/fleetdm/fleet:{{ fleet_version }}
+    restart: "no"
+    command: ["fleet", "prepare", "db", "--no-prompt"]
+    environment: *fleet-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  fleet:
+    image: docker.io/fleetdm/fleet:{{ fleet_version }}
+    restart: unless-stopped
+    command: ["fleet", "serve"]
+    environment: *fleet-env
+    ports:
+      - "{{ fleet_http_port }}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy

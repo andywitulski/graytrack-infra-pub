@@ -1,0 +1,79 @@
+---
+# Builds the dev cluster's unattended-install ISOs on paw01. tofu/envs/labnode uploads them and creates pvedev1-3 when build_dev = true.
+#   Source ISO first: {{ pvedev_iso_dir }}/{{ pve_iso }}  (download and verify from proxmox.com)
+#   PVEDEV_ROOT_PW_HASH=$(openssl passwd -6) bin/ap labnode playbooks/labnode-dev-isos.yml
+- name: Build the dev nodes' install ISOs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    tpl: "{{ playbook_dir }}/templates/pvedev"
+    ais: "podman run --rm -v {{ pvedev_iso_dir }}:/iso:Z localhost/pve-ais"
+  tasks:
+    - name: Root password hash is set for the answer files
+      ansible.builtin.assert:
+        that: lookup('ansible.builtin.env', 'PVEDEV_ROOT_PW_HASH') is match('^\$6\$')
+        fail_msg: "Run with PVEDEV_ROOT_PW_HASH=$(openssl passwd -6) in the environment."
+        quiet: true
+
+    - name: Answer file directory
+      ansible.builtin.file:
+        path: "{{ pvedev_iso_dir }}/pvedev/answers"
+        state: directory
+        mode: "0700"
+
+    - name: Render answer files
+      ansible.builtin.template:
+        src: "{{ tpl }}/answer.toml.j2"
+        dest: "{{ pvedev_iso_dir }}/pvedev/answers/{{ node.name }}.toml"
+        mode: "0600"
+      loop: "{{ pvedev_nodes }}"
+      loop_control:
+        loop_var: node
+      no_log: true
+
+    - name: Check for the auto-install assistant image
+      check_mode: false
+      ansible.builtin.command: podman image exists localhost/pve-ais
+      register: ais_img
+      changed_when: false
+      failed_when: false
+
+    - name: Build the auto-install assistant image
+      ansible.builtin.command: "podman build -t localhost/pve-ais {{ repo_root }}/tools/pve-ais"
+      when: ais_img.rc != 0
+      changed_when: true
+
+    - name: Source Proxmox ISO is present
+      ansible.builtin.stat:
+        path: "{{ pvedev_iso_dir }}/{{ pve_iso }}"
+      register: src_iso
+
+    - name: Fail early if the source ISO is missing
+      ansible.builtin.assert:
+        that: src_iso.stat.exists
+        fail_msg: "{{ pvedev_iso_dir }}/{{ pve_iso }} not found (pve_iso in inventories/labnode/group_vars/all/pvedev.yml)"
+
+    - name: Validate answer files
+      ansible.builtin.command: "{{ ais }} validate-answer /iso/pvedev/answers/{{ node.name }}.toml"
+      loop: "{{ pvedev_nodes }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"
+      changed_when: false
+
+    - name: Build one auto-install ISO per node
+      ansible.builtin.command: >-
+        {{ ais }} prepare-iso /iso/{{ pve_iso }}
+        --fetch-from iso
+        --answer-file /iso/pvedev/answers/{{ node.name }}.toml
+        --output /iso/pvedev/{{ node.name }}-auto.iso
+      args:
+        creates: "{{ pvedev_iso_dir }}/pvedev/{{ node.name }}-auto.iso"
+      register: iso_build
+      failed_when: iso_build.rc != 0 or 'Error' in iso_build.stderr
+      loop: "{{ pvedev_nodes }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"

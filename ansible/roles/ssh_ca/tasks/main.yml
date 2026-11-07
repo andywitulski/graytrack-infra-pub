@@ -1,0 +1,10 @@
+---
+# SSH certificates from ca01 on every node and guest (docs/howto/certificate-authority.md):
+#   - the lab root CA in the system trust store
+#   - sshd accepts user certificates by principal (automation accounts, ssh_ca_people), checks the KRL
+#   - sshd presents a host certificate; the controller's known_hosts trusts the host CA
+#   - ssh_ca_enforce: the automation accounts' static keys are removed once a certificate login works
+# Skipped until bin/ca-init has written the CA's public keys into the repo (ssh_ca_enabled).
+- name: SSH CA
+  ansible.builtin.include_tasks: trust.yml
+  when: ssh_ca_enabled | bool

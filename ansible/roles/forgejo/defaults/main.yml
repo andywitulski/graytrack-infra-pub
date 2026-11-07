@@ -1,0 +1,15 @@
+---
+forgejo_version: ""
+forgejo_domain: ""
+forgejo_http_port: 3000
+forgejo_ssh_port: 2222
+forgejo_push_create: false
+# Public-facing defaults: repos start private and are made public one at a time; e-mail addresses stay hidden
+forgejo_default_private: private      # last | private | public (new repos and push-to-create)
+forgejo_landing_page: explore         # home | explore | organizations | login, or a path such as /alice
+forgejo_idp_domain: "auth.{{ base_domain }}"
+# Local admin for when Authentik is down. Password: forgejo_admin_password (OpenBao, kv/services/<env>/forgejo).
+# If a local admin already exists under another name, set this to that name instead.
+forgejo_breakglass_user: breakglass
+forgejo_breakglass_email: "breakglass@{{ base_domain }}"
+forgejo_dir: /opt/forgejo

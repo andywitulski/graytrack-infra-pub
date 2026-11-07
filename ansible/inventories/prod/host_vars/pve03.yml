@@ -1,0 +1,19 @@
+---
+pve_nic_pins:
+  - { name: nic0, mac: 00:00:5e:00:53:0c }
+  - { name: nic1, mac: 00:00:5e:00:53:0d }
+pve_net_bridge_port: nic0
+pve_net_address: __MGMT_NET__.5/24
+pve_net_gateway: __MGMT_NET__.1
+pve_net_storage:
+  iface: nic1
+  bridge: vmbr1
+  address: __STOR_NET__.5/24
+pve_net_eee_off: [nic0, nic1]
+
+zfs_arc_max_bytes: 8589934592
+
+# Integrated GPU into the media container (gid = render group inside it), with HuC loaded for low-power encode
+lxc_media_devices:
+  - { key: dev0, path: /dev/dri/renderD128, gid: 992 }
+pve_lxc_host_i915_guc: 2

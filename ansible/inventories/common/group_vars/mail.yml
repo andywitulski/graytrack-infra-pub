@@ -1,0 +1,47 @@
+---
+# Mail, stage 1 (docs/howto/mail.md): Stalwart on mail01 holds a mailbox for each person; mbsync keeps
+# each Gmail and Proton account in its own folder tree, both ways; mail goes out through the account it is
+# sent from (Gmail's SMTP, Proton Bridge). Clients use mail.example.com (IMAP 993, submission 465) on the
+# LAN and the VPN. example.com itself is hosted by Proton (its MX, SPF and DKIM point there); stage 2
+# (docs/howto/mail-public-edge.md) would move it, and has to be planned around that.
+#
+# Downloads are pinned by version and sha256 (change both together; the release's own checksum or
+# `sha256sum` of the file you checked).
+# renovate: datasource=github-releases depName=stalwartlabs/stalwart
+mail_stalwart_version: "1.0.2"
+mail_stalwart_sha256: 10bd375d4541e2ffbafdfd5d97d8aa1a5c188438fd8700fbd6f076ee0fc2f24f
+# renovate: datasource=github-releases depName=stalwartlabs/cli
+mail_cli_version: "1.0.14"
+mail_cli_sha256: 78584b238422b0201a7bd223ed95b3c1a7fb8735ad3fa8c884d818a66fd1bc65
+# renovate: datasource=github-releases depName=ProtonMail/proton-bridge
+mail_bridge_version: "3.27.1"
+mail_bridge_sha256: d69eab5674335a41428bf77bde6a9f85667867e2083205625a710f6948e54d86
+
+# The mailboxes' own domain: internal, never in public DNS. Not example.com: Proton hosts that domain, and
+# Stalwart delivers a local domain's mail itself, so mail to any @example.com address would stay here
+# instead of reaching Proton, and nobody could send as their Proton @example.com address.
+mail_domain: "lan.{{ base_domain }}"
+mail_hostname: "mail.{{ base_domain }}"
+
+# One mailbox per person (alice@lan.example.com, bob@lan.example.com: the login, not an address anyone
+# writes to), each with the accounts synced into it.
+#   id      secrets: mail_<id>_address and mail_<id>_password in OpenBao (bin/bao-secret prod set ...);
+#           an account whose secrets are missing or PENDING is skipped, so add it here first, then the secrets
+#   type    gmail (app password) or proton (through Proton Bridge on mail01, its Bridge password)
+#   folder  the folder tree it lands in: <folder>/INBOX, <folder>/Sent, ... (shown as is in mail apps)
+#   send_as optional, in OpenBao like the address (this repo is public): mail_<id>_send_as, the other
+#           addresses this account's server sends as, comma-separated (Proton: the account's other
+#           addresses and aliases, @example.org, @example.com; Gmail: its "Send mail as" aliases)
+# Each person's own password (mail_user_<name>_password, generated) is what mbsync logs in with; on
+# devices, use app passwords made in the account portal (https://mail.example.com).
+mail_users:
+  - name: alice
+    full_name: Alice
+    accounts:
+      - { id: alice_gmail1, type: gmail, folder: Gmail }
+      - { id: alice_proton, type: proton, folder: Proton }
+      - { id: alice_gmail2, type: gmail, folder: Gmail 2 }
+  - name: bob
+    full_name: Bob
+    accounts:
+      - { id: bob_gmail1, type: gmail, folder: Gmail }

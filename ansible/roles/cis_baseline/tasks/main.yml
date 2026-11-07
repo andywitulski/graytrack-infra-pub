@@ -1,0 +1,146 @@
+---
+# ---------------------------------------------------------------- SSH
+# 05- sorts before guest_base's 10-labstack.conf; sshd keeps the first value it reads for each keyword
+- name: SSH hardening (CIS 5.1)
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/05-cis.conf
+    content: |
+      # Managed by Ansible (roles/cis_baseline)
+      PermitRootLogin {{ cis_baseline_permit_root_login }}
+      DisableForwarding {{ 'yes' if cis_baseline_ssh_disable_forwarding else 'no' }}
+      MaxAuthTries 4
+      LoginGraceTime 60
+      ClientAliveInterval 15
+      ClientAliveCountMax 3
+      MaxStartups 10:30:60
+      MaxSessions 10
+      IgnoreRhosts yes
+      HostbasedAuthentication no
+      PermitEmptyPasswords no
+      PermitUserEnvironment no
+      MACs {{ cis_baseline_ssh_macs | join(',') }}
+      Banner /etc/issue.net
+    owner: root
+    group: root
+    mode: "0644"
+  register: cis_baseline_sshd
+
+- name: Full sshd configuration is valid (before the restart)
+  when: cis_baseline_sshd is changed  # noqa: no-handler (must run before the restart handler)
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: true
+  notify: Restart ssh
+
+# Restart now, not at the end of the play: a later failure would otherwise drop the handler and leave
+# the new settings on disk but not in the running sshd
+- name: Apply the SSH settings now
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------- banners
+- name: Login banners (no OS or version details)
+  ansible.builtin.copy:
+    dest: "{{ item }}"
+    content: "{{ cis_baseline_banner }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ (['/etc/issue'] if cis_baseline_manage_issue else []) + ['/etc/issue.net', '/etc/motd'] }}"
+
+# ---------------------------------------------------------------- sudo and su
+- name: Sudo logs to its own file, on a pseudo-terminal, with a short timestamp
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/00-cis
+    content: |
+      Defaults use_pty
+      Defaults logfile="/var/log/sudo.log"
+      Defaults timestamp_timeout=15
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Empty group for su (nobody may su; administration goes through sudo)
+  ansible.builtin.group:
+    name: sugroup
+    system: true
+
+- name: Restrict su to that group
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/su
+    regexp: '^#?\s*auth\s+required\s+pam_wheel\.so'
+    line: "auth       required   pam_wheel.so use_uid group=sugroup"
+    insertafter: '^auth\s+sufficient\s+pam_rootok\.so'
+
+# ---------------------------------------------------------------- files and packages
+# Cloud images without the cron package (systemd timers only) have none of these: skip what is absent
+- name: Cron files present on this host
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop: "{{ cis_baseline_cron_paths }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: cis_baseline_cron
+
+- name: Cron files readable by root only
+  ansible.builtin.file:
+    path: "{{ item.item.path }}"
+    owner: root
+    group: root
+    mode: "{{ item.item.mode }}"
+  loop: "{{ cis_baseline_cron.results | selectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Password history file is root-only
+  ansible.builtin.file:
+    path: /etc/security/opasswd
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Clients nobody here uses
+  ansible.builtin.apt:
+    name: "{{ cis_baseline_remove_packages }}"
+    state: absent
+    purge: true
+
+- name: Journald drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Journald compresses stored entries
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/20-cis.conf
+    content: |
+      [Journal]
+      Compress=yes
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald
+
+# ---------------------------------------------------------------- audit (VMs and nodes; LXCs cannot load rules)
+- name: CIS audit rules
+  when: ansible_facts["virtualization_type"] != "lxc"
+  block:
+    - name: Auditd
+      ansible.builtin.apt:
+        name: auditd
+        state: present
+        lock_timeout: 600
+
+    - name: Rules file
+      ansible.builtin.copy:
+        src: 60-cis.rules
+        dest: /etc/audit/rules.d/60-cis.rules
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Load audit rules

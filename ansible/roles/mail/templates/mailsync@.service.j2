@@ -1,0 +1,15 @@
+# Managed by Ansible (labstack-infra): two-way sync of one person's Gmail and Proton accounts with their
+# mailbox on Stalwart (docs/howto/mail.md). Run by mailsync@<name>.timer; the first run can take hours.
+[Unit]
+Description=Mail sync for %i
+After=network-online.target stalwart.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mailsync
+Group=mailsync
+ExecStart=/usr/bin/mbsync --config {{ mail_sync_dir }}/%i.rc --all
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=12h

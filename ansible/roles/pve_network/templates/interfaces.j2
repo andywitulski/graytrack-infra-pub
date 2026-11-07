@@ -1,0 +1,35 @@
+auto lo
+iface lo inet loopback
+
+auto {{ pve_net_bridge_port }}
+iface {{ pve_net_bridge_port }} inet manual
+{% if pve_net_bridge_port in pve_net_eee_off %}
+    post-up ethtool --set-eee {{ pve_net_bridge_port }} eee off
+{% endif %}
+
+auto vmbr0
+iface vmbr0 inet static
+    address {{ pve_net_address }}
+    gateway {{ pve_net_gateway }}
+    bridge-ports {{ pve_net_bridge_port }}
+    bridge-stp off
+    bridge-fd 0
+    bridge-vlan-aware yes
+    bridge-vids 2-4094
+
+{% if pve_net_storage is defined %}
+auto {{ pve_net_storage.iface }}
+iface {{ pve_net_storage.iface }} inet manual
+{% if pve_net_storage.iface in pve_net_eee_off %}
+    post-up ethtool --set-eee {{ pve_net_storage.iface }} eee off
+{% endif %}
+
+auto {{ pve_net_storage.bridge }}
+iface {{ pve_net_storage.bridge }} inet static
+    address {{ pve_net_storage.address }}
+    bridge-ports {{ pve_net_storage.iface }}
+    bridge-stp off
+    bridge-fd 0
+
+{% endif %}
+source /etc/network/interfaces.d/*

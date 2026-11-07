@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Usage: bin/tf <dev|prod|labnode> <tofu args...>
+# Decrypts that env's secrets into the environment of a single tofu process.
+# State lives in pg01 (tofu/platform/<env>; labnode uses prod's, schema labnode); bin/lib/platform.sh supplies
+# the backend connection.
+# The Proxmox provider's SSH uses a private ssh-agent holding only the short-lived tofu certificate from
+# ca01 (bin/ssh-cert), once the CA exists. LABSTACK_SSH=static keeps your own agent (static tofu key).
+set -euo pipefail
+env="${1:?usage: bin/tf <dev|prod|labnode> <tofu args>}"; shift
+case "$env" in dev|prod|labnode) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+repo_root="$(git rev-parse --show-toplevel)"
+# shellcheck source=lib/platform.sh
+source "$repo_root/bin/lib/platform.sh"
+penv=$(platform_of "$env")
+platform_env "$penv" "$repo_root"
+if platform_cmd_needs_backend "$@"; then
+  platform_need_backend || exit 1
+  tofu_cert_agent "$penv" "$repo_root" || exit 1
+  trap tofu_cert_agent_stop EXIT
+fi
+if [[ "$env" =~ ^(prod|labnode)$ && "${1:-}" =~ ^(apply|destroy|import|state)$ && "${CI:-}" != "true" ]]; then
+  read -r -p "$(printf '%s' "$env" | tr '[:lower:]' '[:upper:]') tofu $1. Type '$env' to continue: " ok
+  [[ "$ok" == "$env" ]] || { echo "aborted"; exit 1; }
+fi
+cd "$repo_root/tofu/envs/$env"
+sops exec-env "$repo_root/secrets/$env.enc.env" "tofu $(printf '%q ' "$@")"

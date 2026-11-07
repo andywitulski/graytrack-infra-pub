@@ -1,0 +1,95 @@
+---
+# step-ca on ca01, configured entirely from here: ca.json is generated, remote management stays off, and
+# the CA keys come from sops (secrets/ca-<env>.enc.yaml, written once by bin/ca-init on the controller).
+#
+# Two instances share the keys and the database:
+#   step-ca        :443   automation. JWK provisioners ansible, tofu, hosts (and ACME when enabled).
+#   step-ca-login  :8443  people. Authentik OIDC provisioner only (step ssh login).
+# step-ca refuses to start when an OIDC provider's discovery document cannot be fetched. Split this way,
+# an Authentik outage stops new logins for people but never the certificates automation needs to fix it.
+# renovate: datasource=github-releases depName=smallstep/certificates
+step_ca_version: "0.30.2"
+step_ca_deb_sha256: "f8e43f0f2ba1e37121b75623993ea0bece5cc3a02b73eefc16e414d41c9fec71"
+step_ca_cli_version: "{{ step_cli_version }}" # inventories/common/group_vars/all/ssh_ca.yml (shared with paw01)
+step_ca_cli_deb_sha256: "{{ step_cli_deb_sha256 }}"
+step_ca_deb_url: "https://github.com/smallstep/certificates/releases/download/v{{ step_ca_version }}/step-ca_{{ step_ca_version }}-1_amd64.deb"
+step_ca_cli_deb_url: "{{ step_cli_deb_url }}"
+
+step_ca_dir: /etc/step-ca
+step_ca_secrets_file: "{{ playbook_dir }}/../../secrets/ca-{{ lab_env }}.enc.yaml"
+step_ca_files_dir: "{{ playbook_dir }}/../files/{{ lab_env }}"
+step_ca_dns_names:
+  - "{{ inventory_hostname }}"
+  - "{{ inventory_hostname }}.{{ base_domain }}"
+  - "{{ ansible_host }}"
+step_ca_port: 443
+step_ca_login_port: 8443
+
+# Database (stepca on the postgres host, TLS verified against its CA in the repo)
+step_ca_pg_host: "{{ hostvars[groups['postgres'][0]]['ansible_host'] }}"
+step_ca_pg_ca_src: "{{ step_ca_files_dir }}/{{ groups['postgres'][0] }}-ca.pem"
+step_ca_pg_db: stepca
+step_ca_pg_user: stepca
+# From sops: stepca_pg_password
+
+# ---------------------------------------------------------------- what may be signed (authority policy)
+# Host names and addresses of every managed host, straight from the inventory, plus the env's domain.
+# Anything else is refused, whoever holds a provisioner password.
+# step_ca_peer_inventories: other inventories whose hosts this CA signs too (labnode uses prod's CA). Their
+# hosts.yml is read on the CA's run (tasks/main.yml sets step_ca_peer_hosts), so no address is typed twice.
+step_ca_peer_inventories: []
+step_ca_host_names: >-
+  {{ ((groups['pve_nodes'] + groups['service_guests'])
+      + (step_ca_peer_hosts | default({})).keys() | list) | unique | sort
+     + ['*.' ~ base_domain] }}
+step_ca_host_ips: >-
+  {{ ((groups['pve_nodes'] + groups['service_guests']) | map('extract', hostvars, 'ansible_host') | list
+      + (step_ca_peer_hosts | default({})).values() | map(attribute='ansible_host') | list)
+     | unique | sort | list }}
+# Automation identities (JWK provisioners, short-lived). Each certificate carries exactly this principal
+# (SSH) and common name (X.509, client authentication only), whatever the request asks for.
+step_ca_automation:
+  ansible: { ssh_default: 8h, ssh_max: 12h, tls_default: 8h, tls_max: 12h }
+  tofu: { ssh_default: 8h, ssh_max: 12h, tls_default: 8h, tls_max: 12h }
+# Host certificates: renewed by roles/ssh_ca from the controller when less than a third is left
+step_ca_host_ssh_duration: 2160h # 90 days
+step_ca_host_tls_default: 720h
+step_ca_host_tls_max: 2160h
+
+# ---------------------------------------------------------------- people (Authentik OIDC, step-ca-login)
+# Certificates carry one principal, the Authentik username (preferred_username), and the e-mail as key ID.
+# Who may get one at all: members of these Authentik groups (bound to the application too,
+# tofu/modules/authentik_config). Which hosts accept it: roles/ssh_ca (ssh_ca_people).
+step_ca_oidc_enabled: true
+step_ca_oidc_client_id: step-ca
+step_ca_oidc_discovery: "https://auth.{{ base_domain }}/application/o/{{ step_ca_oidc_client_id }}/.well-known/openid-configuration"
+step_ca_oidc_groups: [ssh-admins, forgejo-users]
+# Fixed loopback callback, registered as the only redirect URI in Authentik (step uses PKCE)
+step_ca_oidc_listen: "127.0.0.1:10000"
+step_ca_user_ssh_default: 16h
+step_ca_user_ssh_max: 24h
+# Reach Authentik through edge01 even when public DNS answers with the WAN address
+step_ca_idp_pin_address: "{{ hostvars[groups['caddy'][0]]['ansible_host'] }}"
+
+# ---------------------------------------------------------------- devices (Authentik OIDC, step-ca-login)
+# Client certificates for registered devices (ADR-0006, bin/device-cert). The key is made on the device and never
+# leaves it (Secure Enclave on the admin workstation, TPM on paw01); the CA sees only its CSR. Subject = the Authentik
+# username, OU labstack-device, the e-mail as SAN, client authentication only. Issued after a fresh second
+# factor (Authentik application step-ca-device, tofu device_trust.tf), renewal off: re-enroll before it ends.
+# The Authentik application must exist before this provisioner is added: step-ca-login refuses to start when a
+# discovery document cannot be fetched (apply tofu/authentik first, docs/howto/device-trust.md).
+step_ca_device_enabled: "{{ (device_trust_mode | default('off')) != 'off' }}"
+step_ca_device_client_id: step-ca-device
+step_ca_device_discovery: "https://auth.{{ base_domain }}/application/o/{{ step_ca_device_client_id }}/.well-known/openid-configuration"
+step_ca_device_groups: [ssh-admins]
+step_ca_device_tls_default: 720h # 30 days
+step_ca_device_tls_max: 720h
+
+# ---------------------------------------------------------------- ACME (off: nothing uses it yet)
+# docs/howto/using-certificates.md, "ACME". Clients also need a path to ca01:443 (guest firewall, zone policy).
+step_ca_acme_enabled: false
+step_ca_acme_tls_default: 720h
+step_ca_acme_tls_max: 2160h
+
+# Units this role runs (handlers loop over it)
+step_ca_units: "{{ ['step-ca'] + (['step-ca-login'] if step_ca_oidc_enabled | bool else []) }}"

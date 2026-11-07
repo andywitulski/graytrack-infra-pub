@@ -1,0 +1,12 @@
+---
+cluster_name: labstack-dev
+lab_env: dev
+base_domain: dev.example.com
+ntp_servers:
+  - 0.debian.pool.ntp.org
+  - 1.debian.pool.ntp.org
+# Controllers as the nested cluster sees them: paw01, on the dev network itself (__DEV_NET__.2, its second NIC),
+# so nothing is NATed. The admin workstation has no route here. Keep in step with tofu/openbao/dev/main.tf controller_cidrs.
+lab_controllers:
+  - __DEV_NET__.2
+platform_controllers: "{{ lab_controllers | map('regex_replace', '$', '/32') | list }}"

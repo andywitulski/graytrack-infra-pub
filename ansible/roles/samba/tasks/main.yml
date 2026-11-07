@@ -1,0 +1,85 @@
+---
+- name: Data identity
+  ansible.builtin.include_role:
+    name: lab_data_identity
+
+- name: Samba
+  ansible.builtin.apt:
+    name: samba
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Share users (Unix accounts; Samba passwords are set by hand with smbpasswd -a)
+  ansible.builtin.user:
+    name: "{{ item }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+    groups: labdata
+    append: true
+  loop: "{{ samba_users }}"
+
+- name: Samba configuration
+  ansible.builtin.template:
+    src: smb.conf.j2
+    dest: /etc/samba/smb.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: testparm -s %s
+  notify: Restart smbd
+
+- name: NetBIOS name service off
+  ansible.builtin.systemd_service:
+    name: nmbd
+    enabled: false
+    state: stopped
+
+- name: Samba running
+  ansible.builtin.systemd_service:
+    name: smbd
+    enabled: true
+    state: started
+
+- name: Smbd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/smbd.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Smbd bind-address wait script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/smbd-wait-addr
+    content: |
+      #!/bin/sh
+      # Block until the interface smbd binds to has a global IPv4 address.
+      iface="${1:?interface required}"
+      for i in $(seq 60); do
+        ip -4 -o addr show dev "$iface" scope global | grep -q inet && exit 0
+        sleep 1
+      done
+      echo "$iface has no IPv4 after 60s" >&2
+      exit 1
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart smbd
+
+- name: Smbd waits for its bind address
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/smbd.service.d/10-wait-addr.conf
+    content: |
+      [Service]
+      ExecStartPre=/usr/local/sbin/smbd-wait-addr {{ samba_interface }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart smbd
+
+- name: Hand-made smbd override is gone (stock unit already orders after network-online)
+  ansible.builtin.file:
+    path: /etc/systemd/system/smbd.service.d/override.conf
+    state: absent
+  notify: Restart smbd

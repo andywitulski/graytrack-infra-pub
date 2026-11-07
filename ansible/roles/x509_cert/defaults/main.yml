@@ -1,0 +1,18 @@
+---
+# A TLS server certificate from ca01 (step-ca, hosts provisioner) for one service on this host.
+# The key is made on the host and never leaves it: the host writes a CSR, the controller signs it with
+# the hosts provisioner (password from sops, 0600 temporary file), the certificate comes back.
+# Browsers and clients trust it once ca01's root is trusted (docs/howto/admin-ui-tls.md).
+#
+# Set by the caller:
+x509_cert_name: ""              # short name: the directory under x509_cert_base
+x509_cert_dns: []               # DNS names; must match ca01's policy (inventory names, *.base_domain)
+x509_cert_ips: []               # IP addresses; must be inventory addresses
+x509_cert_cn: "{{ inventory_hostname }}"   # ca01's policy allows inventory host names only
+x509_cert_group: root           # group that may read the key (the service's own group)
+# Defaults:
+x509_cert_base: /etc/labstack/x509
+x509_cert_dir: "{{ x509_cert_base }}/{{ x509_cert_name }}"
+x509_cert_duration: 2160h       # 90 days, the hosts provisioner's maximum
+x509_cert_renew_days: 30        # renewed by the next run inside this window, or when names or CA change
+x509_cert_secrets_file: "{{ ssh_ca_secrets_file | default(playbook_dir ~ '/../../secrets/ca-' ~ lab_env ~ '.enc.yaml') }}"

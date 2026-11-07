@@ -1,0 +1,10 @@
+---
+# Headless NVIDIA driver for compute in a VM with a passed-through GPU (gpu01). Debian's packaged driver;
+# ollama brings its own CUDA runtime and only needs the kernel module and libcuda.
+nvidia_headless_packages:
+  - nvidia-kernel-dkms
+  - nvidia-smi
+  - nvidia-persistenced
+  - libcuda1
+  - firmware-misc-nonfree
+nvidia_headless_expect: "GPU"   # nvidia-smi -L must list a GPU matching this

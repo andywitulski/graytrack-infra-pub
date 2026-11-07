@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# bin/fleet-gitops <prod> [--dry-run]
+# Applies fleet/ (Fleet's configuration as code) to the Fleet server: settings, console SSO, enroll secret,
+# configuration profiles. Anything in those sections changed in the Fleet UI is put back.
+# Token and enroll secret from OpenBao (kv/services/<env>/fleet), SSO metadata from bin/tf-ak <env> output.
+# Needs fleetctl (the same version as the server, inventories/common/group_vars/fleet.yml).
+# Nothing secret is printed or left on disk (a private temp config, removed on exit).
+set -euo pipefail
+
+env=${1:?usage: bin/fleet-gitops <prod> [--dry-run]}
+shift
+case "$env" in prod) domain=example.com ;; *) echo "Fleet runs in prod only" >&2; exit 2 ;; esac
+dry=()
+[[ ${1:-} == --dry-run ]] && dry=(--dry-run)
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+command -v fleetctl > /dev/null || { echo "fleetctl not found (docs/howto/mdm.md, Tools)" >&2; exit 1; }
+
+# shellcheck source=lib/platform.sh
+source "$root/bin/lib/platform.sh"
+platform_env "$env" "$root"
+bao_root_token "$env" "$root"
+bao_env_load "$env"
+
+secret() { printf '%s' "$GT_BAO_SECRETS" | jq -er --arg k "$1" '.[$k] // empty | select(. != "PENDING")'; }
+token=$(secret fleet_gitops_token) || { echo "fleet_gitops_token is not set: docs/howto/mdm.md, first run step 4" >&2; exit 1; }
+FLEET_ENROLL_SECRET=$(secret fleet_enroll_secret) || { echo "fleet_enroll_secret missing: bin/gen-service-secrets $env" >&2; exit 1; }
+FLEET_SSO_METADATA=$("$root/bin/tf-ak" "$env" output -raw fleet_saml_metadata)
+[[ $FLEET_SSO_METADATA == *EntityDescriptor* ]] || { echo "no SAML metadata from bin/tf-ak $env output fleet_saml_metadata" >&2; exit 1; }
+# fleetctl pastes $VARS into default.yml as plain text before parsing it as YAML, so multi-line XML (or a
+# secret with YAML characters in it) breaks the file. A JSON string is also a valid YAML double-quoted
+# scalar: hand both over already quoted and escaped (default.yml leaves them unquoted).
+FLEET_SSO_METADATA=$(jq -n --arg v "$FLEET_SSO_METADATA" '$v')
+FLEET_ENROLL_SECRET=$(jq -n --arg v "$FLEET_ENROLL_SECRET" '$v')
+FLEET_URL="https://mdm.$domain"
+export FLEET_URL FLEET_ENROLL_SECRET FLEET_SSO_METADATA
+
+tmp=$(gt_tmpdir)
+trap 'gt_shred_dir "$tmp"' EXIT
+export CONFIG="$tmp/fleetctl.yml"
+# Written directly, not with fleetctl config set --token: a token on a command line shows in ps
+(umask 077 && printf 'contexts:\n  default:\n    address: %s\n    token: %s\n' "$FLEET_URL" "$token" > "$CONFIG")
+unset token
+
+cd "$root/fleet"
+fleetctl gitops -f default.yml "${dry[@]}"

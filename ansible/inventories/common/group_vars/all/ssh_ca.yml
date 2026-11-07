@@ -1,0 +1,42 @@
+---
+# SSH certificates from ca01 (roles/ssh_ca, roles/step_ca, bin/ssh-cert). Shared by every play, so roles
+# that integrate (forgejo) read the same files. docs/howto/certificate-authority.md, docs/howto/using-certificates.md
+ssh_ca_files_dir: "{{ playbook_dir }}/../files/{{ lab_env }}"
+ssh_ca_user_ca_pub: "{{ ssh_ca_files_dir }}/ca01-ssh-user-ca.pub"
+ssh_ca_host_ca_pub: "{{ ssh_ca_files_dir }}/ca01-ssh-host-ca.pub"
+ssh_ca_root_pem: "{{ ssh_ca_files_dir }}/ca01-root.pem"
+ssh_ca_url: "https://{{ lab_ca_addr }}"
+
+# On by itself once bin/ca-init has written the CA's public keys into the repo. Before that, every role
+# skips its SSH CA tasks and nothing changes.
+ssh_ca_enabled: "{{ lookup('ansible.builtin.fileglob', ssh_ca_user_ca_pub, wantlist=True) | length > 0 }}"
+
+# Phase 2: no standing keys. true removes the automation accounts' authorized_keys on every host once a
+# certificate login has been proven from the controller, and guest_base / bootstrap.yml stop putting the
+# static key back. The static key then only opens hosts that were never configured (first runs).
+# Break-glass: bin/ssh-cert <env> breakglass, or the Proxmox console (pct enter / qm guest exec).
+ssh_ca_enforce: false
+
+# People with an account on every node and guest. name is the account and the certificate principal
+# (the Authentik username, which step-ca-login puts in the certificate); sudo without a password, since
+# these accounts have none. Getting a certificate also needs Authentik group ssh-admins or forgejo-users;
+# reaching a host needs this list. Remove someone here and their principal file goes with the next run.
+#   - { name: alice, comment: "Alice Admin", sudo: true }
+ssh_ca_people:
+  - {name: alice, comment: "Alice Admin", sudo: true}
+  - {name: bob, comment: "Bob User", sudo: false}
+
+# Former people: account deleted (home kept) on the next run
+ssh_ca_people_absent: []
+
+# Revoked user certificates (OpenSSH KRL, enforced by every sshd at the next run), one per line:
+#   "serial: 8290738264039429339"     one certificate (ssh-keygen -L shows the serial)
+#   "id: alice@example.com"            every certificate with this key ID (the e-mail for people)
+ssh_ca_revoked: []
+
+# step CLI, one pin for ca01 (roles/step_ca) and the Linux controller paw01 (roles/paw). The admin workstation takes
+# it from Homebrew (docs/howto/certificate-authority.md, Controllers): keep that at this version or later.
+# renovate: datasource=github-releases depName=smallstep/cli
+step_cli_version: "0.31.0"
+step_cli_deb_sha256: "dbea61cba1854e07625d8f064d83441c7f9232edd9440bc08a78614dcc8232fc"
+step_cli_deb_url: "https://github.com/smallstep/cli/releases/download/v{{ step_cli_version }}/step-cli_{{ step_cli_version }}-1_amd64.deb"

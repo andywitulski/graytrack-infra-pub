@@ -1,0 +1,6 @@
+---
+# Read the release notes before a bump: Vaultwarden follows the Bitwarden clients, and an old server can
+# refuse new apps (1.37.2 was needed for clients 2026.8.0+).
+# renovate: datasource=docker depName=vaultwarden/server
+vaultwarden_version: "1.37.4"
+vaultwarden_domain: "vault.{{ base_domain }}"

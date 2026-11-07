@@ -1,0 +1,19 @@
+#!/bin/bash
+# Managed by Ansible (labstack-infra). Manual edits will be reverted (role postgres).
+# Runs as postgres from labstack-pg-dump.timer.
+# One custom-format dump per database plus the roles (globals), kept {{ postgres_dump_keep_days }} days.
+# Restore: docs/howto/platform-tier.md
+set -euo pipefail
+dir={{ postgres_dump_dir }}
+stamp=$(date +%Y%m%d-%H%M%S)
+umask 077
+
+for db in $(psql -XAtc "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1"); do
+  pg_dump --format=custom --file="$dir/$db-$stamp.dump.tmp" "$db"
+  mv "$dir/$db-$stamp.dump.tmp" "$dir/$db-$stamp.dump"
+  echo "dumped $db"
+done
+pg_dumpall --globals-only --file="$dir/globals-$stamp.sql"
+
+find "$dir" -maxdepth 1 -type f \( -name '*.dump' -o -name 'globals-*.sql' \) -mtime +{{ postgres_dump_keep_days }} -delete
+find "$dir" -maxdepth 1 -type f -name '*.tmp' -mmin +60 -delete

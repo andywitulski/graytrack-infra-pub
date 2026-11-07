@@ -1,0 +1,228 @@
+---
+- name: The controller can issue certificates (step CLI, docs/howto/certificate-authority.md)
+  ansible.builtin.command: step version
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  check_mode: false
+
+# ---------------------------------------------------------------- X.509: trust the lab root
+- name: Lab root CA in the system trust store
+  ansible.builtin.copy:
+    src: "{{ ssh_ca_root_pem }}"
+    dest: "/usr/local/share/ca-certificates/labstack-{{ lab_env }}-root.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update CA trust
+
+# ---------------------------------------------------------------- SSH: user certificates
+- name: User CA public key
+  ansible.builtin.copy:
+    src: "{{ ssh_ca_user_ca_pub }}"
+    dest: /etc/ssh/labstack_user_ca.pub
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd for SSH CA
+
+- name: People accounts (certificate login only, no password)
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    comment: "{{ item.comment | default(omit) }}"
+    shell: /bin/bash
+    create_home: true
+    password: "!"
+    update_password: on_create
+  loop: "{{ ssh_ca_people }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: People sudo, without a password (the accounts have none)
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/91-labstack-people
+    content: |
+      # Managed by Ansible (labstack-infra), role ssh_ca: ssh_ca_people with sudo: true
+      {% for p in ssh_ca_people if p.sudo | default(false) %}
+      {{ p.name }} ALL=(ALL) NOPASSWD: ALL
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Former people removed (home directory kept)
+  ansible.builtin.user:
+    name: "{{ item }}"
+    state: absent
+    remove: false
+  loop: "{{ ssh_ca_people_absent }}"
+
+- name: Principals directory
+  ansible.builtin.file:
+    path: /etc/ssh/auth_principals
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Principals for the automation accounts (certificates from the ansible and tofu provisioners)
+  ansible.builtin.copy:
+    dest: "/etc/ssh/auth_principals/{{ item }}"
+    content: "{{ item }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ssh_ca_automation_accounts }}"
+
+- name: Principals for people (their Authentik username, from step-ca-login)
+  ansible.builtin.copy:
+    dest: "/etc/ssh/auth_principals/{{ item.name }}"
+    content: "{{ item.principal | default(item.name) }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ssh_ca_people }}"
+  loop_control:
+    label: "{{ item.name }}: {{ item.principal | default(item.name) }}"
+
+- name: Principals for existing local accounts (ssh_ca_local_principals)
+  ansible.builtin.copy:
+    dest: "/etc/ssh/auth_principals/{{ item.key }}"
+    content: "{{ item.value | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ssh_ca_local_principals | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}: {{ item.value | join(', ') }}"
+
+- name: Principal files on this host
+  ansible.builtin.find:
+    paths: /etc/ssh/auth_principals
+    file_type: file
+  register: ssh_ca_principal_files
+
+- name: Principal files for accounts no longer listed are removed (access ends now)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ ssh_ca_principal_files.files | map(attribute='path')
+       | reject('in', (ssh_ca_automation_accounts + (ssh_ca_people | map(attribute='name') | list)
+                       + (ssh_ca_local_principals.keys() | list))
+                      | map('regex_replace', '^', '/etc/ssh/auth_principals/') | list) | list }}
+
+- name: Revocation list source (ssh_ca_revoked)
+  ansible.builtin.copy:
+    dest: /etc/ssh/labstack_revoked.spec
+    content: |
+      # Managed by Ansible (labstack-infra), role ssh_ca. Compiled into /etc/ssh/labstack_revoked_keys.
+      {% for r in ssh_ca_revoked %}
+      {{ r }}
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+  register: ssh_ca_krl_spec
+
+- name: Revocation list present?
+  ansible.builtin.stat:
+    path: /etc/ssh/labstack_revoked_keys
+  register: ssh_ca_krl
+
+# The KRL exists before sshd is told to read it: a missing RevokedKeys file refuses every public key
+# Serials and key IDs are scoped to the current (first) user CA key
+- name: Current user CA key (KRL scope)
+  ansible.builtin.copy:
+    dest: /etc/ssh/labstack_user_ca.current.pub
+    content: "{{ lookup('ansible.builtin.file', ssh_ca_user_ca_pub).splitlines() | select | first }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  register: ssh_ca_current_ca
+
+- name: Compile the revocation list (KRL)
+  ansible.builtin.command:
+    argv: [ssh-keygen, -k, -f, /etc/ssh/labstack_revoked_keys, -s, /etc/ssh/labstack_user_ca.current.pub, /etc/ssh/labstack_revoked.spec]
+  when: ssh_ca_krl_spec is changed or ssh_ca_current_ca is changed or not ssh_ca_krl.stat.exists
+  changed_when: true
+  notify: Reload sshd for SSH CA
+
+# ---------------------------------------------------------------- SSH: host certificate
+- name: Host certificate for the ED25519 host key
+  ansible.builtin.include_tasks: host_cert.yml
+  vars:
+    ssh_ca_cert_pubkey: /etc/ssh/ssh_host_ed25519_key.pub
+    ssh_ca_cert_path: /etc/ssh/ssh_host_ed25519_key-cert.pub
+    ssh_ca_cert_principals: "{{ ssh_ca_host_principals }}"
+    ssh_ca_cert_key_id: "host:{{ inventory_hostname }}"
+
+- name: New host certificate takes effect  # noqa: no-handler (host_cert.yml is shared; it cannot notify for its callers)
+  ansible.builtin.debug:
+    msg: "host certificate issued, sshd reloads"
+  when: ssh_ca_cert_changed | bool
+  changed_when: true
+  notify: Reload sshd for SSH CA
+
+# Its reload handler would kill a socket-activated sshd; convert first (no-op once done)
+- name: The sshd runs as its own daemon (no socket activation)
+  ansible.builtin.include_role:
+    name: guest_base
+    tasks_from: sshd_daemon.yml
+  when: inventory_hostname not in groups['pve_nodes'] | default([])
+
+# Checked with sshd -t before anything reloads; a configuration sshd rejects is taken out again, so a
+# later restart can never come up broken
+- name: The sshd trusts the CA and presents its certificate
+  block:
+    - name: Drop-in
+      ansible.builtin.template:
+        src: sshd-ca.conf.j2
+        dest: /etc/ssh/sshd_config.d/04-labstack-ca.conf
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        ssh_ca_host_cert_present: true
+      register: ssh_ca_dropin
+      notify: Reload sshd for SSH CA
+
+    - name: Full sshd configuration is valid  # noqa: no-handler (must pass before the reload, or the rescue removes the drop-in)
+      ansible.builtin.command: /usr/sbin/sshd -t
+      when: ssh_ca_dropin is changed
+      changed_when: false
+  rescue:
+    - name: Take the drop-in out again
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/04-labstack-ca.conf
+        state: absent
+
+    - name: Stop here
+      ansible.builtin.fail:
+        msg: "sshd rejected the SSH CA settings; the drop-in was removed and sshd keeps its previous configuration."
+
+- name: Apply now (the enforce step below logs in with a certificate)
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------- controller trusts the host certificates
+- name: Controller known_hosts trusts the host CA for this environment
+  ansible.builtin.blockinfile:
+    path: "{{ ssh_ca_known_hosts }}"
+    create: true
+    mode: "0600"
+    marker: "# {mark} labstack {{ lab_env }} host CA (managed by Ansible, roles/ssh_ca)"
+    # One line per host CA key: during a host CA rotation the file holds the new and the old key
+    block: |-
+      {% for k in lookup('ansible.builtin.file', ssh_ca_host_ca_pub).splitlines() | select %}
+      @cert-authority {{ ssh_ca_known_hosts_patterns | join(',') }} {{ k }}
+      {% endfor %}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# ---------------------------------------------------------------- phase 2: no standing keys
+- name: Remove the static keys (ssh_ca_enforce)
+  when: ssh_ca_enforce | bool
+  ansible.builtin.include_tasks: enforce.yml

@@ -1,0 +1,12 @@
+# Managed by Ansible (labstack-infra). Manual edits will be reverted (role ssh_ca).
+# 04- sorts first: sshd keeps the first value it reads for each keyword.
+# User certificates from ca01 are accepted for an account only if a principal in the certificate is listed
+# in /etc/ssh/auth_principals/<account>. No file, no certificate login (root has none). Plain keys in
+# authorized_keys are not affected by these lines.
+TrustedUserCAKeys /etc/ssh/labstack_user_ca.pub
+AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u
+# Revoked certificates (KRL). Must stay readable: without it sshd refuses every public key.
+RevokedKeys /etc/ssh/labstack_revoked_keys
+{% if ssh_ca_host_cert_present %}
+HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub
+{% endif %}

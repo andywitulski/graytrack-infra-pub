@@ -1,0 +1,8 @@
+---
+- name: Rebuild the trust store
+  ansible.builtin.command: update-ca-certificates
+  changed_when: true
+
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true

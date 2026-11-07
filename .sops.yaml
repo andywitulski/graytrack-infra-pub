@@ -1,0 +1,6 @@
+
+creation_rules:
+  - path_regex: ansible/inventories/.*\.sops\.ya?ml$
+    age: __AGE_PUBLIC_KEY__
+  - path_regex: secrets/.*\.enc\.(env|ya?ml)$
+    age: __AGE_PUBLIC_KEY__

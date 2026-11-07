@@ -1,0 +1,18 @@
+---
+# Databases on pg01. Each one is reachable only by its owner, over TLS, from its clients (roles/postgres).
+postgres_databases:
+  # OpenTofu state for every root under tofu/ (one schema each: envs, authentik, platform, openbao)
+  - name: tofu_state
+    owner: tofu
+    password: "{{ tofu_state_pg_password }}"
+    clients: "{{ platform_controllers }}"
+  # OpenBao storage (encrypted by OpenBao's barrier before it gets here)
+  - name: openbao
+    owner: openbao
+    password: "{{ openbao_pg_password }}"
+    clients: "{{ groups['openbao'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '$', '/32') | list }}"
+  # step-ca: issued certificates, revocations, ACME accounts (roles/step_ca)
+  - name: stepca
+    owner: stepca
+    password: "{{ stepca_pg_password }}"
+    clients: "{{ groups['step_ca'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '$', '/32') | list }}"

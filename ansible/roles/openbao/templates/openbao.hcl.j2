@@ -1,0 +1,43 @@
+# Managed by Ansible (labstack-infra). Manual edits will be reverted (role openbao).
+# Secrets are not in this file: they come from openbao.env (mode 0640, root:openbao).
+ui           = {{ openbao_ui | lower }}
+api_addr     = "{{ openbao_api_addr }}"
+cluster_addr = "{{ openbao_cluster_addr }}"
+log_level    = "info"
+
+# Database openbao on {{ groups['postgres'][0] }}. BAO_PG_CONNECTION_URL carries the password and verifies the
+# server against its CA (sslmode=verify-full). ha_enabled: a second OpenBao node needs only this file.
+# max_connect_retries 0 = wait for the database as long as it takes (pg01 rebooting with the node).
+storage "postgresql" {
+  ha_enabled          = "true"
+  max_connect_retries = 0
+}
+
+# Auto-unseal from a static key (BAO_SEAL_KEY). The chain of trust is sops/age, as for every other
+# tier-0 secret; init returns recovery keys (bin/bao-init) instead of unseal keys.
+seal "static" {
+  current_key_id = "{{ openbao_seal_key_id }}"
+  current_key    = "env://BAO_SEAL_KEY"
+{% if openbao_seal_previous_key_id %}
+  previous_key_id = "{{ openbao_seal_previous_key_id }}"
+  previous_key    = "env://BAO_SEAL_PREVIOUS_KEY"
+{% endif %}
+}
+
+listener "tcp" {
+  address         = "0.0.0.0:8200"
+  cluster_address = "0.0.0.0:8201"
+  tls_cert_file   = "{{ openbao_tls_cert }}"
+  tls_key_file    = "{{ openbao_tls_key }}"
+  tls_min_version = "tls13"
+}
+
+# Declared here, not through the API (OpenBao refuses API-created audit devices by default): a token with
+# sys/audit rights cannot switch auditing off or write it somewhere else. The Wazuh agent ships the file.
+audit "file" "file" {
+  description = "Every request and response, secret values HMAC'd. Read by the Wazuh agent."
+  options {
+    file_path = "{{ openbao_audit_dir }}/audit.log"
+    mode      = "0640"
+  }
+}

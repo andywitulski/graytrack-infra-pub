@@ -1,0 +1,24 @@
+# Managed by Ansible (labstack-infra): roles/zfs_host, zfs_host_sanoid in group_vars/storage_nodes.yml.
+{% for d in zfs_host_sanoid %}
+[{{ d.dataset }}]
+    use_template = {{ d.template }}
+    recursive = {{ 'yes' if d.recursive | default(false) else 'no' }}
+
+{% endfor %}
+[template_working]
+    frequently = 0
+    hourly = 24
+    daily = 30
+    monthly = 6
+    yearly = 0
+    autosnap = yes
+    autoprune = yes
+
+[template_library]
+    frequently = 0
+    hourly = 0
+    daily = 7
+    monthly = 3
+    yearly = 0
+    autosnap = yes
+    autoprune = yes

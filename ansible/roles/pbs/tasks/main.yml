@@ -1,0 +1,153 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that: pbs_repo_key_url is not match('^(<|$)')
+    fail_msg: "Set pbs_repo_key_url (the Proxmox archive keyring for this Debian release) in group_vars/pbs.yml"
+    quiet: true
+
+- name: Datastore is the NFS mount, not a local directory
+  ansible.builtin.command: findmnt --noheadings --target {{ pbs_datastore_path }} --types nfs4
+  changed_when: false
+  check_mode: false
+
+- name: Repository tooling
+  ansible.builtin.apt:
+    name: python3-debian
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: PBS repository (no-subscription)
+  ansible.builtin.deb822_repository:
+    name: pbs-no-subscription
+    types: deb
+    uris: http://download.proxmox.com/debian/pbs
+    suites: "{{ ansible_facts.distribution_release }}"
+    components: pbs-no-subscription
+    signed_by: "{{ pbs_repo_key_url }}"
+- name: Enterprise repository present?
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list.d/pbs-enterprise.sources
+  register: pbs_enterprise_repo
+
+- name: Disable the enterprise repository (no subscription)
+  ansible.builtin.lineinfile:
+    path: /etc/apt/sources.list.d/pbs-enterprise.sources
+    regexp: '^Enabled:'
+    line: 'Enabled: false'
+  when: pbs_enterprise_repo.stat.exists
+
+- name: Proxmox Backup Server
+  ansible.builtin.apt:
+    name: proxmox-backup-server
+    state: present
+    update_cache: true
+
+- name: Read datastores
+  ansible.builtin.command: proxmox-backup-manager datastore list --output-format json
+  register: pbs_datastores
+  changed_when: false
+  check_mode: false
+
+- name: Datastore on the NAS
+  ansible.builtin.command: proxmox-backup-manager datastore create {{ pbs_datastore_name }} {{ pbs_datastore_path }}
+  when: pbs_datastore_name not in (pbs_datastores.stdout | from_json | map(attribute='name') | list)
+  changed_when: true
+
+# ---------------------------------------------------------------- cluster identity
+- name: Read users
+  ansible.builtin.command: proxmox-backup-manager user list --output-format json
+  register: pbs_users
+  changed_when: false
+  check_mode: false
+
+- name: Cluster backup user (no password; it authenticates with its token only)
+  ansible.builtin.command: "proxmox-backup-manager user create {{ pbs_cluster_user }} --comment 'Proxmox VE cluster backups (managed by Ansible)'"
+  when: pbs_cluster_user not in (pbs_users.stdout | from_json | map(attribute='userid') | list)
+  changed_when: true
+
+- name: Read the user's tokens
+  ansible.builtin.command: "proxmox-backup-manager user list-tokens {{ pbs_cluster_user }} --output-format json"
+  register: pbs_tokens
+  changed_when: false
+  check_mode: false
+
+- name: API tokens (each secret is shown once; kept root-only on this host for sops)
+  ansible.builtin.include_tasks: token.yml
+  loop: "{{ [pbs_cluster_token] + pbs_extra_tokens }}"
+  loop_control:
+    loop_var: pbs_token_name
+  when: (pbs_cluster_user ~ '!' ~ pbs_token_name) not in (pbs_tokens.stdout | from_json | map(attribute='tokenid') | list)
+
+- name: Read ACLs
+  ansible.builtin.command: proxmox-backup-manager acl list --output-format json
+  register: pbs_acls
+  changed_when: false
+  check_mode: false
+
+- name: Backup rights on the datastore only (the token needs them as well as its user)
+  vars:
+    pbs_acl_path: "/datastore/{{ pbs_datastore_name }}"
+    pbs_acl_have: >-
+      {{ pbs_acls.stdout | from_json | selectattr('path', 'equalto', pbs_acl_path)
+         | selectattr('roleid', 'equalto', 'DatastoreBackup') | map(attribute='ugid') | list }}
+  ansible.builtin.command:
+    argv:
+      - proxmox-backup-manager
+      - acl
+      - update
+      - "{{ pbs_acl_path }}"
+      - DatastoreBackup
+      - --auth-id
+      - "{{ item }}"
+  loop: "{{ [pbs_cluster_user] + ([pbs_cluster_token] + pbs_extra_tokens) | map('regex_replace', '^', pbs_cluster_user ~ '!') | list }}"
+  when: item not in pbs_acl_have
+  changed_when: true
+
+# ---------------------------------------------------------------- maintenance jobs
+- name: Read the datastore settings
+  ansible.builtin.command: "proxmox-backup-manager datastore show {{ pbs_datastore_name }} --output-format json"
+  register: pbs_store
+  changed_when: false
+  check_mode: false
+
+- name: Garbage collection schedule
+  ansible.builtin.command: "proxmox-backup-manager datastore update {{ pbs_datastore_name }} --gc-schedule '{{ pbs_gc_schedule }}'"
+  when: (pbs_store.stdout | from_json).get('gc-schedule') != pbs_gc_schedule
+  changed_when: true
+
+- name: Read prune and verify jobs
+  ansible.builtin.command: "proxmox-backup-manager {{ item }} list --output-format json"
+  loop: [prune-job, verify-job]
+  register: pbs_jobs
+  changed_when: false
+  check_mode: false
+
+# Created only when the datastore has no job of that kind, so jobs made by hand are never duplicated.
+- name: Prune job (retention)
+  vars:
+    pbs_prune_flags: "{{ pbs_prune_keep.keys() | map('regex_replace', '^', '--') | list }}"
+    pbs_prune_args: "{{ pbs_prune_flags | zip(pbs_prune_keep.values() | map('string')) | flatten }}"
+    pbs_prune_cmd: [proxmox-backup-manager, prune-job, create, nightly-prune]
+  ansible.builtin.command:
+    argv: "{{ pbs_prune_cmd + ['--store', pbs_datastore_name, '--schedule', pbs_prune_schedule] + pbs_prune_args }}"
+  when: pbs_jobs.results[0].stdout | from_json | selectattr('store', 'equalto', pbs_datastore_name) | list | length == 0
+  changed_when: true
+
+- name: Verify job
+  ansible.builtin.command:
+    argv:
+      - proxmox-backup-manager
+      - verify-job
+      - create
+      - weekly-verify
+      - --store
+      - "{{ pbs_datastore_name }}"
+      - --schedule
+      - "{{ pbs_verify_schedule }}"
+      - --ignore-verified
+      - "true"
+      - --outdated-after
+      - "{{ pbs_verify_outdated_after_days }}"
+  when: pbs_jobs.results[1].stdout | from_json | selectattr('store', 'equalto', pbs_datastore_name) | list | length == 0
+  changed_when: true

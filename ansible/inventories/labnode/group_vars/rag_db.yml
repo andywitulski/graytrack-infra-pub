@@ -1,0 +1,15 @@
+---
+# PostgreSQL with pgvector on gpu01 (roles/postgres), next to the models that fill it.
+# Not the "postgres" group on purpose: inventories/common/group_vars/postgres.yml is pg01's database list.
+# Clients: the controllers (admin workstation, paw01; UniFi "Admin to rag DB", "PAW to rag DB") and the Services
+# VLAN (lab apps such as ai01; same VLAN, so no gateway policy). TLS with gpu01's own CA:
+# ansible/files/labnode/gpu01-ca.pem (fetched on the first run; commit it).
+postgres_extra_packages:
+  - "postgresql-{{ postgres_version }}-pgvector"
+postgres_databases:
+  - name: rag
+    owner: rag
+    password: "{{ rag_pg_password }}"
+    clients: "{{ (lab_controllers | map('regex_replace', '$', '/32') | list) + ['__SVC_NET__.0/24'] }}"
+    extensions: [vector]
+# Dumps at 01:30 (role default), before the labnode PBS job at 02:30 (group_vars/all/backups.yml)

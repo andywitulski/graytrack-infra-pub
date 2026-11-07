@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by labstack-infra (fleet/, docs/howto/mail.md). The lab's root CA (ca01, step-ca), public:
+     ansible/files/prod/ca01-root.pem. iPhones and iPads then trust certificates ca01 issues, such as
+     mail.example.com (IMAP, submission). Regenerate this file if the root ever changes. -->
+<plist version="1.0">
+<dict>
+	<key>PayloadDisplayName</key>
+	<string>labstack: lab root CA</string>
+	<key>PayloadIdentifier</key>
+	<string>net.labstack.mdm.lab-root-ca</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>17BE9B61-E2FF-41B9-9A2D-8DB4F0B57E8A</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>labstack root CA</string>
+			<key>PayloadIdentifier</key>
+			<string>net.labstack.mdm.lab-root-ca.cert</string>
+			<key>PayloadType</key>
+			<string>com.apple.security.root</string>
+			<key>PayloadUUID</key>
+			<string>716DA4ED-C983-4F07-AD36-12740B9A8DDD</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadCertificateFileName</key>
+			<string>ca01-root.cer</string>
+			<key>PayloadContent</key>
+			<data>__BASE64_ROOT_CA_DER__</data>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,35 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - "[authentik_version, authentik_domain, authentik_bootstrap_email] | select('match', '^(<|$)') | list | length == 0"
+    fail_msg: "Set authentik_version, authentik_domain and authentik_bootstrap_email in group_vars/authentik.yml"
+    quiet: true
+
+# Resolve the template path here: vars passed to include_role are evaluated inside the
+# included role, where role_path would point at compose_app instead of this role.
+- name: Compose template path (this role)
+  ansible.builtin.set_fact:
+    authentik_compose_template_path: "{{ role_path }}/templates/compose.yml.j2"
+
+- name: Authentik stack
+  ansible.builtin.include_role:
+    name: compose_app
+  vars:
+    compose_app_name: authentik
+    compose_app_dir: "{{ authentik_dir }}"
+    compose_app_compose_template: "{{ authentik_compose_template_path }}"
+    compose_app_env:
+      PG_PASS: "{{ authentik_pg_pass }}"
+      AUTHENTIK_SECRET_KEY: "{{ authentik_secret_key }}"
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: "{{ authentik_pg_pass }}"
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_BOOTSTRAP_EMAIL: "{{ authentik_bootstrap_email }}"
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "{{ authentik_bootstrap_password }}"
+      AUTHENTIK_BOOTSTRAP_TOKEN: "{{ authentik_bootstrap_token }}"
+      AUTHENTIK_LDAP_TOKEN: "{{ authentik_ldap_outpost_token | default('PENDING') }}"
+      AUTHENTIK_PROXY_TOKEN: "{{ authentik_proxy_outpost_token | default('PENDING') }}"
+    compose_app_pg_dump: { service: postgresql, user: authentik, database: authentik }

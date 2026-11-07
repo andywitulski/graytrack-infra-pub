@@ -1,0 +1,46 @@
+// Managed by Ansible (labstack-infra): roles/headscale, headscale_* in group_vars/headscale.yml
+// Default deny: a device can reach only what an ACL below names. Traffic to the lab arrives through the
+// subnet router (tag:router), which enforces these rules for its routes. Lab access is granted to trusted
+// devices (hosts below, by tailnet address), never to a user: a device that only signed in reaches nothing.
+{
+  "groups": {
+    "group:admins": {{ headscale_admins | map('regex_replace', '$', '@') | list | to_json }},
+    "group:users": {{ headscale_users | map('regex_replace', '$', '@') | list | to_json }},
+  },
+  // Trusted devices: headscale_trusted_devices
+  "hosts": {
+{% for name, addr in headscale_trusted_devices | dictsort %}
+    "{{ name }}": "{{ addr }}/32",
+{% endfor %}
+  },
+  "tagOwners": {
+    "{{ headscale_router_tag }}": ["group:admins"],
+{% for name, e in headscale_exits | dictsort %}
+    "{{ e.tag }}": ["group:admins"],
+{% endfor %}
+  },
+  // The router's routes are approved as soon as it advertises them; nothing else may advertise routes
+  "autoApprovers": {
+    "routes": {
+{% for r in headscale_routes %}
+      "{{ r }}": ["{{ headscale_router_tag }}"],
+{% endfor %}
+    },
+    // and the exit nodes are approved as soon as they offer themselves
+    "exitNode": {{ headscale_exits.values() | map(attribute='tag') | list | to_json }},
+  },
+  "acls": [
+{% for a in headscale_acls if a.src | length > 0 %}
+    {"action": "accept", "src": {{ a.src | to_json }}, "dst": {{ a.dst | to_json }}},
+{% endfor %}
+    // Nothing else: no device-to-device traffic, so an untrusted device cannot reach your trusted ones either
+  ],
+  // Full tunnel: each exit node, and the trusted devices that may send their internet traffic through it
+  // (autogroup:internet is the internet only, never private ranges). A device sees only the exits granted here.
+  "grants": [
+{% for name, e in headscale_exits | dictsort if e.devices | default([]) | length > 0 %}
+    // {{ name }}
+    {"src": {{ e.devices | to_json }}, "dst": ["autogroup:internet"], "via": ["{{ e.tag }}"], "ip": ["*"]},
+{% endfor %}
+  ],
+}

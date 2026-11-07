@@ -1,0 +1,13 @@
+---
+# Per node, in host_vars:
+#   - vmid: 4201
+#     mounts: [{ key: mp0, src: /tank/media, dst: /media, ro: true }]
+#     passthrough_ids: [2000]   # exactly one ID, identity-mapped (host 2000 = container 2000)
+#     devices: [{ key: dev0, path: /dev/dri/renderD128, gid: 104 }]
+pve_lxc_host_containers: []
+# Same shape, for containers only one environment has (inventories/<env>/group_vars/storage_nodes.yml)
+pve_lxc_host_extra_containers: []
+
+# Intel iGPU firmware for containers that transcode (Jellyfin): 2 loads HuC,
+# which low-power (VDENC) encoding needs. Takes effect at the next node reboot. null = leave alone.
+pve_lxc_host_i915_guc: null

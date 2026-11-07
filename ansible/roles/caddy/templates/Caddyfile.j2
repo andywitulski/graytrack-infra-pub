@@ -1,0 +1,142 @@
+{
+	email {{ caddy_email }}
+	# DNS-01 without contacting authoritative name servers on port 53 (edge01 has no such egress):
+	# wait a fixed delay, then let the CA validate from the internet.
+	cert_issuer acme {
+		dns {{ caddy_dns_provider }}
+		propagation_delay {{ caddy_dns_propagation_delay }}
+		propagation_timeout -1
+	}
+	# No HTTP/3: only TCP 443 is allowed (UniFi) and forwarded, so the Alt-Svc offer only made
+	# browsers try UDP 443 first, which the firewall logged as blocked on every page load.
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Access log for every site: JSON on stdout, which Docker's journald driver hands to the Wazuh agent.
+# Cookie, Set-Cookie, Authorization and Proxy-Authorization are redacted by Caddy itself; these filters
+# also drop secrets that ride in query strings (OIDC codes and tokens, Subsonic passwords and tokens).
+(access_log) {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			request>uri query {
+{% for p in caddy_log_redact_query %}
+				delete {{ p }}
+{% endfor %}
+			}
+		}
+	}
+}
+
+# Internet exposure is per site. A site without public: true answers only private addresses, so the
+# WAN port forward (network/zone_policy.yml, unifi_public_exposure) publishes only the public ones.
+# A public site can still keep paths LAN-only (lan_paths: sign-in, API, admin).
+(lan_only) {
+	@outside not remote_ip private_ranges
+	error @outside "Not available" 403
+}
+
+(authentik) {
+	forward_auth {{ caddy_forward_auth_upstream }} {
+		uri /outpost.goauthentik.io/auth/caddy
+		copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+		trusted_proxies private_ranges
+	}
+}
+{% for site in caddy_sites %}
+
+{{ site.host }} {
+	import access_log
+{% set device_trust = (site.device_trust | default(false)) and caddy_device_trust | bool %}
+{% if device_trust %}
+	# Device trust (ADR-0006): ask for a client certificate, accept only ca01's. None is fine; one that does not
+	# chain to ca01 fails the handshake. Browsers are offered only identities issued under these CAs.
+	tls {
+		client_auth {
+			mode verify_if_given
+			trust_pool file /etc/caddy/device-ca.pem
+		}
+	}
+{% endif %}
+	# route everywhere: directives run in the order written, so the access guard always runs first
+	route {
+{% if not (site.public | default(false)) %}
+		import lan_only
+{% else %}
+{% if site.lan_paths | default([]) %}
+		@outside_lan_path {
+			not remote_ip private_ranges
+			path {{ site.lan_paths | join(' ') }}
+		}
+		error @outside_lan_path "Not available" 403
+{% endif %}
+{% if site.public_path_regexp | default('') %}
+		# Allowlist: outside addresses reach only the paths matching this regexp (device protocols, enrollment);
+		# everything else on the site (console, admin API) is LAN-only
+		@outside_not_public_path {
+			not remote_ip private_ranges
+			not path_regexp public_only {{ site.public_path_regexp }}
+		}
+		error @outside_not_public_path "Not available" 403
+{% endif %}
+{% if site.lan_path_regexp | default('') %}
+		# Regexp guard for apps whose routes are case-insensitive or have aliases (path alone is bypassable)
+		@outside_lan_regexp {
+			not remote_ip private_ranges
+			path_regexp lan_only {{ site.lan_path_regexp }}
+		}
+		error @outside_lan_regexp "Not available" 403
+{% endif %}
+{% endif %}
+{% if device_trust %}
+		# Only Caddy says which key the client proved: drop what the client sent, then set the verified key's
+		# SHA-256 (no certificate: no usable value). Authentik's device policy reads it (tofu device_trust.tf).
+		request_header -{{ device_trust_header }}
+		request_header {{ device_trust_header }} {http.request.tls.client.public_key_sha256}
+{% endif %}
+{% if site.navidrome | default(false) %}
+		# (route also matters here: Caddy's default order would run the header strip AFTER forward_auth
+		# and delete the identity it just set)
+		# Never trust a client-supplied user header; only Authentik's answer sets it
+		request_header -Remote-User
+		reverse_proxy /outpost.goauthentik.io/* {{ caddy_forward_auth_upstream }}
+
+		@protected not path /share/* /rest/*
+		forward_auth @protected {{ caddy_forward_auth_upstream }} {
+			uri /outpost.goauthentik.io/auth/caddy
+			copy_headers X-Authentik-Username>Remote-User
+		}
+
+		@subsonic path /rest/*
+		forward_auth @subsonic {{ caddy_forward_auth_upstream }} {
+			uri /outpost.goauthentik.io/auth/caddy
+			copy_headers X-Authentik-Username>Remote-User
+			@error status 1xx 3xx 4xx 5xx
+			handle_response @error {
+				respond <<SUBSONICERR
+					<subsonic-response xmlns="http://subsonic.org/restapi" status="failed" version="1.16.1" type="proxy-auth" serverVersion="n/a" openSubsonic="true">
+						<error code="40" message="Invalid credentials or unsupported client"></error>
+					</subsonic-response>
+					SUBSONICERR 200
+			}
+		}
+
+		reverse_proxy {{ site.upstream }} {
+			# Navidrome treats X-Forwarded-For as the source address for its ExtAuth trust check,
+			# so the trusted source must be edge01 itself: send no client address headers.
+			header_up -X-Forwarded-For
+			header_up -X-Real-IP
+		}
+{% elif site.forward_auth | default(false) %}
+		reverse_proxy /outpost.goauthentik.io/* {{ caddy_forward_auth_upstream }}
+		import authentik
+		reverse_proxy {{ site.upstream }}
+{% else %}
+		reverse_proxy {{ site.upstream }}
+{% endif %}
+	}
+}
+{% endfor %}

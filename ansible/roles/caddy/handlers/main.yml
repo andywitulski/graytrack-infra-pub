@@ -1,0 +1,14 @@
+---
+- name: Validate caddy configuration
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile
+    chdir: "{{ caddy_dir }}"
+  changed_when: false
+  listen: Reload caddy
+
+- name: Reload caddy service
+  listen: Reload caddy
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+    chdir: "{{ caddy_dir }}"
+  changed_when: true

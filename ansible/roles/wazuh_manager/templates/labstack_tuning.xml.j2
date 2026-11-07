@@ -1,0 +1,249 @@
+<!-- Managed by Ansible (labstack-infra). Tuning for the lab's own automation and network noise,
+     plus the detection that makes the tuning safe: the automation account may only log in from the
+     controllers in wazuh_manager_automation_sources (lab_controllers). -->
+<group name="labstack,tuning,">
+
+  <!-- sudo's own PAM session open/close duplicates the sudo command alert (5402) -->
+  <rule id="100400" level="0">
+    <if_sid>5501, 5502</if_sid>
+    <match>pam_unix(sudo:session)</match>
+    <description>sudo PAM session (already recorded by the sudo command alert)</description>
+  </rule>
+
+  <!-- Every Ansible task escalates once; hundreds per run. Kept below the alert level. -->
+  <rule id="100401" level="2">
+    <if_sid>5402, 5403</if_sid>
+    <regex type="pcre2">{{ wazuh_manager_automation_user }} : .*BECOME-SUCCESS-</regex>
+    <description>Ansible privilege escalation (expected during playbook runs)</description>
+  </rule>
+
+  <!-- ...which is only acceptable while the automation account logs in from the controller -->
+  <rule id="100402" level="10">
+    <if_sid>5715</if_sid>
+    <user>^{{ wazuh_manager_automation_user }}$</user>
+    <!-- not one of the controllers (a regex, so the allow-list can hold several addresses) -->
+    <regex type="pcre2"> from (?!(?:{{ wazuh_manager_automation_sources | map('regex_escape') | join('|') }}) port )</regex>
+    <description>Automation account {{ wazuh_manager_automation_user }} logged in from $(srcip), not a controller</description>
+    <group>authentication_success,invalid_login,</group>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+  </rule>
+
+  <!-- IPv6: a web server's late answer (port 80/443) after the client's flow expired is logged as a
+       new inbound connection. Not an attempt to reach the client. -->
+  <rule id="100403" level="2">
+    <if_sid>100306</if_sid>
+    <field name="unifi.src_zone">^External$</field>
+    <field name="unifi.dst_zone">^Internal$</field>
+    <srcport type="pcre2">^(80|443)$</srcport>
+    <description>UniFi: late reply from $(srcip):$(srcport) to an internal client (expired flow)</description>
+  </rule>
+
+  <!-- ======================================================== Proxmox guest firewall (tofu firewall.tf) -->
+  <rule id="100420" level="0">
+    <decoded_as>pve-firewall</decoded_as>
+    <description>Proxmox firewall</description>
+  </rule>
+
+  <!-- Audit mode (firewall_enforce = false): traffic that no rule covers, logged instead of dropped -->
+  <rule id="100421" level="4">
+    <if_sid>100420</if_sid>
+    <action>ACCEPT</action>
+    <description>Proxmox firewall audit: $(srcip) to guest $(vmid) $(protocol)/$(dstport) has no rule (would be dropped)</description>
+    <group>firewall_audit,</group>
+  </rule>
+
+  <rule id="100422" level="5">
+    <if_sid>100420</if_sid>
+    <action>DROP</action>
+    <description>Proxmox firewall dropped $(srcip) to guest $(vmid) $(protocol)/$(dstport)</description>
+    <group>firewall_drop,</group>
+  </rule>
+
+  <!-- Broadcast and multicast frames (DHCP discovers, MLD reports, LLMNR, discovery broadcasts) reach
+       every guest NIC on the VLAN, so each one is logged once per guest. They are not an attempt to
+       reach that guest: recorded below the alert level, in audit mode and once dropped (and not counted
+       by 100423). The first six bytes of MAC= are the destination. Unicast stays at 100421/100422. -->
+  <rule id="100444" level="2">
+    <if_sid>100421, 100422</if_sid>
+    <regex type="pcre2">\bMAC=(?:ff:ff:ff:ff:ff:ff|33:33:|01:00:5e:)</regex>
+    <description>Proxmox firewall: broadcast or multicast to guest $(vmid) $(protocol)/$(dstport) (not aimed at the guest)</description>
+  </rule>
+
+  <rule id="100423" level="10" frequency="20" timeframe="60">
+    <if_matched_sid>100422</if_matched_sid>
+    <same_source_ip />
+    <description>Proxmox firewall: many drops from $(srcip) (scan or lateral movement)</description>
+    <group>recon,</group>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+  </rule>
+
+  <!-- ======================================================== auditd (keys from cis_baseline/60-cis.rules and 50-labstack.rules)
+       The audit rules stay mutable (no -e 2); the compensating control is an off-host copy of every
+       event here plus alerts when the audit configuration or the daemon itself is touched. -->
+{#
+  Audit events reach these rules two ways: straight below the auditd base rule (80700), or below one of
+  Wazuh's audit detection rules (group audit_detections, e.g. 92600 "Executed python script"), which
+  claim the event first when the executable matches. Each rule therefore exists twice, one per path.
+  Only SYSCALL events count: a CONFIG_CHANGE carries the key of the rule being loaded or removed, which
+  is not a change to the watched files (those go to 80705 and 100438).
+#}
+{% set audit_rules = [
+  {'id': 100430, 'level': 8, 'audit_keys': 'identity|identity_accounts|privilege|identity_sudo|usermod|ssh_keys|sshd|sshd_config',
+   'desc': 'Audit: $(audit.key) changed by $(audit.exe) (auid $(audit.auid))', 'group': 'audit_identity,', 'mitre': ''},
+  {'id': 100431, 'level': 10, 'audit_keys': 'audit_config|audit_tools',
+   'desc': 'Audit: the audit configuration or tools were used ($(audit.exe), auid $(audit.auid))', 'group': 'audit_tampering,', 'mitre': 'T1562.012'},
+  {'id': 100432, 'level': 7, 'audit_keys': 'kernel_modules|time-change',
+   'desc': 'Audit: $(audit.key) by $(audit.exe) (auid $(audit.auid))', 'group': '', 'mitre': ''},
+] %}
+{% for r in audit_rules %}
+{% for parent in [{'id_offset': 0, 'attach': '<if_sid>80700</if_sid>'}, {'id_offset': 5, 'attach': '<if_group>audit_detections</if_group>'}] %}
+  <rule id="{{ r.id + parent.id_offset }}" level="{{ r.level }}">
+    {{ parent.attach }}
+    <field name="audit.type">^SYSCALL$</field>
+    <field name="audit.key" type="pcre2">^({{ r.audit_keys }})$</field>
+    <description>{{ r.desc }}</description>
+{% if r.group %}
+    <group>{{ r.group }}</group>
+{% endif %}
+{% if r.mitre %}
+    <mitre>
+      <id>{{ r.mitre }}</id>
+    </mitre>
+{% endif %}
+  </rule>
+
+{% endfor %}
+{% endfor %}
+  <!-- The same changes made by Ansible (the automation account) are expected: recorded, not alerted -->
+  <rule id="100433" level="3">
+    <if_sid>100430, 100431, 100432, 100435, 100436, 100437</if_sid>
+    <field name="audit.auid">^{{ wazuh_manager_automation_uid }}$</field>
+    <description>Audit: $(audit.key) changed by the automation account (Ansible run)</description>
+  </rule>
+
+  <!-- The Wazuh agent itself reads the audit state for its CIS checks (SCA): "auditctl -l", "auditctl -s"
+       and augenrules with the check option, as root with no login session (auid unset), from /var/ossec. Read-only;
+       ~120 level-10 alerts a day across the hosts. Changing rules or switching auditing off (-D, -e,
+       -w, loading rules with augenrules) still alerts, from the agent or anyone else. -->
+  <rule id="100445" level="2">
+    <if_sid>100431, 100436</if_sid>
+    <field name="audit.auid">^4294967295$</field>
+    <field name="audit.cwd">^/var/ossec$</field>
+    <regex type="pcre2">type=EXECVE msg=audit\([^)]+\): argc=(?:2 a0="auditctl" a1="-[ls]"|3 a0="/bin/sh" a1="/usr/sbin/augenrules" a2="--check")(?: type=|$)</regex>
+    <description>Audit: the Wazuh agent read the audit rules or status (CIS check)</description>
+  </rule>
+
+  <rule id="100434" level="10">
+    <if_sid>40700</if_sid>
+    <match>Stopping auditd.service|Stopped auditd.service</match>
+    <description>auditd is being stopped (expected only at shutdown)</description>
+    <group>audit_tampering,</group>
+  </rule>
+
+  <!-- Ansible (re)loading the CIS audit rules: one CONFIG_CHANGE per rule on every run (478 on Oct 15).
+       Anyone else adding or removing rules, and every enable/disable (op=set), stays at 80705's level. -->
+  <rule id="100438" level="0">
+    <if_sid>80705</if_sid>
+    <regex type="pcre2">\bauid={{ wazuh_manager_automation_uid }} .*\bop=(?:add|remove)_rule\b</regex>
+    <description>Audit rules reloaded by {{ wazuh_manager_automation_user }} (Ansible run)</description>
+    <group>audit_config,</group>
+  </rule>
+
+  <!-- Proxmox puts its firewall bridge ports and guest NICs into promiscuous mode every time a guest
+       starts or its firewall flag changes. A physical NIC or vmbr going promiscuous stays level 10. -->
+  <rule id="100439" level="2">
+    <if_sid>80710</if_sid>
+    <field name="audit.dev" type="pcre2">^(?:fwpr|fwln|fwbr|veth|tap)[0-9]+</field>
+    <description>Proxmox guest interface $(audit.dev) entered promiscuous mode (guest start or NIC change)</description>
+    <group>pve,</group>
+  </rule>
+
+  <!-- Rootcheck in an LXC: /dev/.lxc/proc is lxcfs's own mount, not a hidden file -->
+  <rule id="100443" level="0">
+    <if_sid>510</if_sid>
+    <match>File '/dev/.lxc/|File '/dev/.lxc-boot-id'</match>
+    <description>Rootcheck: LXC's own files under /dev (.lxc, .lxc-boot-id; LXC guest, not hidden)</description>
+  </rule>
+
+  <!-- Every OpenTofu run against Authentik (bin/tf-ak) reads the signing key pair, private key included
+       (data source authentik_certificate_key_pair), which Authentik records as a secret view. Expected from
+       a controller with the provider's user agent; any other secret view stays at 100207's level 8. -->
+  <rule id="100446" level="3">
+    <if_sid>100207</if_sid>
+    <field name="context.http_request.user_agent" type="pcre2">^authentik-terraform@</field>
+    <field name="context.secret.model_name">^certificatekeypair$</field>
+    <field name="client_ip" type="pcre2">^(?:{{ wazuh_manager_automation_sources | map('regex_escape') | join('|') }})$</field>
+    <description>Authentik: OpenTofu read key pair "$(context.secret.name)" from controller $(client_ip)</description>
+  </rule>
+
+  <!-- dpkg logs every package as "half-configured" on its way to "installed"; 2902 records the install.
+       A package that stays broken shows up as a failed apt run and in the agent's package inventory. -->
+  <rule id="100447" level="2">
+    <if_sid>2904</if_sid>
+    <description>Dpkg: package half-configured (an install or upgrade in progress)</description>
+  </rule>
+
+  <!-- ======================================================== storage and backups (Proxmox nodes)
+       These used to go out as e-mail to root, which never left the nodes (no outbound SMTP). -->
+  <rule id="100440" level="12">
+    <program_name>^zed$</program_name>
+    <regex type="pcre2">class=statechange .*vdev_state=(DEGRADED|FAULTED|OFFLINE|REMOVED|UNAVAIL)</regex>
+    <description>ZFS: a disk in a pool changed state (degraded, faulted or gone)</description>
+    <group>zfs,storage,</group>
+  </rule>
+
+  <rule id="100441" level="10">
+    <program_name>^zed$</program_name>
+    <regex type="pcre2">class=(checksum|io|data|deadman)\b</regex>
+    <description>ZFS: checksum, I/O or data error reported</description>
+    <group>zfs,storage,</group>
+  </rule>
+
+  <rule id="100442" level="10">
+    <match>ERROR: Backup of VM|Backup job finished with errors</match>
+    <description>Proxmox backup failed</description>
+    <group>backup,</group>
+  </rule>
+
+  <!-- ======================================================== SSH certificates from ca01 (roles/ssh_ca)
+       sshd names the certificate in every login: "ssh2: ED25519-CERT SHA256:... ID <key ID> (serial N)
+       CA ECDSA SHA256:...". Key IDs: <account>@<controller> (automation), the e-mail (people),
+       breakglass:<account>@<host>:<time> (bin/ssh-cert breakglass, signed offline). These rules follow
+       100402, which keeps precedence for the automation account logging in from anywhere but the controller. -->
+  <rule id="100451" level="12">
+    <if_sid>5715</if_sid>
+    <match> ID breakglass:</match>
+    <description>SSH break-glass certificate used for $(dstuser) from $(srcip) (signed offline: ca01 or Authentik was down?)</description>
+    <group>authentication_success,ssh_certificate,breakglass,</group>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+  </rule>
+
+  <rule id="100450" level="3">
+    <if_sid>5715</if_sid>
+    <match>-CERT SHA256:</match>
+    <description>SSH login with a ca01 certificate: $(dstuser) from $(srcip)</description>
+    <group>authentication_success,ssh_certificate,</group>
+  </rule>
+{% if ssh_ca_enforce | default(false) | bool %}
+
+  <!-- ssh_ca_enforce: the automation accounts have no authorized_keys any more and people never had any,
+       so a plain-key login by anyone but root (node-to-node cluster SSH) is a key someone left behind -->
+  <rule id="100452" level="8">
+    <if_sid>5715</if_sid>
+    <match negate="yes">-CERT SHA256:</match>
+    <user negate="yes">^root$</user>
+    <description>SSH login with a plain key after the certificate cutover: $(dstuser) from $(srcip) (standing key)</description>
+    <group>authentication_success,ssh_standing_key,</group>
+    <mitre>
+      <id>T1098.004</id>
+    </mitre>
+  </rule>
+{% endif %}
+
+</group>

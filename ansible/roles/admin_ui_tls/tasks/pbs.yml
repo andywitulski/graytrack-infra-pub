@@ -1,0 +1,45 @@
+---
+# Proxmox Backup Server: the proxy (8007, web UI and backup clients) serves /etc/proxmox-backup/proxy.pem
+# and proxy.key and rereads them on reload. The Proxmox nodes pin its fingerprint in their storage entry:
+# playbooks/admin-tls.yml updates prod's, and bin/ap labnode playbooks/backups.yml updates labnode's.
+- name: Certificate for the web UI and the backup clients
+  ansible.builtin.include_role:
+    name: x509_cert
+  vars:
+    x509_cert_name: pbs-proxy
+    x509_cert_dns: ["{{ inventory_hostname }}", "{{ inventory_hostname }}.{{ base_domain }}"]
+    x509_cert_ips: ["{{ ansible_host }}"]
+    x509_cert_group: backup
+
+- name: Certificate the proxy serves now
+  ansible.builtin.shell: set -o pipefail && openssl x509 -in /etc/proxmox-backup/proxy.pem -noout -fingerprint -sha256 | sed 's/^.*=//'
+  args:
+    executable: /bin/bash
+  register: admin_ui_tls_pbs_live
+  changed_when: false
+  check_mode: false
+
+- name: Proxy files from the ca01 certificate
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: true
+    owner: root
+    group: backup
+    mode: "0640"
+  loop:
+    - { src: "{{ x509_cert_path }}", dest: /etc/proxmox-backup/proxy.pem }
+    - { src: "{{ x509_cert_key_path }}", dest: /etc/proxmox-backup/proxy.key }
+  loop_control:
+    label: "{{ item.dest }}"
+  when:
+    - not ansible_check_mode
+    - admin_ui_tls_pbs_live.stdout != x509_cert_fingerprint
+  notify: Reload the PBS proxy
+
+- name: Proxy serves the new certificate before anything pins its fingerprint
+  ansible.builtin.meta: flush_handlers
+
+- name: Fingerprint the nodes must pin
+  ansible.builtin.set_fact:
+    admin_ui_tls_pbs_fingerprint: "{{ x509_cert_fingerprint | lower }}"

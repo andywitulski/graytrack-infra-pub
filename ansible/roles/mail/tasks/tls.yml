@@ -1,0 +1,73 @@
+---
+# Stalwart's certificate comes from ca01 (roles/x509_cert): the key is made here and never leaves mail01.
+# Clients trust it through the lab root (docs/howto/admin-ui-tls.md on computers; the Fleet profile
+# lab-root-ca on iPhones and iPads). Stalwart reads the files by path; a renewal only needs a reload.
+# Also run on its own by playbooks/mail-tls.yml (bin/renew-certs, weekly).
+- name: Certificate from ca01
+  ansible.builtin.include_role:
+    name: x509_cert
+  vars:
+    x509_cert_name: mail
+    x509_cert_dns: ["{{ mail_hostname }}", "{{ inventory_hostname }}", "{{ inventory_hostname }}.{{ base_domain }}"]
+    x509_cert_ips: ["{{ ansible_host }}"]
+    x509_cert_group: stalwart
+
+- name: Certificates Stalwart knows
+  ansible.builtin.command:
+    argv: [stalwart-cli, query, Certificate, --json]
+  environment: "{{ mail_cli_env }}"
+  register: mail_certs
+  changed_when: false
+  check_mode: false
+
+- name: Registered already?
+  ansible.builtin.set_fact:
+    mail_cert_known: >-
+      {{ mail_hostname in (mail_certs.stdout_lines | map('from_json') | map(attribute='subjectAlternativeNames')
+                           | map('list') | flatten) }}
+
+- name: Register the certificate (by file path, once) and make it the default
+  when: not mail_cert_known | bool
+  block:
+    - name: Certificate registered
+      ansible.builtin.command:
+        argv:
+          - stalwart-cli
+          - create
+          - Certificate
+          - --field
+          - "certificate={{ {'@type': 'File', 'filePath': x509_cert_path} | to_json }}"
+          - --field
+          - "privateKey={{ {'@type': 'File', 'filePath': x509_cert_key_path} | to_json }}"
+      environment: "{{ mail_cli_env }}"
+      changed_when: true
+
+    - name: Certificates Stalwart knows (after registering)
+      ansible.builtin.command:
+        argv: [stalwart-cli, query, Certificate, --json]
+      environment: "{{ mail_cli_env }}"
+      register: mail_certs_now
+      changed_when: false
+
+    - name: It is the default certificate
+      vars:
+        mail_cert_id: >-
+          {{ (mail_certs_now.stdout_lines | map('from_json')
+              | selectattr('subjectAlternativeNames', 'contains', mail_hostname) | first).id }}
+      ansible.builtin.command:
+        argv: [stalwart-cli, update, SystemSettings, --field, "defaultCertificateId={{ mail_cert_id }}"]
+      environment: "{{ mail_cli_env }}"
+      changed_when: true
+
+    - name: Listeners use it
+      ansible.builtin.command:
+        argv: [stalwart-cli, create, Action/ReloadTlsCertificates, --json, "{}"]
+      environment: "{{ mail_cli_env }}"
+      changed_when: true
+
+- name: Renewed certificate in use
+  ansible.builtin.command:
+    argv: [stalwart-cli, create, Action/ReloadTlsCertificates, --json, "{}"]
+  environment: "{{ mail_cli_env }}"
+  when: x509_cert_changed | bool and mail_cert_known | bool
+  changed_when: true

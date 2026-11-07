@@ -1,0 +1,20 @@
+# Managed by Ansible (labstack-infra): Proton Bridge, Proton mail as IMAP/SMTP on 127.0.0.1 (docs/howto/mail.md)
+# Sign-in is interactive and done once with this service stopped:
+#   systemctl stop protonbridge && sudo -u protonbridge -H protonmail-bridge --cli
+[Unit]
+Description=Proton Mail Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=protonbridge
+Group=protonbridge
+Environment=HOME={{ mail_bridge_home }}
+WorkingDirectory={{ mail_bridge_home }}
+ExecStart=/usr/bin/protonmail-bridge --noninteractive
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

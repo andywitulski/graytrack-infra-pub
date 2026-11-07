@@ -1,0 +1,67 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled"],
+  "timezone": "America/Indiana/Indianapolis",
+  "schedule": ["before 6am on monday"],
+  "prConcurrentLimit": 8,
+  "labels": ["dependencies"],
+  "vulnerabilityAlerts": { "enabled": true, "labels": ["security"], "schedule": ["at any time"] },
+  "pre-commit": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Version variables annotated with a '# renovate:' comment on the line above",
+      "managerFilePatterns": ["/^ansible/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\s*\\n\\s*[a-z0-9_]+: \"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}{{#if (equals datasource 'docker')}}docker{{else}}semver-coerced{{/if}}{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Literal image tags in the compose templates (tags built from a variable are covered above)",
+      "managerFilePatterns": ["/^ansible/roles/.+/templates/compose\\.yml\\.j2$/"],
+      "matchStrings": ["image: (?<depName>[a-z0-9.-]+\\/[^\\s:{]+):(?<currentValue>[^\\s{}]+)\\s"],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "GitHub release tags carry a leading v",
+      "matchDatasources": ["github-releases"],
+      "extractVersion": "^v(?<version>.+)$"
+    },
+    {
+      "description": "Fleet supports MySQL 8.4 LTS (9.6 is incompatible): stay on 8.4",
+      "matchDepNames": ["docker.io/library/mysql"],
+      "allowedVersions": "/^8\\.4\\.\\d+$/"
+    },
+    {
+      "description": "Same PostgreSQL major as the data on disk: majors need a dump and restore",
+      "matchDepNames": ["docker.io/library/postgres"],
+      "allowedVersions": "/^16\\.\\d+-alpine$/"
+    },
+    {
+      "description": "Pinned .deb downloads with a sha256 next to the version: the PR must also update the checksum",
+      "matchDepNames": ["openbao/openbao", "smallstep/certificates", "smallstep/cli", "PowerShell/PowerShell"],
+      "prBodyNotes": ["**Update the matching `*_sha256` from the release's checksums before merging.** The play refuses a download that does not match."]
+    },
+    {
+      "description": "Applications that migrate their databases on upgrade: one PR each, never automerged",
+      "matchDepNames": ["ghcr.io/goauthentik/server", "codeberg.org/forgejo/forgejo", "docker.io/library/nextcloud"],
+      "automerge": false,
+      "prBodyNotes": ["Migrates its database on start. Nightly dump first, then `bin/ap prod playbooks/services.yml --limit <host>`."]
+    },
+    {
+      "description": "Wazuh: the manager's role never upgrades an existing deployment; follow Wazuh's Docker upgrade guide",
+      "matchDepNames": ["wazuh/wazuh-docker"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Nextcloud majors one at a time, only when asked",
+      "matchDepNames": ["docker.io/library/nextcloud"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

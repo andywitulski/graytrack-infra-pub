@@ -1,0 +1,34 @@
+---
+# OpenBao on bao01: storage in PostgreSQL on pg01 (TLS verified against pg01's CA), static auto-unseal
+# with a key from sops, TLS 1.3 listener with its own host CA, declarative file audit device.
+# renovate: datasource=github-releases depName=openbao/openbao
+openbao_version: "2.7.2"
+# From checksums.txt of the GitHub release. Change both together when upgrading.
+openbao_deb_sha256: "42bd0890a8e2060e5f29410ea828ee047aa2de21028045731a0516d5a532928c"
+openbao_deb_url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/openbao_{{ openbao_version }}_linux_amd64.deb"
+
+openbao_tls_dir: /etc/openbao/tls
+# Listener certificate from ca01 (roles/x509_cert) once ca01 exists, so browsers that trust ca01 accept
+# the UI. Before that (a fresh build: OpenBao comes up before the CA) the per-host CA from host_tls.
+# Clients trust both: tofu/platform/<env>/client.env points at bao01-trust.pem (host CA plus ca01 root).
+openbao_tls_ca01: "{{ ssh_ca_enabled | default(false) | bool }}"
+openbao_api_addr: "https://{{ ansible_host }}:8200"
+openbao_cluster_addr: "https://{{ ansible_host }}:8201"
+openbao_ui: true
+
+# Storage: the first host of the postgres group, its CA as fetched by host_tls into the repo
+openbao_pg_host: "{{ hostvars[groups['postgres'][0]]['ansible_host'] }}"
+openbao_pg_ca_src: "{{ playbook_dir }}/../files/{{ lab_env }}/{{ groups['postgres'][0] }}-ca.pem"
+openbao_pg_db: openbao
+openbao_pg_user: openbao
+# From sops: openbao_pg_password
+
+# Static seal: OpenBao unseals itself with this key (32 bytes, base64) at every start. From sops:
+# openbao_seal_key. Rotation: move the old key to openbao_seal_previous_key with its id in
+# openbao_seal_previous_key_id, put a new key in openbao_seal_key and bump openbao_seal_key_id
+# (docs/howto/platform-tier.md). Losing every copy of the current key makes the storage unreadable.
+openbao_seal_key_id: seal-1
+openbao_seal_previous_key_id: ""
+
+openbao_audit_dir: /var/log/openbao
+openbao_audit_keep_days: 30

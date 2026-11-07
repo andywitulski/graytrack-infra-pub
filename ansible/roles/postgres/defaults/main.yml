@@ -1,0 +1,20 @@
+---
+# PostgreSQL for the platform tier (pg01): one database per consumer, each reachable over TLS only, from
+# its listed client addresses only, with SCRAM passwords from sops. Consumers in group_vars/postgres.yml.
+postgres_version: "17" # Debian 13
+postgres_conf_dir: "/etc/postgresql/{{ postgres_version }}/main"
+postgres_tls_dir: /etc/labstack/tls
+
+# - name: database, owner: role that owns it (and the only one that may connect),
+#   password: from sops, clients: list of CIDRs allowed to connect as owner,
+#   extensions: optional list, created in that database by the superuser (the owner cannot)
+postgres_databases: []
+
+# Packages beside the server, e.g. postgresql-17-pgvector for the "vector" extension (gpu01)
+postgres_extra_packages: []
+
+# Nightly logical dumps inside the container, before the PBS job (02:00) backs it up: a restore then has
+# both the crash-consistent disk and a clean dump of every database.
+postgres_dump_dir: /var/backups/postgresql
+postgres_dump_time: "01:30"
+postgres_dump_keep_days: 14

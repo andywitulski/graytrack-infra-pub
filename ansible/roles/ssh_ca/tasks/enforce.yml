@@ -1,0 +1,53 @@
+---
+# Phase 2 (ssh_ca_enforce: true): the automation accounts keep no authorized_keys. Each account's
+# certificate login is proven from the controller first, with exactly the key bin/ap issued (no agent,
+# no fallback), so a host is never left without a way in.
+- name: Certificate files for each automation account
+  ansible.builtin.stat:
+    path: "{{ lookup('ansible.builtin.env', 'LABSTACK_SSH_KEY_' ~ item) }}-cert.pub"
+  loop: "{{ ssh_ca_automation_accounts }}"
+  delegate_to: localhost
+  become: false
+  register: ssh_ca_ctl_certs
+  failed_when: >-
+    lookup('ansible.builtin.env', 'LABSTACK_SSH_KEY_' ~ item) | length == 0 or not ssh_ca_ctl_certs.stat.exists
+
+- name: Certificate login works for each automation account (from the controller)
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - -o
+      - IdentitiesOnly=yes
+      - -o
+      - IdentityAgent=none
+      - -o
+      - ConnectTimeout=10
+      - -o
+      - "IdentityFile={{ lookup('ansible.builtin.env', 'LABSTACK_SSH_KEY_' ~ item) }}"
+      - -o
+      - "CertificateFile={{ lookup('ansible.builtin.env', 'LABSTACK_SSH_KEY_' ~ item) }}-cert.pub"
+      - -p
+      - "{{ ansible_port | default(22) | string }}"
+      - "{{ item }}@{{ ansible_host }}"
+      - "true"
+  loop: "{{ ssh_ca_automation_accounts }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Account homes
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ item }}"
+  loop: "{{ ssh_ca_automation_accounts }}"
+  register: ssh_ca_homes
+
+- name: No standing keys for the automation accounts
+  ansible.builtin.file:
+    path: "{{ item.ansible_facts.getent_passwd[item.item][4] }}/.ssh/authorized_keys"
+    state: absent
+  loop: "{{ ssh_ca_homes.results }}"
+  loop_control:
+    label: "{{ item.item }}"

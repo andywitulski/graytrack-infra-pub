@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Usage: bin/ca-rotate-provisioner <dev|prod> <ansible|tofu|hosts>
+# New key pair and new password for one of ca01's JWK provisioners (password leaked, or routine rotation).
+# Tokens signed with the old key stop working as soon as ca01 reloads; certificates already issued stay
+# valid until they expire (revoke them with ssh_ca_revoked if the old password was misused).
+# Writes secrets/ca-<env>.enc.yaml, then: bin/ap <env> playbooks/platform.yml --limit step_ca
+set -euo pipefail
+
+env=${1:?usage: bin/ca-rotate-provisioner <dev|prod> <ansible|tofu|hosts>}
+name=${2:?usage: bin/ca-rotate-provisioner <dev|prod> <ansible|tofu|hosts>}
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+[[ $name =~ ^(ansible|tofu|hosts)$ ]] || { echo "provisioner: ansible, tofu or hosts" >&2; exit 2; }
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+cd "$root"
+f="secrets/ca-$env.enc.yaml"
+[[ -f $f ]] || { echo "missing $f (bin/ca-init $env)" >&2; exit 1; }
+
+# shellcheck source=lib/platform.sh
+source bin/lib/platform.sh
+[[ $env == prod ]] && platform_prod_confirm "rotation of ca01 provisioner $name"
+
+umask 077
+work=$(gt_tmpdir)
+trap 'gt_shred_dir "$work"' EXIT
+export NO_COLOR=1
+
+openssl rand -base64 33 | tr -d '\n' > "$work/pw"
+step crypto jwk create "$work/pub.json" "$work/priv.json" --kty EC --crv P-256 --use sig \
+  --password-file "$work/pw" > /dev/null 2>&1
+step crypto jose format < "$work/priv.json" > "$work/priv.jwe" # compact form, as ca.json holds it
+
+p="[\"provisioners\"][\"$name\"]"
+jq -c . "$work/pub.json" | sops set --value-stdin "$f" "${p}[\"key\"]"
+jq -Rs 'rtrimstr("\n")' < "$work/priv.jwe" | sops set --value-stdin "$f" "${p}[\"encryptedKey\"]"
+jq -Rs . < "$work/pw" | sops set --value-stdin "$f" "${p}[\"password\"]"
+
+echo "provisioner $name ($env): new key $(jq -r .kid "$work/pub.json"), new password, in $f"
+echo "Next: bin/ap $env playbooks/platform.yml --limit step_ca, then commit $f"

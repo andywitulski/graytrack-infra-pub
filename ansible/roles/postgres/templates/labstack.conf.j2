@@ -1,0 +1,14 @@
+# Managed by Ansible (labstack-infra). Manual edits will be reverted (role postgres).
+# Loaded after postgresql.conf through its conf.d include.
+listen_addresses = 'localhost,{{ ansible_host }}'
+
+ssl = on
+ssl_cert_file = '{{ postgres_tls_dir }}/server.crt'
+ssl_key_file = '{{ postgres_tls_dir }}/server.key'
+ssl_min_protocol_version = 'TLSv1.3'
+password_encryption = 'scram-sha-256'
+
+# Who connected from where, for the SIEM (journal)
+log_connections = on
+log_disconnections = on
+log_line_prefix = '%m [%p] %q%u@%d from %h '

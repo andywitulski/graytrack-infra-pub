@@ -1,0 +1,62 @@
+- name: Find installer-generated NIC pins
+  ansible.builtin.find:
+    paths: /usr/local/lib/systemd/network
+    patterns: "*.link"
+  register: pve_network_installer_pins
+
+- name: Disable unused hardware drivers (Wi-Fi on hypervisors)
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/labstack-blacklist.conf
+    content: |
+      # Managed by Ansible (labstack-infra). Manual edits will be reverted.
+      {% for m in pve_blacklist_modules | default([]) %}
+      blacklist {{ m }}
+      install {{ m }} /bin/false
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update initramfs
+
+- name: Remove installer-generated NIC pins (Ansible owns NIC naming)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ pve_network_installer_pins.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  notify: Update initramfs
+
+- name: Pin NIC names to MAC addresses
+  ansible.builtin.copy:
+    dest: "/etc/systemd/network/10-labstack-{{ item.name }}.link"
+    content: |
+      [Match]
+      MACAddress={{ item.mac }}
+      Type=ether
+
+      [Link]
+      Name={{ item.name }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ pve_nic_pins }}"
+  notify: Update initramfs
+
+- name: Keep USB NICs awake (no autosuspend)
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/60-labstack-usb-nic-power.rules
+    content: |
+      ACTION=="add", SUBSYSTEM=="net", SUBSYSTEMS=="usb", RUN+="/bin/sh -c 'echo on > /sys$env{DEVPATH}/../../../power/control'"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Node network configuration (applied by hand from the console, never automatically)
+  ansible.builtin.template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true

@@ -1,0 +1,173 @@
+---
+- name: Base packages
+  ansible.builtin.apt:
+    name:
+      - sudo
+      - unattended-upgrades
+      - python3
+      - jq
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: QEMU guest agent (VMs only)
+  ansible.builtin.apt:
+    name: qemu-guest-agent
+    state: present
+  when: ansible_facts["virtualization_type"] == "kvm"
+
+- name: QEMU guest agent running (VMs only)
+  ansible.builtin.service:
+    name: qemu-guest-agent
+    state: started
+    enabled: true
+  when: ansible_facts["virtualization_type"] == "kvm"
+
+# A changed NIC, disk or ip_config in tofu gives the VM a new cloud-init instance-id, and cloud-init then
+# re-runs its first-boot modules on the next boot. By default that deletes and regenerates the SSH host
+# keys, which breaks the host certificate (ssh_ca) and every known_hosts entry. Keep them.
+- name: Cloud-init present?
+  ansible.builtin.stat:
+    path: /etc/cloud/cloud.cfg.d
+  register: guest_base_cloud_init
+
+- name: Cloud-init keeps the SSH host keys on a new instance-id
+  ansible.builtin.copy:
+    dest: /etc/cloud/cloud.cfg.d/99-labstack-keep-host-keys.cfg
+    content: |
+      # Managed by Ansible (labstack-infra, role guest_base)
+      ssh_deletekeys: false
+    owner: root
+    group: root
+    mode: "0644"
+  when: guest_base_cloud_init.stat.isdir | default(false)
+
+- name: Automation account exists
+  ansible.builtin.user:
+    name: "{{ guest_base_admin_user }}"
+    shell: /bin/bash
+    create_home: true
+
+# Until ssh_ca_enforce: the static key. After it, certificates only (roles/ssh_ca removes the file once a
+# certificate login is proven); the static key is never put back on a configured host.
+- name: Automation account key (exclusive)
+  ansible.posix.authorized_key:
+    user: "{{ guest_base_admin_user }}"
+    key: "{{ guest_base_admin_pubkey }}"
+    exclusive: true
+  when: not (ssh_ca_enforce | default(false) | bool)
+
+- name: Automation account sudo
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-{{ guest_base_admin_user }}"
+    content: "{{ guest_base_admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: The sshd runs as its own daemon (no socket activation)
+  ansible.builtin.include_tasks: sshd_daemon.yml
+
+- name: Harden sshd (drop-in)
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/10-labstack.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+      X11Forwarding no
+      AllowAgentForwarding no
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart ssh
+
+# Containers share the host's clock, and chrony cannot run in an unprivileged one (no CAP_SYS_TIME)
+- name: No time daemon in containers (an older run installed chrony there; it only sits failed)
+  ansible.builtin.apt:
+    name: chrony
+    state: absent
+    purge: true
+  when: ansible_facts["virtualization_type"] == "lxc"
+
+- name: Time sync daemon (VMs only)
+  ansible.builtin.apt:
+    name: chrony
+    state: present
+  when: ansible_facts["virtualization_type"] == "kvm"
+
+- name: Time sources (VMs only)
+  when: ansible_facts["virtualization_type"] == "kvm"
+  ansible.builtin.copy:
+    dest: /etc/chrony/sources.d/labstack.sources
+    content: |
+      {% for s in ntp_servers %}
+      server {{ s }} iburst
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload chrony sources
+
+- name: Journald drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Persistent journald
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/10-labstack.conf
+    content: |
+      [Journal]
+      Storage=persistent
+      SystemMaxUse={{ guest_base_journald_max_use }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald
+
+- name: Automatic security updates
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Audit (VMs only; unprivileged LXCs cannot load audit rules)
+  when: ansible_facts["virtualization_type"] == "kvm"
+  block:
+    - name: Install auditd
+      ansible.builtin.apt:
+        name: auditd
+        state: present
+        lock_timeout: 600
+
+    - name: Audit rules
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/50-labstack.rules
+        content: |
+          -w /etc/passwd -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/sudoers -p wa -k privilege
+          -w /etc/sudoers.d/ -p wa -k privilege
+          -w /etc/ssh/sshd_config -p wa -k sshd
+          -w /etc/ssh/sshd_config.d/ -p wa -k sshd
+          -a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=4294967295 -k root_cmd
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Load audit rules
+
+    - name: Auditd running
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true

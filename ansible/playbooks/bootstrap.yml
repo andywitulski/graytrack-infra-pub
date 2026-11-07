@@ -1,0 +1,181 @@
+---
+- name: Bootstrap Proxmox nodes for automation
+  hosts: pve_nodes
+  become: true
+  tasks:
+    # The installer can leave DNS pointing at the node itself (an install over Wi-Fi did): nothing resolves
+    # and the apt tasks below fail. Only where the inventory sets pve_dns_servers (inventories/labnode).
+    - name: Node DNS as Proxmox has it
+      ansible.builtin.command:
+        argv: [pvesh, get, "/nodes/{{ inventory_hostname }}/dns", --output-format, json]
+      register: bootstrap_pve_dns
+      changed_when: false
+      when: pve_dns_servers is defined
+
+    - name: Node DNS points at the network's resolver
+      ansible.builtin.command:
+        argv: >-
+          {{ ['pvesh', 'set', '/nodes/' ~ inventory_hostname ~ '/dns', '--search', base_domain]
+             + (pve_dns_servers | map('string') | zip(['--dns1', '--dns2', '--dns3']) | map('reverse') | flatten) }}
+      when:
+        - pve_dns_servers is defined
+        - >-
+          (bootstrap_pve_dns.stdout | from_json).search | default('') != base_domain
+          or [(bootstrap_pve_dns.stdout | from_json).dns1 | default(''),
+              (bootstrap_pve_dns.stdout | from_json).dns2 | default(''),
+              (bootstrap_pve_dns.stdout | from_json).dns3 | default('')] | select | list != pve_dns_servers
+      changed_when: true
+
+    - name: Proxmox apt sources (enterprise disabled, no-subscription enabled)
+      ansible.builtin.template:
+        src: pve/apt.sources.j2
+        dest: "/etc/apt/sources.list.d/{{ item.key }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pve_apt_sources | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Snippets directory exists on every node
+      ansible.builtin.file:
+        path: /var/lib/vz/snippets
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure sudo is installed
+      ansible.builtin.apt:
+        name: sudo
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create automation OS accounts (no password, key-only)
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        shell: /bin/bash
+        create_home: true
+      loop: "{{ automation_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # After ssh_ca_enforce the accounts log in with certificates only (roles/ssh_ca, playbooks/ssh-ca.yml)
+    - name: Install authorized SSH keys (exclusive, removes unknown keys)
+      ansible.posix.authorized_key:
+        user: "{{ item.name }}"
+        key: "{{ lookup('ansible.builtin.file', item.pubkey_file) }}"
+        path: "/home/{{ item.name }}/.ssh/authorized_keys"
+        exclusive: true
+      loop: "{{ automation_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not (ssh_ca_enforce | default(false) | bool)
+
+    - name: Install sudoers drop-ins (validated before install)
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ item.name }}"
+        content: "{{ item.sudoers }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+      loop: "{{ automation_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Harden sshd via drop-in
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-labstack.conf
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin prohibit-password
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload sshd
+
+    - name: Validate full sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      check_mode: false
+      changed_when: false
+
+    - name: Network troubleshooting tools
+      ansible.builtin.apt:
+        name:
+          - iputils-arping
+          - tcpdump
+          - ethtool
+        state: present
+
+    - name: Announce address changes automatically (gratuitous ARP on link up or MAC change)
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_file: /etc/sysctl.d/60-labstack-net.conf
+        state: present
+        reload: true
+      loop:
+        - net.ipv4.conf.all.arp_notify
+        - net.ipv4.conf.default.arp_notify
+
+  handlers:
+    - name: Reload sshd
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded
+
+- name: Proxmox API identity for OpenTofu (cluster-wide, run on one node)
+  hosts: pve_nodes[0]
+  become: true
+  tasks:
+    - name: Read existing roles
+      ansible.builtin.command: pveum role list --output-format json
+      register: pve_roles
+      check_mode: false
+      changed_when: false
+
+    - name: Create provisioning role
+      ansible.builtin.command: >-
+        pveum role add {{ pve_tofu_role }}
+        --privs "{{ pve_tofu_privs | join(',') }}"
+      when: >-
+        pve_tofu_role not in
+        (pve_roles.stdout | from_json | map(attribute='roleid') | list)
+      changed_when: true
+
+    - name: Read existing users
+      ansible.builtin.command: pveum user list --output-format json
+      register: pve_users
+      check_mode: false
+      changed_when: false
+
+    - name: Create API user in the pve realm
+      ansible.builtin.command: >-
+        pveum user add {{ pve_tofu_user }}
+        --comment "OpenTofu automation identity (managed by Ansible)"
+      when: >-
+        pve_tofu_user not in
+        (pve_users.stdout | from_json | map(attribute='userid') | list)
+      changed_when: true
+
+    - name: Grant role to API user at datacenter root (idempotent set)
+      ansible.builtin.command: >-
+        pveum acl modify / --users {{ pve_tofu_user }} --roles {{ pve_tofu_role }}
+      changed_when: false
+
+    - name: Read local storage content types
+      ansible.builtin.command: pvesh get /storage/local --output-format json
+      register: pve_local_storage
+      changed_when: false
+      check_mode: false
+
+    - name: Allow snippets on local storage (cluster-wide setting)
+      vars:
+        pve_local_content: "{{ (pve_local_storage.stdout | from_json).content.split(',') }}"
+      ansible.builtin.command: >-
+        pvesm set local --content {{ pve_local_content | union(['snippets']) | sort | join(',') }}
+      when: "'snippets' not in pve_local_content"
+      changed_when: true

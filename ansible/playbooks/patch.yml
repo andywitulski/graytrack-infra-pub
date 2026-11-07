@@ -1,0 +1,53 @@
+---
+# Updates for every host, one tier at a time (docs/runbooks/patching.md).
+#   bin/ap <env> playbooks/patch.yml --check               what each host would upgrade; changes nothing
+#   bin/ap <env> playbooks/patch.yml                       upgrade, restart outdated services, report reboots
+#   bin/ap <env> playbooks/patch.yml -e patch_reboot=true  also reboot what needs it, one host at a time
+# Narrow with --limit. Order: service guests, the platform tier one at a time, the Proxmox nodes one at a
+# time. Any failure stops the run before the next host (max_fail_percentage 0), so a bad update stays on
+# one host. The daily unattended security updates on the guests (roles/guest_base) carry on regardless.
+
+- name: Service guests
+  hosts: service_guests:!platform_guests
+  become: true
+  serial: "{{ 1 if (patch_reboot | default(false) | bool) else 5 }}"
+  max_fail_percentage: 0
+  roles:
+    - patch
+
+# bin/ap needs ca01 (certificates), bao01 (secrets) and pg01 (state): never more than one down
+- name: Platform tier, one at a time
+  hosts: platform_guests
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  roles:
+    - patch
+
+# A node reboot shuts down and restarts every guest on it (local storage, no HA); in prod pve03 also
+# serves NFS to the others. Run node reboots in a quiet hour, not across the 02:00 backups.
+- name: Proxmox nodes, one at a time
+  hosts: pve_nodes
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  roles:
+    - patch
+
+- name: Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Every patched host
+      vars:
+        patch_r: "{{ hostvars[item].patch_result }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}: {{ patch_r.upgraded }} upgraded; reboot {{ patch_r.reboot }}; kernel {{ patch_r.kernel }}{{
+          ('; held ' ~ (patch_r.held | join(' '))) if patch_r.held else '' }}{{
+          ('; still outdated ' ~ (patch_r.services_outdated | join(' '))) if patch_r.services_outdated else '' }}
+      loop: "{{ groups['all'] | reject('equalto', 'localhost') | list }}"
+      when: hostvars[item].patch_result is defined
+      loop_control:
+        label: "{{ item }}"

@@ -1,0 +1,14 @@
+---
+# Patching (playbooks/patch.yml): full-upgrade, needrestart, reboot only when asked, health after.
+# Set on the command line: -e patch_reboot=true
+patch_reboot: false
+# apt autoremove after the upgrade (old kernels, orphaned dependencies). Off: review first with --check.
+patch_autoremove: false
+# Controllers whose VM runs on this host (rebooting the host would cut the run that is patching it).
+# Set per host: inventories/labnode/host_vars/labnode.yml: [paw01]
+patch_hosts_controllers: []
+# needrestart: guests restart outdated services themselves (also after the daily unattended-upgrades);
+# Proxmox nodes only list them and wait for the reboot (no restarts of pve-cluster mid-upgrade).
+patch_needrestart_mode: "{{ 'l' if inventory_hostname in groups['pve_nodes'] | default([]) else 'a' }}"
+# How long a host may take to come back and settle after a reboot
+patch_reboot_timeout: 900

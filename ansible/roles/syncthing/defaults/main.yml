@@ -1,0 +1,16 @@
+---
+# LAN-only Syncthing: devices reach sync01 at its static address (tcp://__SVC_NET__.21:22000), the GUI
+# through sync.<domain>. No NAT-PMP or UPnP toward the gateway, no public relays, no global discovery, no
+# usage reporting: none of them can work through the firewall, and every attempt was logged as blocked.
+# Local discovery is off too: sync01 sits on VLAN 120 and its peers on the LAN, so its broadcasts reached
+# only the other guests (logged by their firewalls) and never a peer.
+syncthing_config_candidates:
+  - /var/lib/labdata/.local/state/syncthing/config.xml
+  - /var/lib/labdata/.config/syncthing/config.xml
+syncthing_options:
+  natEnabled: "false"
+  relaysEnabled: "false"
+  globalAnnounceEnabled: "false"
+  localAnnounceEnabled: "false"
+  urAccepted: "-1"
+  crashReportingEnabled: "false"

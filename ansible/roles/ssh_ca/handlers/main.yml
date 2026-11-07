@@ -1,0 +1,23 @@
+---
+- name: Update CA trust
+  ansible.builtin.command: update-ca-certificates
+  changed_when: true
+
+- name: Validate sshd configuration
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+  listen: Reload sshd for SSH CA
+
+# A reload under socket activation kills sshd ("Cannot bind any address"); guest_base turns it off
+- name: The sshd is not socket-activated (trust.yml converts it)
+  ansible.builtin.systemd_service:
+    name: ssh.socket
+  register: ssh_ca_socket
+  failed_when: (ssh_ca_socket.status | default({})).ActiveState | default('') == 'active'
+  listen: Reload sshd for SSH CA
+
+- name: Reload sshd
+  ansible.builtin.service:
+    name: ssh
+    state: reloaded
+  listen: Reload sshd for SSH CA

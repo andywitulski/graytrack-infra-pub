@@ -1,0 +1,251 @@
+---
+- name: The CA exists (bin/ca-init on the controller)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ step_ca_secrets_file }}"
+    - "{{ step_ca_files_dir }}/ca01-root.pem"
+    - "{{ step_ca_files_dir }}/ca01-intermediate.pem"
+    - "{{ step_ca_files_dir }}/ca01-ssh-user-ca.pub"
+    - "{{ step_ca_files_dir }}/ca01-ssh-host-ca.pub"
+    - "{{ step_ca_pg_ca_src }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  delegate_to: localhost
+  become: false
+  register: step_ca_inputs
+  failed_when: not step_ca_inputs.stat.exists
+
+- name: Hosts of the inventories that use this CA too (step_ca_peer_inventories)
+  ansible.builtin.set_fact:
+    step_ca_peer_hosts: "{{ step_ca_peer_hosts | default({}) | combine(step_ca_inv_hosts) }}"
+  vars:
+    step_ca_inv: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../inventories/' ~ item ~ '/hosts.yml') | from_yaml }}"
+    step_ca_inv_hosts: >-
+      {{ (step_ca_inv.all.children.pve_nodes.hosts | default({}, true))
+         | combine(step_ca_inv.all.children.service_guests.hosts | default({}, true)) }}
+  loop: "{{ step_ca_peer_inventories }}"
+
+- name: Database password is in sops
+  ansible.builtin.assert:
+    that: stepca_pg_password | default('PENDING') not in ['', 'PENDING']
+    fail_msg: "stepca_pg_password is missing: bin/gen-service-secrets {{ lab_env }}"
+    quiet: true
+  no_log: true
+
+- name: CA keys and provisioners (secrets/ca-<env>.enc.yaml)
+  ansible.builtin.set_fact:
+    step_ca_secret: "{{ lookup('community.sops.sops', step_ca_secrets_file) | from_yaml }}"
+  no_log: true
+
+# ---------------------------------------------------------------- packages
+- name: Package cache directory
+  ansible.builtin.file:
+    path: /var/cache/step
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Packages step-ca and step CLI (checksums pinned in defaults)
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "/var/cache/step/{{ item.url | basename }}"
+    checksum: "sha256:{{ item.sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { url: "{{ step_ca_deb_url }}", sha256: "{{ step_ca_deb_sha256 }}" }
+    - { url: "{{ step_ca_cli_deb_url }}", sha256: "{{ step_ca_cli_deb_sha256 }}" }
+  loop_control:
+    label: "{{ item.url | basename }}"
+
+- name: Installed step-ca and step CLI
+  ansible.builtin.apt:
+    deb: "/var/cache/step/{{ item }}"
+  loop:
+    - "{{ step_ca_deb_url | basename }}"
+    - "{{ step_ca_cli_deb_url | basename }}"
+  notify: Restart step-ca
+
+# ---------------------------------------------------------------- layout
+- name: Service account
+  ansible.builtin.user:
+    name: step
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/step-ca
+    create_home: true
+
+- name: Directories (root-owned, readable by step where it needs to read)
+  ansible.builtin.file:
+    path: "{{ step_ca_dir }}/{{ item.path }}"
+    state: directory
+    owner: root
+    group: step
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "", mode: "0750" }
+    - { path: certs, mode: "0755" }
+    - { path: config, mode: "0750" }
+    - { path: db, mode: "0755" }
+    - { path: secrets, mode: "0750" }
+    - { path: templates, mode: "0755" }
+    - { path: templates/ssh, mode: "0755" }
+    - { path: templates/x509, mode: "0755" }
+  loop_control:
+    label: "{{ step_ca_dir }}/{{ item.path }}"
+
+- name: Public certificates and keys (from the repo)
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ step_ca_dir }}/{{ item.dest }}"
+    owner: root
+    group: step
+    mode: "0644"
+  loop:
+    - { src: "{{ step_ca_files_dir }}/ca01-root.pem", dest: certs/root_ca.crt }
+    - { src: "{{ step_ca_files_dir }}/ca01-intermediate.pem", dest: certs/intermediate_ca.crt }
+    - { src: "{{ step_ca_files_dir }}/ca01-ssh-user-ca.pub", dest: certs/ssh_user_ca_key.pub }
+    - { src: "{{ step_ca_files_dir }}/ca01-ssh-host-ca.pub", dest: certs/ssh_host_ca_key.pub }
+    - { src: "{{ step_ca_pg_ca_src }}", dest: db/pg-ca.pem }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Restart step-ca
+
+- name: Signing keys (encrypted PEMs) and their password
+  ansible.builtin.copy:
+    dest: "{{ step_ca_dir }}/secrets/{{ item.dest }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: step
+    mode: "0640"
+  loop:
+    - { dest: intermediate_ca_key, content: "{{ step_ca_secret.intermediate_ca_key }}" }
+    - { dest: ssh_host_ca_key, content: "{{ step_ca_secret.ssh_host_ca_key }}" }
+    - { dest: ssh_user_ca_key, content: "{{ step_ca_secret.ssh_user_ca_key }}" }
+    - { dest: password, content: "{{ step_ca_secret.ca_password }}" }
+  no_log: true
+  notify: Restart step-ca
+
+- name: The root key is not on this host (it never belongs here)
+  ansible.builtin.file:
+    path: "{{ step_ca_dir }}/secrets/root_ca_key"
+    state: absent
+
+# ---------------------------------------------------------------- templates
+- name: SSH and X.509 templates for the automation identities
+  ansible.builtin.template:
+    src: "{{ item.0 }}-automation.tpl.j2"
+    dest: "{{ step_ca_dir }}/templates/{{ item.0 }}/automation-{{ item.1 }}.tpl"
+    owner: root
+    group: step
+    mode: "0644"
+  vars:
+    step_ca_template_name: "{{ item.1 }}"
+  loop: "{{ ['ssh', 'x509'] | product(step_ca_automation.keys() | list) | list }}"
+  loop_control:
+    label: "{{ item.0 }}/automation-{{ item.1 }}.tpl"
+  notify: Reload step-ca
+
+- name: Host and people templates
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ step_ca_dir }}/templates/{{ item.dest }}"
+    owner: root
+    group: step
+    mode: "0644"
+  loop:
+    - { src: ssh-host.tpl.j2, dest: ssh/host.tpl }
+    - { src: ssh-oidc-user.tpl.j2, dest: ssh/oidc-user.tpl }
+    - { src: x509-oidc-user.tpl.j2, dest: x509/oidc-user.tpl }
+    - { src: x509-oidc-device.tpl.j2, dest: x509/oidc-device.tpl }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Reload step-ca
+
+# ---------------------------------------------------------------- instances
+- name: Configuration per instance (holds the database password)
+  ansible.builtin.template:
+    src: ca.json.j2
+    dest: "{{ step_ca_dir }}/config/{{ step_ca_unit }}.json"
+    owner: root
+    group: step
+    mode: "0640"
+  loop: "{{ step_ca_units }}"
+  loop_control:
+    loop_var: step_ca_unit
+  no_log: true
+  notify: Reload step-ca
+
+- name: Login instance off when OIDC is disabled
+  ansible.builtin.service:
+    name: step-ca-login
+    state: stopped
+    enabled: false
+  when: not step_ca_oidc_enabled | bool
+  failed_when: false
+
+- name: Systemd units
+  ansible.builtin.template:
+    src: step-ca.service.j2
+    dest: "/etc/systemd/system/{{ step_ca_unit }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    step_ca_unit_desc: "{{ 'people (Authentik OIDC)' if step_ca_unit == 'step-ca-login' else 'automation and hosts' }}"
+  loop: "{{ step_ca_units }}"
+  loop_control:
+    loop_var: step_ca_unit
+  notify:
+    - Reload systemd
+    - Restart step-ca
+
+- name: Authentik's name resolves to the edge proxy (not the WAN address)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '\sauth\.{{ base_domain | regex_escape }}$'
+    line: "{{ step_ca_idp_pin_address }} auth.{{ base_domain }}"
+  when: step_ca_oidc_enabled | bool and step_ca_idp_pin_address | length > 0
+
+- name: Instances running
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: "{{ step_ca_units }}"
+
+- name: Apply changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Automation instance answers over TLS signed by this CA
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}:{{ step_ca_port }}/health"
+    ca_path: "{{ step_ca_dir }}/certs/root_ca.crt"
+  register: step_ca_health
+  retries: 20
+  delay: 3
+  until: step_ca_health.status == 200 and step_ca_health.json.status | default('') == 'ok'
+
+# Not fatal: the login instance cannot start while Authentik is unreachable, and a playbook run must
+# still work then (it may be the run that fixes Authentik).
+- name: Login instance answers (needs Authentik)
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}:{{ step_ca_login_port }}/health"
+    ca_path: "{{ step_ca_dir }}/certs/root_ca.crt"
+  register: step_ca_login_health
+  retries: 10
+  delay: 3
+  until: step_ca_login_health.status == 200
+  failed_when: false
+  when: step_ca_oidc_enabled | bool
+
+- name: Login instance is down
+  ansible.builtin.debug:
+    msg: >-
+      step-ca-login is not answering on :{{ step_ca_login_port }}. It starts once {{ step_ca_oidc_discovery }}
+      answers from this host (Authentik up, edge01 reachable, the step-ca application created in
+      tofu/authentik). Automation certificates are not affected. Logs: journalctl -u step-ca-login
+  when: step_ca_oidc_enabled | bool and step_ca_login_health.status | default(0) != 200

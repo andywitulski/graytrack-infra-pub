@@ -1,0 +1,22 @@
+---
+# renovate: datasource=docker depName=docker.io/library/nextcloud
+nextcloud_version: "35.0.2"
+nextcloud_domain: "cloud.{{ base_domain }}"
+nextcloud_data_path: /mnt/nextcloud-data
+nfs_client_mounts:
+  - { src: "{{ lab_nfs_server }}:/tank/nextcloud", path: /mnt/nextcloud-data }
+
+# Apps from the app store, installed and kept enabled (default settings). Removing one here does not
+# uninstall it: disable it with occ or the UI. docs/howto/nextcloud-office.md
+nextcloud_apps:
+  - richdocuments  # Nextcloud Office, served by Collabora below
+  - deck
+  - cookbook
+  - news
+  - cospend
+  - notes
+
+# Collabora Online (CODE) on cloud01 next to Nextcloud, behind Caddy at office.<base_domain>
+# renovate: datasource=docker depName=docker.io/collabora/code versioning=loose
+collabora_version: "26.04.4.1.1"
+collabora_domain: "office.{{ base_domain }}"

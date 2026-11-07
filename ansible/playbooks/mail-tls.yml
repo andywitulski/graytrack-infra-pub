@@ -1,0 +1,11 @@
+---
+# Renews Stalwart's certificate from ca01 on mail01 and reloads it (roles/mail, tasks/tls.yml). Acts only
+# inside the renewal window (the last 30 of 90 days). Run weekly by bin/renew-certs; fine by hand.
+- name: Mail certificate
+  hosts: mail
+  become: true
+  tasks:
+    - name: Certificate renewed and in use
+      ansible.builtin.include_role:
+        name: mail
+        tasks_from: tls

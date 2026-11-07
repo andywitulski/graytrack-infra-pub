@@ -1,0 +1,30 @@
+---
+# The PBS storage entry on a Proxmox node pins PBS's certificate fingerprint. When PBS gets a new
+# certificate (roles/admin_ui_tls, pbs.yml), the pin is moved to it, read live from PBS, never typed.
+# Needs: pbs_storage_id (the storage on this node), pbs_fp_host (PBS host to read the fingerprint on).
+- name: Storage entry ({{ pbs_storage_id }})
+  ansible.builtin.command: pvesh get /storage/{{ pbs_storage_id }} --output-format json
+  register: pbs_fp_storage
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: PBS certificate fingerprint (read live)
+  ansible.builtin.shell: >-
+    set -o pipefail && proxmox-backup-manager cert info | sed -n 's/^Fingerprint (sha256): *//p'
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ pbs_fp_host }}"
+  register: pbs_fp_live
+  changed_when: false
+  check_mode: false
+  when: pbs_fp_storage.rc == 0
+
+- name: Storage pins the current PBS certificate
+  ansible.builtin.command:
+    argv: [pvesm, set, "{{ pbs_storage_id }}", --fingerprint, "{{ pbs_fp_live.stdout | trim | lower }}"]
+  when:
+    - pbs_fp_storage.rc == 0
+    - pbs_fp_live.stdout | trim | length > 0
+    - (pbs_fp_storage.stdout | from_json).fingerprint | default('') | lower != pbs_fp_live.stdout | trim | lower
+  changed_when: true

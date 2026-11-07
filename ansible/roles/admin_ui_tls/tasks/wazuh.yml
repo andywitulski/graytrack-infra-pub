@@ -1,0 +1,54 @@
+---
+# Wazuh dashboard (443): wazuh-docker mounts config/wazuh_indexer_ssl_certs/wazuh.dashboard{,-key}.pem as
+# single files, so after writing them the container is recreated to see the new ones. Only the
+# browser-facing certificate changes: the dashboard reaches the indexer with its own root-ca.pem.
+- name: Certificate for the dashboard
+  ansible.builtin.include_role:
+    name: x509_cert
+  vars:
+    x509_cert_name: wazuh-dashboard
+    x509_cert_dns: "{{ admin_ui_tls_wazuh_names + [inventory_hostname, inventory_hostname ~ '.' ~ base_domain] }}"
+    x509_cert_ips: ["{{ ansible_host }}"]
+
+- name: Dashboard certificate files now
+  ansible.builtin.stat:
+    path: "{{ admin_ui_tls_wazuh_dir }}/config/wazuh_indexer_ssl_certs/{{ item }}"
+  loop: [wazuh.dashboard.pem, wazuh.dashboard-key.pem]
+  register: admin_ui_tls_wazuh_files
+
+- name: Certificate the dashboard serves now
+  ansible.builtin.shell: >-
+    set -o pipefail && openssl x509 -in {{ admin_ui_tls_wazuh_dir }}/config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem -noout -fingerprint -sha256
+    | sed 's/^.*=//'
+  args:
+    executable: /bin/bash
+  register: admin_ui_tls_wazuh_live
+  changed_when: false
+  check_mode: false
+
+# Owner and mode as the deployment made them: the container reads them as its own user
+- name: Dashboard files from the ca01 certificate
+  ansible.builtin.copy:
+    src: "{{ item.0 }}"
+    dest: "{{ item.1.stat.path }}"
+    remote_src: true
+    owner: "{{ item.1.stat.uid }}"
+    group: "{{ item.1.stat.gid }}"
+    mode: "{{ item.1.stat.mode }}"
+  loop: "{{ [x509_cert_path, x509_cert_key_path] | zip(admin_ui_tls_wazuh_files.results) | list }}"
+  loop_control:
+    label: "{{ item.1.stat.path }}"
+  when:
+    - not ansible_check_mode
+    - admin_ui_tls_wazuh_live.stdout != x509_cert_fingerprint
+  notify: Recreate the Wazuh dashboard
+
+- name: Dashboard on the new certificate now
+  ansible.builtin.meta: flush_handlers
+
+- name: Dashboard answers
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 443
+    timeout: 120
+  when: not ansible_check_mode

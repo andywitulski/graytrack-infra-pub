@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Usage: bin/tf-adopt <dev|prod> [plan file]
+# Adopts running infrastructure into a root whose state was lost (tofu/envs/<env>). Reads a plan in which
+# everything is "create" (bin/tf <env> plan -out=adopt.plan, the default file name) and writes one import
+# block per resource to tofu/envs/<env>/imports.tf, with the import ID each resource type expects
+# (bpg/proxmox 0.113). Then:
+#   bin/tf <env> plan -out=adopt.plan    every resource "will be imported"; 0 to add, 0 to destroy
+#   bin/tf <env> apply adopt.plan
+#   rm tofu/envs/<env>/imports.tf adopt.plan; bin/tf <env> plan
+# Expected after the import: in-place updates (comments, rule positions) and replacement of the
+# downloaded images and the vendor-data snippet only (the API cannot report their source URL or content;
+# the guests ignore both). Any guest marked for replacement or destroy: stop, that is drift to fix first.
+set -euo pipefail
+
+env=${1:?usage: bin/tf-adopt <dev|prod> [plan file]}
+plan=${2:-adopt.plan}
+case "$env" in dev | prod) ;; *) echo "unknown env: $env" >&2; exit 2 ;; esac
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+dir="$root/tofu/envs/$env"
+out="$dir/imports.tf"
+
+[[ -f $dir/$plan ]] || { echo "no plan at $dir/$plan (bin/tf $env plan -out=$plan)" >&2; exit 1; }
+[[ -e $out ]] && { echo "$out exists: apply or delete it first" >&2; exit 1; }
+command -v jq > /dev/null || { echo "missing jq" >&2; exit 1; }
+
+# The plan is encrypted (versions.tf): bin/tf supplies the passphrase
+json=$("$root/bin/tf" "$env" show -json "$plan")
+
+# Only "create" in the plan: something already in state is never re-imported
+blocks=$(printf '%s' "$json" | jq -r '
+  def import_id:
+    .type as $t | .change.after as $a
+    | if $t == "proxmox_virtual_environment_vm" or $t == "proxmox_virtual_environment_container" then
+        "\($a.node_name)/\($a.vm_id)"
+      elif $t == "proxmox_virtual_environment_pool" then $a.pool_id
+      elif $t == "proxmox_virtual_environment_cluster_firewall" then "cluster"
+      elif $t == "proxmox_virtual_environment_firewall_ipset" then
+        (if $a.vm_id then "vm/\($a.node_name)/\($a.vm_id)/"
+         elif $a.container_id then "container/\($a.node_name)/\($a.container_id)/"
+         else "cluster/" end) + $a.name
+      elif $t == "proxmox_virtual_environment_firewall_options" or $t == "proxmox_virtual_environment_firewall_rules" then
+        if $a.vm_id then "vm/\($a.node_name)/\($a.vm_id)"
+        elif $a.container_id then "container/\($a.node_name)/\($a.container_id)"
+        elif $a.node_name then "node/\($a.node_name)"
+        else "cluster" end
+      elif $t == "proxmox_download_file" then
+        "\($a.node_name)/\($a.datastore_id):\($a.content_type)/\($a.file_name)"
+      elif $t == "proxmox_virtual_environment_file" then
+        "\($a.node_name)/\($a.datastore_id):\($a.content_type)/" +
+        ((($a.source_raw // [])[0].file_name) // (($a.source_file // [])[0].file_name)
+         // (($a.source_file // [])[0].path | split("/") | last))
+      else error("no import ID rule for \($t) (\(.address)): add one to bin/tf-adopt") end;
+  [.resource_changes[] | select(.mode == "managed" and .change.actions == ["create"])]
+  | if length == 0 then error("nothing to import: no resource is \"create\" in this plan") else . end
+  | .[] | "import {\n  to = \(.address)\n  id = \(import_id | tojson)\n}\n"')
+
+{
+  echo "# Written by bin/tf-adopt $env from $plan on $(date -u +%Y-%m-%dT%H:%MZ). Delete once applied (gitignored)."
+  echo
+  printf '%s\n' "$blocks"
+} > "$out"
+
+n=$(grep -c '^import {' "$out")
+echo "$n import blocks in ${out#"$root"/}"
+grep -E '^  id = ' "$out" | sed 's/^  id = /  /' | sort | head -60
+echo
+echo "Next: bin/tf $env plan -out=$plan   (expect: $n to import, 0 to add, 0 to destroy; replaced: images and snippet only)"

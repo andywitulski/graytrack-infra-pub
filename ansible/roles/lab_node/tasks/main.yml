@@ -1,0 +1,401 @@
+---
+# Node preparation that the Proxmox installer and bootstrap.yml do not cover:
+# laptop power behaviour, nested virtualization, the GPU for passthrough, VM storage, dev DNS,
+# the kalinet isolation (rules and DNS) and the Thunderbolt bridge.
+# Kernel and initramfs changes take effect after a reboot; the run says so instead of rebooting.
+
+- name: Required host settings are filled in
+  ansible.builtin.assert:
+    that:
+      - labnode_lab_disk is match('^/dev/disk/by-id/')
+      - pve_nic_pins | map(attribute='mac') | select('match', '^([0-9a-f]{2}:){5}[0-9a-f]{2}$') | list | length == pve_nic_pins | length
+    fail_msg: "Set labnode_lab_disk (a /dev/disk/by-id path) and the NIC MAC in inventories/labnode/host_vars/labnode.yml"
+    quiet: true
+
+# ---------------------------------------------------------------- a laptop that never sleeps
+- name: Logind drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/logind.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Lid, power keys and idle never suspend the hypervisor
+  ansible.builtin.copy:
+    dest: /etc/systemd/logind.conf.d/10-labstack-hypervisor.conf
+    content: |
+      # Managed by Ansible (labstack-infra).
+      [Login]
+      HandleLidSwitch=ignore
+      HandleLidSwitchDocked=ignore
+      HandleLidSwitchExternalPower=ignore
+      HandleSuspendKey=ignore
+      HandleHibernateKey=ignore
+      IdleAction=ignore
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart logind
+
+- name: Sleep targets masked
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    masked: true
+  loop: [sleep.target, suspend.target, hibernate.target, hybrid-sleep.target]
+
+# ---------------------------------------------------------------- nested virtualization (dev cluster)
+- name: Nested virtualization for kvm_intel
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/labstack-kvm.conf
+    content: "options kvm_intel nested=1\n"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update initramfs
+
+# ---------------------------------------------------------------- the GPU belongs to vfio-pci, not the host
+- name: Boot loader in use
+  ansible.builtin.stat:
+    path: /etc/kernel/cmdline
+  register: lab_node_cmdline_file
+
+- name: Remember the boot loader
+  ansible.builtin.set_fact:
+    lab_node_systemd_boot: "{{ lab_node_cmdline_file.stat.exists }}"
+
+- name: IOMMU on (systemd-boot, ZFS root)
+  when: lab_node_systemd_boot
+  ansible.builtin.lineinfile:
+    path: /etc/kernel/cmdline
+    regexp: '^(?!.*intel_iommu=on)(.*)$'
+    line: '\1 intel_iommu=on iommu=pt'
+    backrefs: true
+  notify: Refresh boot configuration
+
+- name: IOMMU on (GRUB)
+  when: not lab_node_systemd_boot
+  ansible.builtin.copy:
+    dest: /etc/default/grub.d/labstack-iommu.cfg
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT intel_iommu=on iommu=pt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Refresh boot configuration
+
+- name: VFIO modules at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/labstack-vfio.conf
+    content: |
+      vfio
+      vfio_iommu_type1
+      vfio_pci
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update initramfs
+
+- name: NVIDIA functions on this machine
+  check_mode: false
+  ansible.builtin.command: "lspci -Dnn -d {{ lab_node_gpu_vendor }}:"
+  register: lab_node_gpu_lspci
+  changed_when: false
+
+- name: Parse them (address and vendor:device per function)
+  ansible.builtin.set_fact:
+    lab_node_gpu_functions: >-
+      {{ lab_node_gpu_lspci.stdout_lines
+         | map('regex_search', '^(\S+) .*\[([0-9a-f]{4}:[0-9a-f]{4})\]', '\1', '\2')
+         | select | list }}
+
+- name: The GPU is present
+  ansible.builtin.assert:
+    that: lab_node_gpu_functions | length > 0
+    fail_msg: "No PCI device from vendor {{ lab_node_gpu_vendor }} found (lspci -nn)."
+    quiet: true
+
+- name: The vfio-pci driver claims every function of the card before any GPU driver
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/labstack-vfio.conf
+    content: |
+      # Managed by Ansible (labstack-infra): {{ lab_node_gpu_functions | map('first') | join(', ') }}
+      options vfio-pci ids={{ lab_node_gpu_functions | map('last') | unique | join(',') }}
+      softdep nouveau pre: vfio-pci
+      softdep nvidia pre: vfio-pci
+      softdep snd_hda_intel pre: vfio-pci
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update initramfs
+
+- name: IOMMU group of the GPU (empty until the reboot that enables the IOMMU)
+  ansible.builtin.stat:
+    path: "/sys/bus/pci/devices/{{ lab_node_gpu_functions[0][0] }}/iommu_group"
+  register: lab_node_gpu_group
+
+- name: PCI resource mapping for tofu (once the IOMMU is active)
+  when: lab_node_gpu_group.stat.exists
+  block:
+    - name: Existing PCI mappings
+      check_mode: false
+      ansible.builtin.command: pvesh get /cluster/mapping/pci --output-format json
+      register: lab_node_mappings
+      changed_when: false
+
+    - name: Subsystem ID of the GPU
+      check_mode: false
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        printf '%s:%s' $(cat /sys/bus/pci/devices/{{ lab_node_gpu_functions[0][0] }}/subsystem_vendor
+        /sys/bus/pci/devices/{{ lab_node_gpu_functions[0][0] }}/subsystem_device) | sed 's/0x//g'
+      args:
+        executable: /bin/bash
+      register: lab_node_gpu_subsys
+      changed_when: false
+
+    - name: Create the mapping
+      when: lab_node_gpu_mapping not in (lab_node_mappings.stdout | from_json | map(attribute='id') | list)
+      vars:
+        lab_node_map: >-
+          node={{ inventory_hostname }},path={{ lab_node_gpu_functions[0][0] }},id={{ lab_node_gpu_functions[0][1] }},iommugroup={{
+          lab_node_gpu_group.stat.lnk_target | basename }},subsystem-id={{ lab_node_gpu_subsys.stdout }}
+      ansible.builtin.command:
+        argv:
+          - pvesh
+          - create
+          - /cluster/mapping/pci
+          - --id
+          - "{{ lab_node_gpu_mapping }}"
+          - --description
+          - discrete GPU for gpu01 (managed by Ansible)
+          - --map
+          - "{{ lab_node_map | replace(' ', '') }}"
+      changed_when: true
+
+# ---------------------------------------------------------------- VM storage on the second NVMe
+# The disk must be blank or already ours. An old volume group named like ours (the Fedora /lab) would be
+# taken over silently; refuse if the group holds anything but our thin pool and the volumes inside it
+# (the guests' disks, vm-<id>-*, which Proxmox creates in the pool).
+- name: Logical volumes already in the lab volume group (name|pool)
+  ansible.builtin.command: lvs --noheadings --separator '|' -o lv_name,pool_lv {{ lab_node_lab_vg }}
+  register: lab_node_lab_lvs
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: The lab volume group holds only our thin pool and volumes in it
+  vars:
+    lab_node_lab_ours: '^({{ lab_node_lab_thinpool }}[|]|[^|]+[|]{{ lab_node_lab_thinpool }})$'
+    lab_node_lab_foreign: >-
+      {{ lab_node_lab_lvs.stdout_lines | map('trim') | select | reject('match', lab_node_lab_ours) | list }}
+  ansible.builtin.assert:
+    that: lab_node_lab_lvs.rc != 0 or lab_node_lab_foreign | length == 0
+    fail_msg: >-
+      Volume group {{ lab_node_lab_vg }} holds volumes outside the thin pool {{ lab_node_lab_thinpool }}:
+      {{ lab_node_lab_foreign | map('regex_replace', '[|].*$', '') | list }}. An old install? Back it up, then:
+      vgremove {{ lab_node_lab_vg }}; pvremove and wipefs -a the disk.
+    quiet: true
+
+- name: Volume group on the lab disk
+  community.general.lvg:
+    vg: "{{ lab_node_lab_vg }}"
+    pvs: ["{{ labnode_lab_disk }}"]
+
+# Created once with all free space. shrink: false: on a rerun "100%FREE" is 0, and lvol would try to shrink
+# the existing pool to it ("no shrinking of data to 0 permitted"). Growing the pool later is done by hand.
+- name: Thin pool (all free space, created once)
+  community.general.lvol:
+    vg: "{{ lab_node_lab_vg }}"
+    thinpool: "{{ lab_node_lab_thinpool }}"
+    size: 100%FREE
+    shrink: false
+
+- name: Proxmox storage definitions
+  check_mode: false
+  ansible.builtin.command: pvesh get /storage --output-format json
+  register: lab_node_storage
+  changed_when: false
+
+- name: Thin pool registered as Proxmox storage
+  when: lab_node_lab_storage not in (lab_node_storage.stdout | from_json | map(attribute='storage') | list)
+  ansible.builtin.command: >-
+    pvesm add lvmthin {{ lab_node_lab_storage }}
+    --vgname {{ lab_node_lab_vg }} --thinpool {{ lab_node_lab_thinpool }}
+    --content images,rootdir
+  changed_when: true
+
+# ---------------------------------------------------------------- dev DNS (dnsmasq on the dev network's gateway)
+- name: Dnsmasq package
+  ansible.builtin.apt:
+    name: dnsmasq
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Dev names, served only on the dev network's gateway
+  ansible.builtin.template:
+    src: dnsmasq-dev.conf.j2
+    dest: /etc/dnsmasq.d/labstack-dev.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart dnsmasq
+
+- name: Dnsmasq running
+  ansible.builtin.systemd_service:
+    name: dnsmasq
+    enabled: true
+    state: started
+
+# ---------------------------------------------------------------- kalinet: internet only (kali01)
+- name: Nftables tools
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Configuration directory
+  ansible.builtin.file:
+    path: /etc/labstack
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Kalinet isolation rules (checked before they are installed)
+  ansible.builtin.template:
+    src: kalinet.nft.j2
+    dest: /etc/labstack/kalinet.nft
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/nft -c -f %s
+  notify: Load kalinet rules
+
+- name: Kalinet DNS and DHCP settings
+  ansible.builtin.template:
+    src: dnsmasq-kalinet.conf.j2
+    dest: /etc/labstack/dnsmasq-kalinet.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/dnsmasq --test --conf-file=%s
+  notify: Restart kalinet DNS
+
+# The rules load before any guest starts (pve-guests), and stay loaded when the unit stops: fail closed.
+- name: Kalinet units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - name: labstack-kalinet-fw.service
+      content: |
+        [Unit]
+        Description=kalinet reaches the internet only (labstack)
+        DefaultDependencies=no
+        After=local-fs.target
+        Before=network-pre.target pve-guests.service
+        Wants=network-pre.target
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/sbin/nft -f /etc/labstack/kalinet.nft
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: labstack-kalinet-dns.service
+      content: |
+        [Unit]
+        Description=DNS and DHCP for kalinet (labstack)
+        After=network-online.target labstack-kalinet-fw.service
+        Wants=network-online.target
+        Requires=labstack-kalinet-fw.service
+
+        [Service]
+        ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/labstack/dnsmasq-kalinet.conf
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+  loop_control:
+    label: "{{ item.name }}"
+  notify: Reload systemd
+
+- name: Systemd knows the kalinet units
+  ansible.builtin.meta: flush_handlers
+
+- name: Kalinet units enabled and running
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [labstack-kalinet-fw.service, labstack-kalinet-dns.service]
+  ignore_errors: "{{ ansible_check_mode }}" # first --check: the units do not exist yet
+
+- name: Kalinet rules are loaded
+  ansible.builtin.command: nft list table inet labstack_kali
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+# ---------------------------------------------------------------- Thunderbolt: Workstation to paw01, direct
+- name: Thunderbolt networking module at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/labstack-thunderbolt.conf
+    content: "thunderbolt_net\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Thunderbolt networking module now
+  community.general.modprobe:
+    name: thunderbolt_net
+    state: present
+
+- name: Attach script for Thunderbolt interfaces
+  ansible.builtin.template:
+    src: labstack-tb-attach.j2
+    dest: /usr/local/sbin/labstack-tb-attach
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Udev puts each Thunderbolt interface into the bridge when the cable comes up
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/90-labstack-thunderbolt.rules
+    content: |
+      # Managed by Ansible (labstack-infra, role lab_node)
+      ACTION=="add", SUBSYSTEM=="net", KERNEL=="thunderbolt*", RUN+="/usr/local/sbin/labstack-tb-attach %k"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload udev
+
+# No address on the bridge (not even IPv6 link-local): the node is not on this link, paw01 and the workstation are
+- name: Thunderbolt bridge (no node address)
+  ansible.builtin.copy:
+    dest: /etc/network/interfaces.d/labstack-thunderbolt
+    content: |
+      # Managed by Ansible (labstack-infra, role lab_node). Workstation to paw01 over a Thunderbolt cable.
+      auto {{ labnode_tb_bridge }}
+      iface {{ labnode_tb_bridge }} inet manual
+          bridge-ports none
+          bridge-stp off
+          bridge-fd 0
+          mtu 1500
+          post-up sysctl -qw net.ipv6.conf.{{ labnode_tb_bridge }}.disable_ipv6=1
+          post-up /usr/local/sbin/labstack-tb-attach --all
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Bring up the Thunderbolt bridge
+
+- name: Reboot needed?
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'IOMMU not active yet: reboot labnode, then run this playbook again to create the GPU mapping.'
+         if not lab_node_gpu_group.stat.exists else 'GPU mapping in place.' }}

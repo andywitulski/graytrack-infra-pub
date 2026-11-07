@@ -1,0 +1,96 @@
+# Managed by Ansible (labstack-infra).
+services:
+  postgresql:
+    image: docker.io/library/postgres:16.15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${PG_PASS}
+    volumes:
+      - ./database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+{% if authentik_use_redis %}
+
+  redis:
+    image: docker.io/library/redis:8.10.3-alpine
+    restart: unless-stopped
+    command: --save 60 1 --loglevel warning
+    volumes:
+      - redis:/data
+{% endif %}
+
+  server:
+    image: ghcr.io/goauthentik/server:{{ authentik_version }}
+    restart: unless-stopped
+    command: server
+    env_file: .env
+    # Every Authentik audit event is logged here ("Created Event"); tagged for the Wazuh decoder
+    logging:
+      driver: journald
+      options:
+        tag: authentik
+    ports:
+      - "{{ authentik_http_port }}:9000"
+    volumes:
+      - ./media:/media
+      - ./custom-templates:/templates
+    depends_on:
+      postgresql:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/goauthentik/server:{{ authentik_version }}
+    restart: unless-stopped
+    command: worker
+    env_file: .env
+    # Every Authentik audit event is logged here ("Created Event"); tagged for the Wazuh decoder
+    logging:
+      driver: journald
+      options:
+        tag: authentik
+    volumes:
+      - ./media:/media
+      - ./certs:/certs
+      - ./custom-templates:/templates
+    depends_on:
+      postgresql:
+        condition: service_healthy
+{% if authentik_ldap_outpost_enabled %}
+
+  ldap:
+    image: ghcr.io/goauthentik/ldap:{{ authentik_version }}
+    restart: unless-stopped
+    environment:
+      AUTHENTIK_HOST: http://server:9000
+      AUTHENTIK_INSECURE: "false"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_LDAP_TOKEN}
+    ports:
+      - "636:6636"
+    depends_on:
+      - server
+{% endif %}
+{% if authentik_proxy_outpost_enabled %}
+
+  proxy:
+    image: ghcr.io/goauthentik/proxy:{{ authentik_version }}
+    restart: unless-stopped
+    environment:
+      AUTHENTIK_HOST: http://server:9000
+      AUTHENTIK_HOST_BROWSER: https://{{ authentik_domain }}
+      AUTHENTIK_INSECURE: "false"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_PROXY_TOKEN}
+    ports:
+      - "9010:9000"
+    depends_on:
+      - server
+{% endif %}
+{% if authentik_use_redis %}
+
+volumes:
+  redis: {}
+{% endif %}

@@ -1,0 +1,7 @@
+---
+- name: ZFS datasets, data identities, ARC cap, NFS exports on the storage node
+  hosts: storage_nodes
+  become: true
+  roles:
+    - zfs_host
+    - nfs_server

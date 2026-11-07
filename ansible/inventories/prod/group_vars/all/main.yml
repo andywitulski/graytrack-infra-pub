@@ -1,0 +1,17 @@
+---
+cluster_name: labstack
+lab_env: prod
+base_domain: example.com
+# Not the gateway: the gateway lockdown blocks lab zones from it ("Mgmt NTP" etc. allow the pool instead)
+ntp_servers:
+  - 0.debian.pool.ntp.org
+  - 1.debian.pool.ntp.org
+# Controllers: where bin/ap and bin/tf run (admin workstation, paw01). The same two addresses as unifi_workstation and
+# unifi_paw in ansible/network/zone_policy.yml, which OpenTofu reads; roles/postgres fails if they differ.
+# Used for: pg01 access to the state database, Wazuh's "automation account from elsewhere" alert.
+lab_controllers:
+  - __LAN_NET__.6
+  - __MGMT_NET__.30
+platform_controllers: "{{ lab_controllers | map('regex_replace', '$', '/32') | list }}"
+# labnode (standalone node, docs/howto/lab-node.md) uses this CA: its hosts may get host certificates
+step_ca_peer_inventories: [labnode]

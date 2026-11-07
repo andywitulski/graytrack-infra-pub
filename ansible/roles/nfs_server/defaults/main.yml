@@ -1,0 +1,3 @@
+---
+# { path, clients: [ip, ...], options }
+nfs_server_exports: []

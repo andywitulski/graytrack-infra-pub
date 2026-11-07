@@ -1,0 +1,32 @@
+---
+# Networks, port profiles and switch port assignments for the UniFi gateway and switch.
+# Names must match UniFi exactly; addresses match tofu/ and the inventory.
+# Existing networks are updated in place: check the --check --diff output against the UI before applying.
+
+unifi_networks:
+  - { name: "mgmt", vlan: 100, ip_subnet: __MGMT_NET__.1/24, dhcpd_enabled: false, multicast_dns: false }
+  - { name: "security", vlan: 110, ip_subnet: __SEC_NET__.1/24, dhcpd_enabled: false, multicast_dns: false }
+  - { name: "services", vlan: 120, ip_subnet: __SVC_NET__.1/24, dhcpd_enabled: false, multicast_dns: false }
+  - { name: "Edge", vlan: 125, ip_subnet: __DMZ_NET__.1/24, dhcpd_enabled: false, multicast_dns: false }
+  - { name: "storage", vlan: 130, ip_subnet: __STOR_NET__.1/24, dhcpd_enabled: false, multicast_dns: false }
+
+# Port profiles: an empty tagged list means only the native VLAN ("Block All").
+unifi_port_profiles:
+  - name: "Node trunk"
+    native: "mgmt"
+    tagged: ["security", "services", "Edge"]
+  - name: "Storage access"
+    native: "storage"
+    tagged: []
+
+# One switch per run. Port numbers as UniFi shows them in the Port Manager.
+# Ports not listed here are never touched.
+unifi_switch_mac: "00:00:5e:00:53:0e"
+unifi_switch_ports:
+  - { port: 15, profile: "Node trunk", note: "pve01 nic0" }
+  - { port: 24, profile: "Storage access", note: "pve01 nic1" }
+  - { port: 16, profile: "Node trunk", note: "pve02 nic0" }
+  - { port: 18, profile: "Storage access", note: "pve02 nic1" }
+  - { port: 23, profile: "Node trunk", note: "pve03 nic0" }
+  - { port: 22, profile: "Storage access", note: "pve03 nic1" }
+  - { port: 14, profile: "Node trunk", note: "labnode dock NIC" }

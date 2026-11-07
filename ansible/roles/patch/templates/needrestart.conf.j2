@@ -1,0 +1,10 @@
+# Managed by Ansible (labstack-infra, role patch).
+# a: restart outdated services automatically (guests). l: list only (Proxmox nodes: they wait for a reboot).
+$nrconf{restart} = '{{ patch_needrestart_mode }}';
+# No interactive kernel or microcode hints; playbooks/patch.yml reads needrestart -b instead.
+$nrconf{kernelhints} = 0;
+$nrconf{ucodehint} = 0;
+# Never restart the container engine on its own: every container on the host would restart with it.
+# A docker or containerd upgrade restarts it from the package anyway; anything else waits for the reboot.
+$nrconf{override_rc}{qr(^docker)} = 0;
+$nrconf{override_rc}{qr(^containerd)} = 0;

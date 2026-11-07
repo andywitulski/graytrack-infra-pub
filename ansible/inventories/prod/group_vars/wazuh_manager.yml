@@ -1,0 +1,6 @@
+---
+# UniFi SIEM export (Settings: Integrations > SIEM / System Logging). The gateway sends from its
+# address on the security VLAN, the interface facing siem01. Check with tcpdump if nothing arrives
+# (docs/howto/siem-sources.md).
+wazuh_manager_syslog_allowed_ips:
+  - __SEC_NET__.1

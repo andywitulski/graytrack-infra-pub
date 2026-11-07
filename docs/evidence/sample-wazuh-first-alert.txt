@@ -1,0 +1,6 @@
+Redacted sample. Date: 2026-10-08. Control: AU-6, AC-7, SI-4. ATP-008 T3.
+** Alert: - syslog,sshd,authentication_failed,invalid_login,nist_800_53_AU.14,nist_800_53_AC.7,nist_800_53_AU.6,pci_dss_10.2.4,pci_dss_10.2.5,tsc_CC6.1,tsc_CC7.2
+2026 Oct 08 11:12:34 (git01) any->journald
+Rule: 5710 (level 5) -> 'sshd: Attempt to login using a non-existent user'
+Src IP: __LAN_NET__.4
+Oct 08 11:12:34 git01 sshd-session[REDACTED]: Invalid user nosuchuser from __LAN_NET__.4

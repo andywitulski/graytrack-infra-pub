@@ -1,0 +1,57 @@
+automation_users:
+  - name: ansible
+    pubkey_file: "{{ playbook_dir }}/../files/pubkeys/ansible.pub"
+    sudoers: |
+      ansible ALL=(ALL) NOPASSWD: ALL
+  - name: tofu
+    pubkey_file: "{{ playbook_dir }}/../files/pubkeys/tofu.pub"
+    sudoers: |
+      tofu ALL=(root) NOPASSWD: /sbin/pvesm
+      tofu ALL=(root) NOPASSWD: /sbin/qm
+      tofu ALL=(root) NOPASSWD: /usr/bin/tee /var/lib/vz/*
+
+pve_tofu_role: TofuProvisioner
+pve_tofu_user: tofu@pve
+pve_tofu_privs:
+  - Datastore.Allocate
+  - Datastore.AllocateSpace
+  - Datastore.AllocateTemplate
+  - Datastore.Audit
+  - Pool.Allocate
+  - Pool.Audit
+  - SDN.Allocate
+  - SDN.Audit
+  - SDN.Use
+  - Sys.Audit
+  - Sys.Console
+  - Sys.Modify
+  - VM.Allocate
+  - VM.Audit
+  - VM.Backup
+  - VM.Clone
+  - VM.Config.CDROM
+  - VM.Config.CPU
+  - VM.Config.Cloudinit
+  - VM.Config.Disk
+  - VM.Config.HWType
+  - VM.Config.Memory
+  - VM.Config.Network
+  - VM.Config.Options
+  - VM.Console
+  - VM.GuestAgent.Audit
+  - VM.Migrate
+  - VM.PowerMgmt
+  - VM.Snapshot
+  - VM.Snapshot.Rollback
+  - Mapping.Audit
+  - Mapping.Use
+
+pve_ceph_release: tentacle
+pve_apt_sources:
+  pve-enterprise.sources:
+    - { uri: "https://enterprise.proxmox.com/debian/pve", component: pve-enterprise, enabled: false }
+  proxmox.sources:
+    - { uri: "http://download.proxmox.com/debian/pve", component: pve-no-subscription, enabled: true }
+  ceph.sources:
+    - { uri: "https://enterprise.proxmox.com/debian/ceph-{{ pve_ceph_release }}", component: enterprise, enabled: false }
+    - { uri: "http://download.proxmox.com/debian/ceph-{{ pve_ceph_release }}", component: no-subscription, enabled: true }

@@ -1,0 +1,5 @@
+---
+# Browsers reach the dashboard by name: a UniFi local DNS record (siem.<base_domain> to siem01),
+# resolved by paw01 at the far end of the SOCKS tunnel (docs/howto/siem-sso.md).
+# Must match wazuh_dashboard_url in tofu/authentik/<env>/main.tf: it is the SAML ACS address.
+wazuh_manager_dashboard_url: "https://siem.{{ base_domain }}"

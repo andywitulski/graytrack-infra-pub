@@ -1,0 +1,148 @@
+---
+# Networks, port profiles and per-port profile assignment on the UniFi switch.
+#   bin/ap prod playbooks/unifi_switching.yml --check --diff
+# Networks and profiles use the hellqvio86.unifi collection. Port assignment uses the switch's own
+# port_overrides through the API: read, merge (unlisted ports untouched), write, read back.
+- name: UniFi networks, port profiles and switch ports
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../network/switching.yml
+  vars:
+    unifi_api: "https://{{ unifi_host }}/proxy/network/api/s/default"
+    unifi_headers:
+      X-API-KEY: "{{ unifi_api_key }}"
+      Accept: application/json
+  module_defaults:
+    group/hellqvio86.unifi.unifi:
+      host: "{{ unifi_host }}"
+      api_key: "{{ unifi_api_key }}"
+      site: default
+      validate_certs: false
+    # Collection bug (0.0.32): unifi_network is missing from the action group, so it needs its own entry.
+    hellqvio86.unifi.unifi_network:
+      host: "{{ unifi_host }}"
+      api_key: "{{ unifi_api_key }}"
+      site: default
+      validate_certs: false
+
+  tasks:
+    - name: Everything is filled in
+      ansible.builtin.assert:
+        that:
+          - unifi_host is defined and unifi_api_key is defined
+          - "unifi_networks | map(attribute='name') | select('match', '^<') | list | length == 0"
+          - "unifi_switch_mac is not match('^<')"
+          - "unifi_switch_ports | selectattr('port', 'equalto', 0) | list | length == 0"
+        fail_msg: "Fill in network names, the switch MAC and the real port numbers in network/switching.yml"
+        quiet: true
+
+    - name: Networks
+      hellqvio86.unifi.unifi_network:
+        name: "{{ item.name }}"
+        purpose: corporate
+        vlan: "{{ item.vlan }}"
+        ip_subnet: "{{ item.ip_subnet }}"
+        dhcpd_enabled: "{{ item.dhcpd_enabled }}"
+        multicast_dns: "{{ item.multicast_dns }}"
+      loop: "{{ unifi_networks }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.vlan }})"
+
+    - name: Port profiles
+      hellqvio86.unifi.unifi_port_profile:
+        name: "{{ item.name }}"
+        native_network_name: "{{ item.native }}"
+        tagged_network_names: "{{ item.tagged }}"
+      loop: "{{ unifi_port_profiles }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Read port profiles
+      ansible.builtin.uri:
+        url: "{{ unifi_api }}/rest/portconf"
+        headers: "{{ unifi_headers }}"
+        validate_certs: false
+      register: unifi_portconf
+      check_mode: false
+
+    - name: Read the switch
+      ansible.builtin.uri:
+        url: "{{ unifi_api }}/stat/device/{{ unifi_switch_mac | lower }}"
+        headers: "{{ unifi_headers }}"
+        validate_certs: false
+      register: unifi_switch
+      check_mode: false
+
+    - name: Index profiles and current overrides
+      vars:
+        unifi_dev: "{{ unifi_switch.json.data | first }}"
+      ansible.builtin.set_fact:
+        unifi_profile_ids: "{{ dict(unifi_portconf.json.data | map(attribute='name') | zip(unifi_portconf.json.data | map(attribute='_id'))) }}"
+        unifi_switch_id: "{{ unifi_dev._id }}"
+        unifi_current_overrides: "{{ unifi_dev.port_overrides | default([]) }}"
+        unifi_new_overrides: >-
+          {{ unifi_dev.port_overrides | default([])
+             | rejectattr('port_idx', 'in', unifi_switch_ports | map(attribute='port') | list) | list }}
+
+    - name: Merge the managed ports (existing per-port settings kept, profile set)
+      vars:
+        unifi_existing: "{{ unifi_current_overrides | selectattr('port_idx', 'equalto', item.port) | first | default({}) }}"
+      ansible.builtin.set_fact:
+        unifi_new_overrides: >-
+          {{ unifi_new_overrides + [unifi_existing | combine({
+               'port_idx': item.port,
+               'portconf_id': unifi_profile_ids.get(item.profile, '(new profile: ' ~ item.profile ~ ')') })] }}
+      loop: "{{ unifi_switch_ports }}"
+      loop_control:
+        label: "port {{ item.port }}: {{ item.profile }} ({{ item.note }})"
+
+    - name: Planned port assignments
+      ansible.builtin.debug:
+        msg: >-
+          {{ unifi_switch_ports | map(attribute='port') | zip(unifi_switch_ports | map(attribute='profile'), unifi_switch_ports | map(attribute='note'))
+             | map('join', ' | ') | list }}
+
+    - name: Every profile exists (outside check mode, new profiles were just created)
+      ansible.builtin.assert:
+        that: (unifi_switch_ports | map(attribute='profile') | unique | difference(unifi_profile_ids.keys() | list)) | length == 0
+        fail_msg: >-
+          Port profiles not found on the controller:
+          {{ unifi_switch_ports | map(attribute='profile') | unique | difference(unifi_profile_ids.keys() | list) }}
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Write port overrides (only when they differ)
+      ansible.builtin.uri:
+        url: "{{ unifi_api }}/rest/device/{{ unifi_switch_id }}"
+        method: PUT
+        headers: "{{ unifi_headers }}"
+        body_format: json
+        body:
+          port_overrides: "{{ unifi_new_overrides | sort(attribute='port_idx') }}"
+        validate_certs: false
+      when: (unifi_new_overrides | sort(attribute='port_idx')) != (unifi_current_overrides | sort(attribute='port_idx'))
+      changed_when: true
+
+    - name: Read back what the switch now has
+      ansible.builtin.uri:
+        url: "{{ unifi_api }}/stat/device/{{ unifi_switch_mac | lower }}"
+        headers: "{{ unifi_headers }}"
+        validate_certs: false
+      register: unifi_switch_after
+      check_mode: false
+
+    - name: Every managed port carries its profile
+      vars:
+        unifi_after: "{{ (unifi_switch_after.json.data | first).port_overrides | default([]) }}"
+      ansible.builtin.assert:
+        that: >-
+          (unifi_after | selectattr('port_idx', 'equalto', item.port) | map(attribute='portconf_id') | first | default(''))
+          == unifi_profile_ids[item.profile]
+        fail_msg: "Port {{ item.port }} ({{ item.note }}) does not carry {{ item.profile }}"
+        quiet: true
+      loop: "{{ unifi_switch_ports }}"
+      loop_control:
+        label: "port {{ item.port }}"
+      when: not ansible_check_mode

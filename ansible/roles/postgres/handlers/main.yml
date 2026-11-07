@@ -1,0 +1,15 @@
+---
+- name: Restart postgresql
+  ansible.builtin.service:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: restarted
+
+- name: Reload postgresql
+  ansible.builtin.service:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: reloaded
+  listen: host_tls certificate changed # PostgreSQL rereads ssl_cert_file and ssl_key_file on reload
+
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true

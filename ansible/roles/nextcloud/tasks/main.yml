@@ -1,0 +1,166 @@
+---
+- name: Required settings are filled in
+  ansible.builtin.assert:
+    that:
+      - "[nextcloud_version, nextcloud_domain] | select('match', '^(<|$)') | list | length == 0"
+    fail_msg: "Set nextcloud_version and nextcloud_domain in group_vars/nextcloud.yml"
+    quiet: true
+
+- name: Collabora settings are filled in
+  ansible.builtin.assert:
+    that:
+      - collabora_domain | length > 0
+      - collabora_admin_pass | default('') | length > 0
+    fail_msg: "Set collabora_domain, and collabora_admin_pass in OpenBao (bin/gen-service-secrets prod)"
+    quiet: true
+  when: collabora_version | length > 0
+
+- name: Data directory is the NFS mount, not a local directory
+  ansible.builtin.command: findmnt --noheadings --target {{ nextcloud_data_path }} --types nfs4
+  changed_when: false
+  check_mode: false
+
+# Resolve the template path here: vars passed to include_role are evaluated inside the
+# included role, where role_path would point at compose_app instead of this role.
+- name: Compose template path (this role)
+  ansible.builtin.set_fact:
+    nextcloud_compose_template_path: "{{ role_path }}/templates/compose.yml.j2"
+
+- name: Nextcloud stack
+  ansible.builtin.include_role:
+    name: compose_app
+  vars:
+    compose_app_name: nextcloud
+    compose_app_dir: "{{ nextcloud_dir }}"
+    compose_app_compose_template: "{{ nextcloud_compose_template_path }}"
+    compose_app_env:
+      NC_DB_PASS: "{{ nextcloud_db_pass }}"
+      POSTGRES_HOST: db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: "{{ nextcloud_db_pass }}"
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: "{{ nextcloud_admin_pass }}"
+      NEXTCLOUD_TRUSTED_DOMAINS: "{{ nextcloud_domain }}"
+      NEXTCLOUD_DATA_DIR: /var/www/data
+      REDIS_HOST: redis
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: "{{ nextcloud_domain }}"
+      TRUSTED_PROXIES: "{{ nextcloud_trusted_proxies }}"
+      COLLABORA_ADMIN_PASS: "{{ collabora_admin_pass | default('') }}"
+    compose_app_pg_dump: { service: db, user: nextcloud, database: nextcloud }
+
+- name: Nextcloud finished installing
+  check_mode: false  # read-only; --check needs the real answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nextcloud_http_port }}/status.php"
+    return_content: true
+  register: nextcloud_status
+  until: nextcloud_status.json is defined and nextcloud_status.json.installed | default(false)
+  retries: 60
+  delay: 10
+
+- name: Background jobs run from cron
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ background:cron
+    chdir: "{{ nextcloud_dir }}"
+  changed_when: false
+
+- name: Cron job service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nextcloud-cron.service
+    content: |
+      [Unit]
+      Description=Nextcloud background jobs
+
+      [Service]
+      Type=oneshot
+      WorkingDirectory={{ nextcloud_dir }}
+      ExecStart=/usr/bin/docker compose -f compose.yml exec -T -u www-data app php -f /var/www/html/cron.php
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Cron job timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nextcloud-cron.timer
+    content: |
+      [Unit]
+      Description=Nextcloud background jobs every 5 minutes
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=5min
+
+      [Install]
+      WantedBy=timers.target
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Cron timer enabled
+  ansible.builtin.systemd_service:
+    name: nextcloud-cron.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Read installed apps
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ app:list --output=json
+    chdir: "{{ nextcloud_dir }}"
+  register: nextcloud_installed_apps
+  changed_when: false
+  check_mode: false
+
+- name: Allow server-side requests to the internal identity provider
+  ansible.builtin.command:
+    cmd: docker compose exec -T -u www-data app php occ config:system:set allow_local_remote_servers --value=true --type=boolean
+    chdir: "{{ nextcloud_dir }}"
+  changed_when: false
+
+- name: OpenID Connect app
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ app:install user_oidc
+    chdir: "{{ nextcloud_dir }}"
+  when: "'user_oidc' not in (nextcloud_installed_apps.stdout | from_json).enabled"
+  changed_when: true
+
+- name: Read OIDC providers
+  ansible.builtin.command:
+    cmd: docker compose -f compose.yml exec -T -u www-data app php occ user_oidc:provider
+    chdir: "{{ nextcloud_dir }}"
+  register: nextcloud_oidc_providers
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Authentik OIDC provider (once the client secret exists)
+  ansible.builtin.command:
+    chdir: "{{ nextcloud_dir }}"
+    argv:
+      - docker
+      - compose
+      - -f
+      - compose.yml
+      - exec
+      - -T
+      - -u
+      - www-data
+      - app
+      - php
+      - occ
+      - user_oidc:provider
+      - authentik
+      - --clientid=nextcloud
+      - "--clientsecret={{ nextcloud_oidc_client_secret }}"
+      - "--discoveryuri=https://{{ nextcloud_idp_domain }}/application/o/nextcloud/.well-known/openid-configuration"
+      - --scope=openid email profile
+  when:
+    - nextcloud_oidc_client_secret | default('PENDING') != 'PENDING'
+    - "'authentik' not in nextcloud_oidc_providers.stdout"
+  changed_when: true
+  no_log: true
+
+- name: App store apps and Nextcloud Office
+  ansible.builtin.import_tasks: apps.yml

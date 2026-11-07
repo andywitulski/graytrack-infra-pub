@@ -1,0 +1,180 @@
+---
+- name: TPM device
+  ansible.builtin.stat:
+    path: "{{ tpm_device }}"
+  register: tpm_dev
+
+- name: A VM in vtpm_guests has its TPM (tofu vtpm = true, applied; the provider restarts the VM)
+  ansible.builtin.assert:
+    that: tpm_dev.stat.exists
+    fail_msg: >-
+      {{ inventory_hostname }} has no {{ tpm_device }}. Apply the vTPM first (docs/howto/device-trust.md,
+      "vTPM rollout"), or take the host out of vtpm_guests.
+    quiet: true
+  when: tpm_required | bool
+
+- name: No TPM here (reported only)
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: no {{ tpm_device }}, nothing to record"
+  when: not tpm_dev.stat.exists
+
+- name: TPM present
+  when: tpm_dev.stat.exists
+  block:
+    - name: Packages
+      ansible.builtin.apt:
+        name: "{{ tpm_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: TPM tools talk to the kernel resource manager (no tpm2-abrmd)
+      ansible.builtin.copy:
+        dest: /etc/profile.d/tpm2-tcti.sh
+        content: "export TPM2TOOLS_TCTI=device:{{ tpm_device }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Helper directory
+      ansible.builtin.file:
+        path: "{{ tpm_libexec }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: EK reader
+      ansible.builtin.copy:
+        src: tpm-ek.sh
+        dest: "{{ tpm_libexec }}/tpm-ek"
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ---------------------------------------------------------------- nodes: the swtpm local CA
+    # Proxmox creates it with the first vTPM on the node; its root and issuer sign every vTPM EK certificate there.
+    - name: The node's swtpm local CA
+      ansible.builtin.stat:
+        path: "{{ tpm_swtpm_localca_dir }}/swtpm-localca-rootca-cert.pem"
+      register: tpm_localca
+      when: inventory_hostname in groups.get('pve_nodes', [])
+
+    - name: Record the node's swtpm local CA in the repo (root and issuer)
+      ansible.builtin.fetch:
+        src: "{{ tpm_swtpm_localca_dir }}/{{ item.src }}"
+        dest: "{{ tpm_ek_dir }}/swtpm-localca/{{ inventory_hostname }}-{{ item.dest }}.pem"
+        flat: true
+      loop:
+        - { src: swtpm-localca-rootca-cert.pem, dest: root }
+        - { src: issuercert.pem, dest: issuer }
+      when: tpm_localca.stat.exists | default(false)
+
+    # ---------------------------------------------------------------- the endorsement key
+    - name: Read the EK
+      ansible.builtin.command: "{{ tpm_libexec }}/tpm-ek"
+      environment:
+        TPM_DEVICE: "{{ tpm_device }}"
+      register: tpm_ek_raw
+      changed_when: false
+
+    - name: EK as data
+      ansible.builtin.set_fact:
+        tpm_ek: "{{ tpm_ek_raw.stdout | from_json }}"
+        tpm_ek_pin_file: "{{ tpm_ek_dir }}/{{ inventory_hostname }}.yml"
+
+    - name: Pinned EK in the repo
+      ansible.builtin.set_fact:
+        tpm_ek_pinned: "{{ lookup('ansible.builtin.file', tpm_ek_pin_file, errors='ignore') | default('', true) | from_yaml }}"
+
+    - name: Same TPM as pinned (a different EK is a different TPM)
+      ansible.builtin.assert:
+        that: tpm_ek_pinned.key_sha256 == tpm_ek.key_sha256
+        fail_msg: >-
+          {{ inventory_hostname }}: the TPM changed. Pinned EK {{ tpm_ek_pinned.key_sha256 }}, now {{ tpm_ek.key_sha256 }}.
+          A restore or clone over this VM, a recreated vTPM, or a different host answering at this address.
+          If it is on purpose: -e tpm_ek_accept_change=true, then commit {{ tpm_ek_pin_file | relpath(playbook_dir ~ '/../..') }}.
+        quiet: true
+      when:
+        - tpm_ek_pinned is mapping
+        - not tpm_ek_accept_change | bool
+
+    # A cloned VM carries its source's vTPM state, so the clone answers with the same EK under a new name
+    - name: No other host is pinned with this EK (a clone of it)
+      ansible.builtin.assert:
+        that: tpm_ek_twins | length == 0
+        fail_msg: >-
+          {{ inventory_hostname }} has the same EK as {{ tpm_ek_twins | join(', ') }}: one is a clone of the other
+          (vTPM state copied with the disk). Give the clone a new vTPM (remove and re-add tpm_state), then re-pin.
+        quiet: true
+      vars:
+        tpm_ek_other_pins: >-
+          {{ query('ansible.builtin.fileglob', tpm_ek_dir ~ '/*.yml')
+             | reject('equalto', tpm_ek_dir ~ '/' ~ inventory_hostname ~ '.yml') | list }}
+        tpm_ek_twins: >-
+          {{ query('ansible.builtin.file', *tpm_ek_other_pins) | map('from_yaml') | select('mapping')
+             | selectattr('key_sha256', 'defined')
+             | selectattr('key_sha256', 'equalto', tpm_ek.key_sha256)
+             | map(attribute='host') | list }}
+
+    # VMs: the EK certificate must chain to one of the lab nodes' swtpm local CAs recorded above
+    - name: The swtpm local CAs recorded in the repo
+      ansible.builtin.set_fact:
+        # double-quoted YAML, so \n is a newline before Jinja sees it
+        tpm_localca_bundle: "{{ query('ansible.builtin.file', *query('ansible.builtin.fileglob', tpm_ek_dir ~ '/swtpm-localca/*.pem')) | join('\n') }}"
+      when: tpm_ek.certificate_pem is defined
+
+    - name: EK certificate chains to a lab node's swtpm CA
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          d=$(mktemp -d /run/tpm-verify.XXXXXX); trap 'rm -rf "$d"' EXIT
+          printf '%s\n' "$CA" > "$d/ca.pem"
+          printf '%s\n' "$EK" > "$d/ek.pem"
+          openssl verify -CAfile "$d/ca.pem" "$d/ek.pem"
+        executable: /bin/bash
+      environment:
+        CA: "{{ tpm_localca_bundle }}"
+        EK: "{{ tpm_ek.certificate_pem }}"
+      register: tpm_ek_verify
+      changed_when: false
+      failed_when: false
+      when:
+        - tpm_ek.certificate_pem is defined
+        - tpm_localca_bundle | default('') | length > 0
+        - inventory_hostname in groups.get('vtpm_guests', [])
+
+    - name: Chain result
+      ansible.builtin.set_fact:
+        tpm_ek_chain: >-
+          {{ 'not a vTPM' if inventory_hostname not in groups.get('vtpm_guests', [])
+             else 'no swtpm CA recorded yet (the nodes run first in playbooks/tpm.yml)' if tpm_ek_verify is skipped
+             else 'verified' if tpm_ek_verify.rc == 0
+             else 'FAILED: ' ~ (tpm_ek_verify.stdout ~ ' ' ~ tpm_ek_verify.stderr) | trim }}
+
+    - name: A vTPM EK certificate that does not chain to a lab node is reported loudly
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: EK certificate chain {{ tpm_ek_chain }}"
+      when: tpm_ek_chain is search('FAILED')
+
+    - name: Record (pin) the EK in the repo
+      ansible.builtin.copy:
+        content: |
+          # Managed by roles/tpm (ADR-0006). The endorsement key of {{ inventory_hostname }}'s TPM: public data.
+          # A different key on a later run stops the play; re-pin on purpose with -e tpm_ek_accept_change=true.
+          {{ {
+               'host': inventory_hostname,
+               'source': tpm_ek.source,
+               'alg': tpm_ek.alg,
+               'nv_index': tpm_ek.nv_index,
+               'key_sha256': tpm_ek.key_sha256,
+               'issuer': tpm_ek.issuer | default(''),
+               'not_after': tpm_ek.not_after | default(''),
+               'chain': tpm_ek_chain,
+               'public_key_pem': tpm_ek.public_key_pem,
+             } | to_nice_yaml(indent=2, width=200) }}
+        dest: "{{ tpm_ek_pin_file }}"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      when: (tpm_ek_pinned is not mapping) or (tpm_ek_accept_change | bool)

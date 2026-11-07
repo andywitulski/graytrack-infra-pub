@@ -1,0 +1,59 @@
+---
+- name: Data identity
+  ansible.builtin.include_role:
+    name: lab_data_identity
+
+- name: Syncthing
+  ansible.builtin.apt:
+    name: syncthing
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Service drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/syncthing@labdata.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: GUI listens on the service address (reached only through Caddy with Authentik forward auth)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/syncthing@labdata.service.d/10-labstack.conf
+    content: |
+      [Service]
+      Environment=STGUIADDRESS=0.0.0.0:8384
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart syncthing
+
+- name: Syncthing running as labdata
+  ansible.builtin.systemd_service:
+    name: syncthing@labdata
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Syncthing configuration file
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ syncthing_config_candidates }}"
+  register: syncthing_config_stat
+
+- name: XML support for the settings below
+  ansible.builtin.apt:
+    name: python3-lxml
+    state: present
+
+- name: LAN-only network settings (no NAT traversal, relays, global discovery or reporting)
+  vars:
+    syncthing_config: "{{ syncthing_config_stat.results | selectattr('stat.exists') | map(attribute='item') | first }}"
+  community.general.xml:
+    path: "{{ syncthing_config }}"
+    xpath: "/configuration/options/{{ item.key }}"
+    value: "{{ item.value }}"
+  loop: "{{ syncthing_options | dict2items }}"
+  when: syncthing_config_stat.results | selectattr('stat.exists') | list | length > 0
+  notify: Restart syncthing

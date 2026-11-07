@@ -1,0 +1,4 @@
+---
+# renovate: datasource=github-releases depName=navidrome/navidrome
+media_navidrome_version: "0.64.2"
+media_render_gid: 992 # the render group's GID inside the media container: getent group render

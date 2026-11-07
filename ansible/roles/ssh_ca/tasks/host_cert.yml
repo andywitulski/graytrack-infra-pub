@@ -1,0 +1,122 @@
+---
+# Signs one SSH host key with ca01's host CA, from the controller, when the host has no certificate or the
+# one it has is expiring, was issued for other names, by another CA, or for another key. Reusable:
+#   ssh_ca_cert_pubkey      public host key on the target         /etc/ssh/ssh_host_ed25519_key.pub
+#   ssh_ca_cert_path        where the certificate goes            /etc/ssh/ssh_host_ed25519_key-cert.pub
+#   ssh_ca_cert_principals  names it is valid for
+#   ssh_ca_cert_key_id      key ID (shows in logs and ssh -v)
+# Sets ssh_ca_cert_changed. The hosts provisioner password stays on the controller (temporary 0600 file).
+
+- name: "Current host certificate ({{ ssh_ca_cert_path }})"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    echo "key=$(ssh-keygen -l -f "$PUB" | awk '{print $2}')"
+    [[ -f $CERT ]] || exit 0
+    info=$(ssh-keygen -L -f "$CERT")
+    to=$(printf '%s\n' "$info" | sed -n 's/^ *Valid: from .* to \(.*\)$/\1/p')
+    echo "left=$(( $(date -d "$to" +%s) - $(date +%s) ))"
+    printf '%s\n' "$info" | sed -n 's/^ *Signing CA: [^ ]* \(SHA256:[^ ]*\).*/ca=\1/p'
+    printf '%s\n' "$info" | sed -n 's/^ *Public key: [^ ]* \(SHA256:[^ ]*\).*/certkey=\1/p'
+    printf '%s\n' "$info" | awk '/^ *Principals:/{f=1; next} /^ *Critical Options:/{f=0} f{gsub(/^ +| +$/, ""); if ($0 != "") print "principal=" $0}'
+  args:
+    executable: /bin/bash
+  environment:
+    PUB: "{{ ssh_ca_cert_pubkey }}"
+    CERT: "{{ ssh_ca_cert_path }}"
+  register: ssh_ca_cert_info
+  changed_when: false
+  check_mode: false
+
+- name: Host CA fingerprint (controller)
+  ansible.builtin.command: ssh-keygen -l -f {{ ssh_ca_host_ca_pub }}
+  delegate_to: localhost
+  become: false
+  register: ssh_ca_host_ca_fp
+  changed_when: false
+  check_mode: false
+  run_once: true
+
+- name: Does it need a new certificate?
+  vars:
+    ssh_ca_kv: "{{ ssh_ca_cert_info.stdout_lines | map('split', '=', 1) | list }}"
+    ssh_ca_have_principals: "{{ ssh_ca_kv | selectattr(0, 'equalto', 'principal') | map(attribute=1) | sort }}"
+    ssh_ca_one: "{{ ssh_ca_kv | rejectattr(0, 'equalto', 'principal') | items2dict(key_name=0, value_name=1) }}"
+  ansible.builtin.set_fact:
+    ssh_ca_cert_reasons: >-
+      {{ ([] if 'left' in ssh_ca_one else ['no certificate'])
+         + (['expires in ' ~ ((ssh_ca_one.left | int) // 86400) ~ ' days']
+            if 'left' in ssh_ca_one and (ssh_ca_one.left | int) < (ssh_ca_host_cert_renew_days | int) * 86400 else [])
+         + (['other CA'] if 'left' in ssh_ca_one and ssh_ca_one.ca | default('') != ssh_ca_host_ca_fp.stdout.split()[1] else [])
+         + (['other key'] if 'left' in ssh_ca_one and ssh_ca_one.certkey | default('') != ssh_ca_one.key else [])
+         + (['other names'] if 'left' in ssh_ca_one and ssh_ca_have_principals != (ssh_ca_cert_principals | map('string') | sort) else []) }}
+
+- name: Sign the host key on the controller
+  when: ssh_ca_cert_reasons | length > 0
+  block:
+    - name: Public host key
+      ansible.builtin.slurp:
+        src: "{{ ssh_ca_cert_pubkey }}"
+      register: ssh_ca_pubkey
+
+    - name: Hosts provisioner password (sops, once per play)
+      ansible.builtin.set_fact:
+        ssh_ca_hosts_password: "{{ lookup('community.sops.sops', ssh_ca_secrets_file, extract='[\"provisioners\"][\"hosts\"][\"password\"]') }}"
+      when: ssh_ca_hosts_password is not defined
+      no_log: true
+
+    - name: Work directory (controller)
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: ssh-ca-
+      delegate_to: localhost
+      become: false
+      register: ssh_ca_tmp
+
+    - name: Sign and fetch
+      delegate_to: localhost
+      become: false
+      block:
+        - name: Inputs (0600)
+          ansible.builtin.copy:
+            dest: "{{ ssh_ca_tmp.path }}/{{ item.name }}"
+            content: "{{ item.content }}"
+            mode: "0600"
+          loop:
+            - { name: host.pub, content: "{{ ssh_ca_pubkey.content | b64decode }}" }
+            - { name: pw, content: "{{ ssh_ca_hosts_password }}" }
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: "Sign ({{ ssh_ca_cert_reasons | join(', ') }})"
+          ansible.builtin.command:
+            argv: "{{ ['step', 'ssh', 'certificate', ssh_ca_cert_key_id, ssh_ca_tmp.path ~ '/host.pub',
+                       '--host', '--sign', '--provisioner', 'hosts', '--provisioner-password-file', ssh_ca_tmp.path ~ '/pw',
+                       '--ca-url', ssh_ca_url, '--root', ssh_ca_root_pem, '--force']
+                      + (ssh_ca_cert_principals | map('string') | map('regex_replace', '^', '--principal=') | list) }}"
+          environment:
+            STEPPATH: "{{ ssh_ca_tmp.path }}/step"
+            NO_COLOR: "1"
+          changed_when: true
+
+        - name: Certificate
+          ansible.builtin.slurp:
+            src: "{{ ssh_ca_tmp.path }}/host-cert.pub"
+          register: ssh_ca_new_cert
+      always:
+        - name: Remove the work directory
+          ansible.builtin.file:
+            path: "{{ ssh_ca_tmp.path }}"
+            state: absent
+
+    - name: Certificate onto the host
+      ansible.builtin.copy:
+        dest: "{{ ssh_ca_cert_path }}"
+        content: "{{ ssh_ca_new_cert.content | b64decode }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+- name: Result
+  ansible.builtin.set_fact:
+    ssh_ca_cert_changed: "{{ ssh_ca_cert_reasons | length > 0 }}"

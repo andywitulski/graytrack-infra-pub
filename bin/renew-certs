@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# bin/renew-certs: renew every certificate the controller issues from ca01, unattended.
+#   prod and labnode: admin UIs and OpenBao's listener (admin-tls.yml), SSH host certificates (ssh-ca.yml),
+#   Stalwart on mail01 (mail-tls.yml),
+#   then labnode's PBS storage onto PBS's current fingerprint (backups.yml).
+#   Also, being the weekly job anyway: Forgejo's offsite mirrors (forgejo_mirrors.yml: new repositories get a
+#   mirror, failed syncs fail the run). It does nothing until forgejo_mirror_github_org is set.
+# Every play only acts inside a certificate's renewal window (the last 30 of 90 days), so most weekly runs
+# change nothing. Run weekly by labstack-renew-certs.timer on paw01 (roles/paw); also fine by hand.
+#
+# Runs exactly what is checked out, and only from a clean main: it never pulls (a scheduled job must not
+# run code nobody looked at) and refuses local edits (it would deploy them to prod unreviewed).
+set -euo pipefail
+cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+[[ $branch == main ]] || { echo "renew-certs: on branch $branch, not main; nothing done" >&2; exit 1; }
+[[ -z $(git status --porcelain --untracked-files=no) ]] || {
+  echo "renew-certs: uncommitted changes in $(pwd); nothing done" >&2; exit 1; }
+
+export CI=true # bin/ap: no interactive confirmation for prod and labnode
+rc=0
+run() {
+  echo "== bin/ap $* ($(date -Iseconds))"
+  if ! bin/ap "$@"; then echo "renew-certs: FAILED bin/ap $*" >&2; rc=1; fi
+}
+run prod playbooks/admin-tls.yml
+run prod playbooks/ssh-ca.yml
+run prod playbooks/mail-tls.yml
+run labnode playbooks/admin-tls.yml
+run labnode playbooks/ssh-ca.yml
+run labnode playbooks/backups.yml
+run prod playbooks/forgejo_mirrors.yml
+echo "== done ($(date -Iseconds)), $([[ $rc == 0 ]] && echo ok || echo 'with failures')"
+exit $rc

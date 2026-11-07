@@ -1,0 +1,59 @@
+---
+lab_env: labnode
+base_domain: example.com
+# Not the gateway: the gateway lockdown blocks lab zones from it ("Mgmt NTP" etc. allow the pool instead)
+ntp_servers:
+  - 0.debian.pool.ntp.org
+  - 1.debian.pool.ntp.org
+# Controllers, as in inventories/prod (zone_policy.yml unifi_workstation and unifi_paw)
+lab_controllers:
+  - __LAN_NET__.6
+  - __MGMT_NET__.30
+
+# Prod's platform tier (bin/lib/platform.sh platform_of): this inventory has no postgres, openbao or
+# step_ca group, so the addresses inventories/common derives from those groups are set here.
+lab_ca_addr: __MGMT_NET__.24
+# Certificates: prod's CA. Its authority policy lists these hosts (step_ca_peer_inventories in prod).
+ssh_ca_files_dir: "{{ playbook_dir }}/../files/prod"
+ssh_ca_secrets_file: "{{ playbook_dir }}/../../secrets/ca-prod.enc.yaml"
+
+# The nested dev cluster (Proxmox SDN, created by tofu/envs/labnode; the node is the gateway and NATs out)
+labnode_dev_net: __DEV_NET__.0/24       # unchanged addresses from the libvirt days
+labnode_dev_gw: __DEV_NET__.1
+labnode_dev_storage_net: __DEV_STOR_NET__.0/24   # isolated L2, like prod's storage network
+
+# Name resolution for dev (replaces libvirt's dnsmasq): answered by dnsmasq on the node at labnode_dev_gw
+labnode_dev_domain: dev.example.com
+labnode_dev_hosts:
+  pvedev1: __DEV_NET__.11
+  pvedev2: __DEV_NET__.12
+  pvedev3: __DEV_NET__.13
+labnode_dev_edge_ip: __DEV_NET__.41
+labnode_dev_service_names: [auth, git, cloud, media, music, books, sync]
+
+# Wazuh: the agents report to prod's siem01 (unifi_siem). "Mgmt to SIEM" covers the node and paw01,
+# "Services to SIEM" gpu01; siem01's guest firewall accepts the agents ipset (Management, Services).
+# The enrollment password is prod's, copied into this inventory's sops by bin/gen-service-secrets labnode.
+wazuh_agent_manager: __SEC_NET__.10
+
+# kali01's network (tofu/envs/labnode network.tf, kali.tf): internet only. roles/lab_node drops everything
+# from it to these ranges and to the node itself (except DNS and DHCP on the gateway), and nothing may open
+# a connection into it. Its DNS (a dnsmasq of its own, not dev's) answers no example.com names.
+labnode_kali_vnet: kalinet
+labnode_kali_net: __KALI_NET__.0/24
+labnode_kali_gw: __KALI_NET__.1
+labnode_kali_dhcp_range: [__KALI_NET__.100, __KALI_NET__.199]
+labnode_kali_blocked:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 100.64.0.0/10   # CGNAT
+  - 169.254.0.0/16  # link-local
+  - 224.0.0.0/4     # multicast
+  - 240.0.0.0/4
+# Add the home's public address here to stop Kali reaching the lab through the port forward (hairpin NAT).
+labnode_kali_blocked_extra: []
+
+# Direct Thunderbolt cable from the workstation to the node: a bridge with no node address, paw01's net2 on it
+# (__TB_NET__.2/30, tofu/envs/labnode paw.tf) and the workstation's Thunderbolt Bridge service at __TB_NET__.1/30.
+labnode_tb_bridge: vmbrtb

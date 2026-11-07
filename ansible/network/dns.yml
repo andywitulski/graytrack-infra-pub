@@ -1,0 +1,16 @@
+---
+# Local DNS on the UniFi gateway (playbooks/unifi_dns.yml): A records under base_domain.
+# Generated, not listed: every Proxmox node and guest of this inventory and of unifi_dns_peer_inventories
+# (<host>.<base_domain> -> ansible_host), and every Caddy site (-> edge01). List here only the names
+# neither knows. Records under base_domain that nothing here produces are reported; with
+# unifi_dns_prune: true they are deleted.
+unifi_dns_peer_inventories: [labnode]
+unifi_dns_extra:
+  - { name: siem, ip: "{{ unifi_siem }}" }        # Wazuh dashboard (SAML login is bound to this name)
+  - { name: hdhr, ip: "{{ unifi_hdhomerun }}" }   # HDHomeRun tuner
+  - { name: mail, ip: "{{ unifi_mail }}" }        # Stalwart on mail01: IMAP, submission, account portal
+  # Split horizon for the public names: in ZoneEdit every public site is a CNAME to home (the dynamic WAN
+  # address). On the LAN, home is edge01, so a CNAME without its own record here still lands on Caddy
+  # instead of the WAN address (the gateway has no hairpin NAT).
+  - { name: home, ip: "{{ unifi_edge }}" }
+unifi_dns_prune: true

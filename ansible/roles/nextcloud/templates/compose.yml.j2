@@ -1,0 +1,56 @@
+# Managed by Ansible (labstack-infra).
+services:
+  db:
+    image: docker.io/library/postgres:16.15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NC_DB_PASS}
+    volumes:
+      - ./database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d nextcloud -U nextcloud"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: docker.io/library/redis:8.10.3-alpine
+    restart: unless-stopped
+
+  app:
+    image: docker.io/library/nextcloud:{{ nextcloud_version }}-apache
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "{{ nextcloud_http_port }}:80"
+    volumes:
+      - ./html:/var/www/html
+      - {{ nextcloud_data_path }}:/var/www/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+{% if collabora_version %}
+
+  # Nextcloud Office editor. TLS ends at Caddy (office domain); only Nextcloud's own domain may use it.
+  collabora:
+    image: docker.io/collabora/code:{{ collabora_version }}
+    restart: unless-stopped
+    ports:
+      - "{{ collabora_http_port }}:9980"
+    environment:
+      aliasgroup1: "https://{{ nextcloud_domain }}:443"
+      server_name: "{{ collabora_domain }}"
+      dictionaries: "{{ collabora_dictionaries }}"
+      extra_params: "--o:ssl.enable=false --o:ssl.termination=true"
+      username: admin
+      password: ${COLLABORA_ADMIN_PASS}
+    # Jails for each document (mknod, chroot, file ownership inside the jail)
+    cap_add:
+      - MKNOD
+      - SYS_CHROOT
+      - FOWNER
+{% endif %}

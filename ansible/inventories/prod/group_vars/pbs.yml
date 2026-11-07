@@ -1,0 +1,3 @@
+---
+# labnode (the standalone node, inventories/labnode) backs up to this PBS with its own token pve@pbs!labnode
+pbs_extra_tokens: [labnode]

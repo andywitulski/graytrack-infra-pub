@@ -1,0 +1,10 @@
+---
+# prod-only containers on the storage node (roles/pve_lxc_host; the shared ones are in inventories/common)
+pve_lxc_host_extra_containers:
+  # ts01 and ts02: the Tailscale subnet router and exit node need a TUN device (docs/howto/vpn.md)
+  - vmid: "{{ hostvars[groups['tailscale_router'][0]]['pve_vmid'] }}"
+    devices:
+      - { key: dev0, path: /dev/net/tun, gid: 0 }
+  - vmid: "{{ hostvars[groups['tailscale_exit'][0]]['pve_vmid'] }}"
+    devices:
+      - { key: dev0, path: /dev/net/tun, gid: 0 }

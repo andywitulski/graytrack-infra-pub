@@ -1,0 +1,6 @@
+Redacted sample. Date: 2026-10-01. Source: edge01. Control: SC-7, AC-4. ATP-004 T1, T2.
+== isolation from edge01
+Connection to __SVC_NET__.11 9000 port [tcp/*] succeeded!
+nc: connect to __SVC_NET__.11 port 22 (tcp) timed out: Operation now in progress
+nc: connect to __LAN_NET__.4 port 22 (tcp) timed out: Operation now in progress
+nc: connect to __MGMT_NET__.2 port 8006 (tcp) timed out: Operation now in progress

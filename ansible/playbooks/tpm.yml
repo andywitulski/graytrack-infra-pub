@@ -1,0 +1,10 @@
+---
+# TPM inventory and pinning (roles/tpm, ADR-0006). Nodes are in the same play, so their swtpm local CAs are
+# recorded before the VMs' EK certificates are checked against them.
+#   bin/ap prod playbooks/tpm.yml          bin/ap labnode playbooks/tpm.yml
+# Then commit ansible/files/<env>/tpm/: the pins are what later runs compare against.
+- name: TPM hosts
+  hosts: tpm_hosts
+  become: true
+  roles:
+    - tpm

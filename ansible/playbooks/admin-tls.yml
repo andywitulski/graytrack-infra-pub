@@ -1,0 +1,61 @@
+---
+# Admin web UIs on certificates from ca01 instead of self-signed ones (docs/howto/admin-ui-tls.md).
+#   bin/ap prod playbooks/admin-tls.yml --check --diff     Proxmox nodes, PBS, Wazuh dashboard
+#   bin/ap labnode playbooks/admin-tls.yml                   the labnode node (then labnode's backups.yml)
+# OpenBao: renewal here; the first switch to a ca01 certificate is playbooks/platform.yml --limit bao01.
+# bin/renew-certs runs this weekly from paw01 (roles/paw, labstack-renew-certs.timer).
+# Renewal: any rerun inside the last 30 days of the 90 (roles/x509_cert). Needs ca01 up and the
+# hosts provisioner password (secrets/ca-<env>.enc.yaml).
+
+- name: Proxmox nodes (8006), one at a time (pveproxy restarts)
+  hosts: pve_nodes
+  become: true
+  serial: 1
+  tasks:
+    - name: Node certificate
+      ansible.builtin.include_role:
+        name: admin_ui_tls
+        tasks_from: pve.yml
+      when: ssh_ca_enabled | bool
+
+- name: Backup server (8007)
+  hosts: pbs
+  become: true
+  tasks:
+    - name: PBS certificate
+      ansible.builtin.include_role:
+        name: admin_ui_tls
+        tasks_from: pbs.yml
+      when: ssh_ca_enabled | bool
+
+# Without this, backups stop at the next run: the nodes would refuse PBS's new certificate
+- name: The cluster's PBS storage pins the new certificate
+  hosts: pve_nodes[0]
+  become: true
+  tasks:
+    - name: Fingerprint in the storage entry
+      ansible.builtin.include_tasks: tasks/pbs_fingerprint.yml
+      vars:
+        pbs_storage_id: "{{ groups['pbs'][0] }}"
+        pbs_fp_host: "{{ groups['pbs'][0] }}"
+      when: groups['pbs'] | default([]) | length > 0
+
+- name: Wazuh dashboard (443)
+  hosts: wazuh_manager
+  become: true
+  tasks:
+    - name: Dashboard certificate
+      ansible.builtin.include_role:
+        name: admin_ui_tls
+        tasks_from: wazuh.yml
+      when: ssh_ca_enabled | bool
+
+- name: OpenBao listener (8200), renewal only
+  hosts: openbao
+  become: true
+  tasks:
+    - name: Listener certificate
+      ansible.builtin.include_role:
+        name: openbao
+        tasks_from: tls.yml
+      when: ssh_ca_enabled | bool

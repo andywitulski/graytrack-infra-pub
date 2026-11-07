@@ -1,0 +1,15 @@
+---
+# The same non-login identity as on the NAS host (UID/GID 2000), identity-mapped into the container.
+- name: Data identity group
+  ansible.builtin.group:
+    name: "{{ lab_data_identity_name }}"
+    gid: "{{ lab_data_identity_id }}"
+
+- name: Data identity user
+  ansible.builtin.user:
+    name: "{{ lab_data_identity_name }}"
+    uid: "{{ lab_data_identity_id }}"
+    group: "{{ lab_data_identity_name }}"
+    home: "{{ lab_data_identity_home }}"
+    create_home: true
+    shell: /usr/sbin/nologin

@@ -1,0 +1,7 @@
+---
+# Admin web UIs on certificates from ca01 instead of their self-signed ones (docs/howto/admin-ui-tls.md).
+# Task files: pve.yml (Proxmox nodes, 8006), pbs.yml (PBS, 8007), wazuh.yml (Wazuh dashboard, 443).
+# OpenBao's UI (8200) is roles/openbao (openbao_tls_ca01). Each is valid for the host's inventory name,
+# <name>.<base_domain> and its address, plus the service names below.
+admin_ui_tls_wazuh_names: ["siem.{{ base_domain }}"]
+admin_ui_tls_wazuh_dir: /opt/wazuh-docker/single-node   # roles/wazuh_manager: wazuh_manager_dir

@@ -1,0 +1,31 @@
+---
+# Agents must never be newer than the manager: keep this equal to wazuh_version on the manager.
+# Bumped by hand together with wazuh_manager_version (Renovate opens the PR for the manager)
+wazuh_agent_version: "4.14.8-1"
+wazuh_agent_manager: "{{ hostvars[groups['wazuh_manager'][0]]['ansible_host'] }}"
+wazuh_agent_repo_key_url: https://packages.wazuh.com/key/GPG-KEY-WAZUH
+# From sops: wazuh_enrollment_password
+# Files the agent reads besides the journal, when they exist on the host:
+#   audit.log: every auditd event, off the host (the compensating control for mutable audit rules)
+#   pve-firewall.log: the Proxmox guest firewall (nodes; decoder pve-firewall on the manager)
+wazuh_agent_extra_logfiles:
+  - { location: /var/log/audit/audit.log, format: audit }
+  - { location: /var/log/pve-firewall.log, format: syslog }
+# Proxmox nodes: pmxcfs files the cluster rewrites on its own, each change reported once per node.
+# Guest configs (qemu-server/*.conf, lxc/*.conf) and everything else under /etc/pve stay monitored.
+wazuh_agent_pve_syscheck_ignore:
+  - /etc/pve/.version
+  - /etc/pve/.rrd
+  - /etc/pve/.vmlist
+  - /etc/pve/.members
+  - /etc/pve/.clusterlog
+  - /etc/pve/authkey.pub.old
+  # The ticket signing key pair: Proxmox replaces it every 24 hours on its own (one alert per file per node)
+  - /etc/pve/authkey.pub
+  - /etc/pve/priv/authkey.key
+  # LVM metadata copies, rewritten on every LV change (backup snapshots, disk resizes)
+  - /etc/lvm/archive
+  - /etc/lvm/backup
+# HA state, rewritten every few minutes. sregex is Wazuh's simple matcher: only ^ $ | ! and plain text
+# (the earlier ^/etc/pve/nodes/\S+/lrm_status$ never matched: \S is not supported there).
+wazuh_agent_pve_syscheck_ignore_sregex: /lrm_status$

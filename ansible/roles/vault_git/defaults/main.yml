@@ -1,0 +1,20 @@
+---
+# Server-side git history for the Obsidian vault. Syncthing keeps the devices in sync; this commits the
+# synced folder on sync01 and pushes it to a private Forgejo repo. The .git directory lives outside the
+# vault, so Syncthing never sees or syncs it and the clients never run git themselves (no sync conflicts).
+vault_git_worktree: /srv/syncthing/obsidian
+vault_git_dir: /var/lib/vault-git/obsidian.git
+vault_git_user: labdata
+vault_git_home: /var/lib/labdata
+vault_git_remote: "git@git.{{ base_domain }}:alice/obsidian-vault.git"
+vault_git_branch: main
+vault_git_interval: "*:0/15"          # systemd OnCalendar
+vault_git_author: "vault-sync <vault-sync@{{ base_domain }}>"
+vault_git_excludes:
+  - .stfolder
+  - .stversions/
+  - .stignore
+  - .trash/
+  - .obsidian/workspace.json
+  - .obsidian/workspace-mobile.json
+  - "*.tmp"

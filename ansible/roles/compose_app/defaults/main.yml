@@ -1,0 +1,13 @@
+---
+# Generic Docker Compose app: /opt/<name>/{compose.yml,.env}, optional nightly pg_dump.
+# Service roles render their own extra files into compose_app_dir first, then include this role.
+compose_app_name: ""
+compose_app_dir: "/opt/{{ compose_app_name }}"
+compose_app_compose_template: ""
+compose_app_env: {}
+compose_app_pull: missing
+compose_app_build: policy
+# Containers of the project that compose.yml no longer lists are removed (e.g. Authentik's old redis)
+compose_app_remove_orphans: true
+# Optional: { service: db, user: app, database: app } for a nightly dump into <dir>/backups
+compose_app_pg_dump: {}

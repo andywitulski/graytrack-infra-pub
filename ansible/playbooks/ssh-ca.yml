@@ -1,0 +1,11 @@
+---
+# SSH certificates on every node and guest (roles/ssh_ca): trust, principals, people, host certificates,
+# revocations, and with ssh_ca_enforce the removal of the static automation keys. Also part of
+# services.yml and platform.yml, so regular runs renew host certificates; this playbook reaches the nodes.
+#   bin/ap prod playbooks/ssh-ca.yml
+#   bin/ap prod playbooks/ssh-ca.yml --limit pve_nodes
+- name: SSH certificate authority on every managed host
+  hosts: pve_nodes:service_guests
+  become: true
+  roles:
+    - ssh_ca

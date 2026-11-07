@@ -1,0 +1,14 @@
+---
+ollama_version: ""
+# Release asset name. Since the 0.1x releases Linux ships as zstd (tar.zst); older pins used ollama-linux-amd64.tgz.
+ollama_archive: ollama-linux-amd64.tar.zst
+ollama_listen: "0.0.0.0:11434"
+ollama_models_dir: /var/lib/ollama/models
+# Models pulled when missing (never removed here). Names as `ollama pull` takes them; no tag means :latest.
+# Fill from the old ollama-models.txt: inventories/<env>/group_vars/ollama.yml.
+ollama_models: []
+# Serial of a separate disk for the models (tofu sets it; gpu01: "ollama-models"). Formatted once (ext4,
+# label ollama-models), mounted at ollama_models_dir. Empty: models stay on the system disk.
+ollama_models_disk_serial: ""
+# Per pull; the large models take a while on a home connection
+ollama_pull_timeout: 7200

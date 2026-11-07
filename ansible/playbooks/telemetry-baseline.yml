@@ -1,0 +1,146 @@
+---
+- name: Time sync and persistent journald (every managed server)
+  hosts: pve_nodes:siem
+  become: true
+  tasks:
+    - name: Install chrony
+      ansible.builtin.apt:
+        name: chrony
+        state: present
+
+    - name: Ensure drop-in directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /etc/chrony/sources.d
+        - /etc/systemd/journald.conf.d
+
+    - name: Point chrony at lab time sources
+      ansible.builtin.copy:
+        dest: /etc/chrony/sources.d/labstack.sources
+        content: |
+          {% for s in ntp_servers %}
+          server {{ s }} iburst
+          {% endfor %}
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload chrony sources
+
+    - name: Persistent journald with a size cap
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-labstack.conf
+        content: |
+          [Journal]
+          Storage=persistent
+          SystemMaxUse=1G
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart journald
+
+    - name: Ensure chrony is running
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Reload chrony sources
+      ansible.builtin.command: chronyc reload sources
+      changed_when: true
+
+    - name: Restart journald
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted
+
+- name: Identity-focused auditd (Proxmox nodes)
+  hosts: pve_nodes
+  become: true
+  tasks:
+    - name: Install auditd
+      ansible.builtin.apt:
+        name: auditd
+        state: present
+
+    - name: Identity-focused audit rules
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/50-labstack.rules
+        content: |
+          ## labstack identity-focused audit rules (managed by Ansible)
+          -w /etc/passwd -p wa -k identity_accounts
+          -w /etc/shadow -p wa -k identity_accounts
+          -w /etc/group -p wa -k identity_accounts
+          -w /etc/gshadow -p wa -k identity_accounts
+          -w /etc/sudoers -p wa -k identity_sudo
+          -w /etc/sudoers.d/ -p wa -k identity_sudo
+          -w /etc/ssh/sshd_config -p wa -k sshd_config
+          -w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+          -w /root/.ssh/ -p wa -k ssh_keys
+          -w /home/ansible/.ssh/ -p wa -k ssh_keys
+          -w /home/tofu/.ssh/ -p wa -k ssh_keys
+          -w /usr/sbin/pveum -p x -k pve_identity_cli
+          -w /usr/bin/pvesh -p x -k pve_api_cli
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Load audit rules
+
+    - name: Ensure auditd is running
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Load audit rules
+      ansible.builtin.command: augenrules --load
+      changed_when: true
+
+- name: CIS baseline (Proxmox nodes)
+  hosts: pve_nodes
+  become: true
+  vars:
+    cis_baseline_permit_root_login: prohibit-password   # node-to-node cluster SSH runs as root
+    cis_baseline_ssh_disable_forwarding: false          # secure live migration tunnels over SSH
+    cis_baseline_manage_issue: false                    # pvebanner writes /etc/issue at boot
+  roles:
+    - cis_baseline
+
+# Proxmox mails root about ZFS (zed), backups and updates, but nothing may leave the nodes on port 25
+# (UniFi blocks it), so every message retried and was logged as a blocked connection. Mail now stays
+# on the node (/var/mail/root); the same events reach Wazuh from the journal (rules 100440-100442).
+- name: Node mail stays local
+  hosts: pve_nodes
+  become: true
+  tasks:
+    - name: Current outbound transport
+      check_mode: false
+      ansible.builtin.command: postconf -h default_transport
+      register: node_mail_transport
+      changed_when: false
+
+    - name: No outbound mail (local delivery still works)
+      when: node_mail_transport.stdout != 'error:outbound mail disabled (labstack)'
+      ansible.builtin.command:
+        argv:
+          - postconf
+          - -e
+          - default_transport=error:outbound mail disabled (labstack)
+          - relay_transport=error:outbound mail disabled (labstack)
+      changed_when: true
+      notify: Reload postfix
+
+    - name: Drop what is already queued for outside (it can never be delivered)
+      when: node_mail_transport.stdout != 'error:outbound mail disabled (labstack)'
+      ansible.builtin.command: postsuper -d ALL deferred
+      changed_when: true
+
+  handlers:
+    - name: Reload postfix
+      ansible.builtin.service:
+        name: postfix
+        state: reloaded
